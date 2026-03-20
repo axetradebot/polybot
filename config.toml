@@ -1,7 +1,7 @@
 [trading]
 starting_bankroll = 500.0
 max_bet_usd = 5.0
-daily_loss_limit_usd = 25.0
+daily_loss_limit_usd = 500.0
 consecutive_loss_pause = 5
 pause_duration_minutes = 30
 
