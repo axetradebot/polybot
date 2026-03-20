@@ -131,7 +131,15 @@ async fn main() -> Result<()> {
         }
         BotMode::Live => {
             info!("Initializing live CLOB connection...");
-            run_live_mode(state, &config, &signal_engine, &risk_manager, &db, &telegram).await
+            let result =
+                run_live_mode(state, &config, &signal_engine, &risk_manager, &db, &telegram)
+                    .await;
+            if let Err(ref e) = result {
+                let msg = format!("LIVE MODE CRASHED: {e}");
+                error!("{}", msg);
+                telegram.send_error(&msg).await.ok();
+            }
+            result
         }
     }
 }
@@ -492,9 +500,18 @@ async fn run_live_mode(
     use polymarket_client_sdk::types::U256;
     use polymarket_client_sdk::POLYGON;
 
-    let signer = LocalSigner::from_str(&config.private_key)
-        .context("Invalid private key")?
-        .with_chain_id(Some(POLYGON));
+    let signer = match LocalSigner::from_str(&config.private_key) {
+        Ok(s) => s.with_chain_id(Some(POLYGON)),
+        Err(e) => {
+            let msg = format!("Invalid private key: {e}");
+            error!("{}", msg);
+            telegram.send_error(&msg).await.ok();
+            anyhow::bail!(msg);
+        }
+    };
+
+    info!("Signer created, authenticating with CLOB...");
+    telegram.send_error("LIVE MODE: Authenticating with CLOB...").await.ok();
 
     let mut builder = Client::new(&config.infra.polymarket_clob_url, Config::default())?
         .authentication_builder(&signer);
@@ -509,12 +526,18 @@ async fn run_live_mode(
         crate::types::SignatureType::Eoa => {}
     }
 
-    let client = builder
-        .authenticate()
-        .await
-        .context("CLOB authentication failed")?;
+    let client = match builder.authenticate().await {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("CLOB authentication FAILED: {e}");
+            error!("{}", msg);
+            telegram.send_error(&msg).await.ok();
+            anyhow::bail!(msg);
+        }
+    };
 
     info!("CLOB client authenticated, entering live trading loop");
+    telegram.send_error("CLOB authenticated OK. Live trading loop starting.").await.ok();
 
     let watch_start = config.watch_start_s();
     let use_tiers = config.signal.entry_tiers.enabled;
@@ -643,15 +666,27 @@ async fn run_live_mode(
 
                 match decision {
                     None => {
-                        info!(tier = %tier.name, "Tier skipped");
+                        let msg = format!(
+                            "Tier '{}' skipped (delta below threshold or price out of range)",
+                            tier.name
+                        );
+                        info!("{}", msg);
+                        telegram.send_error(&msg).await.ok();
                         next_tier_idx += 1;
                     }
                     Some(d) => {
+                        telegram.send_error(&format!(
+                            "Tier '{}' signal: {} delta={:.4}% target=${} contracts={}",
+                            d.tier_name, d.direction, d.delta_pct, d.target_price, d.contracts
+                        )).await.ok();
+
                         // Cancel previous order
                         if active_order_id.is_some() {
                             let cancel_start = std::time::Instant::now();
                             if let Err(e) = client.cancel_all_orders().await {
-                                warn!(error = %e, "Cancel failed before replace");
+                                let msg = format!("Cancel failed before replace: {e}");
+                                warn!("{}", msg);
+                                telegram.send_error(&msg).await.ok();
                             } else {
                                 info!(elapsed_ms = cancel_start.elapsed().as_millis(), "Order cancelled for tier replace");
                             }
@@ -674,7 +709,9 @@ async fn run_live_mode(
                         let token_id = match token_id_res {
                             Ok(id) => id,
                             Err(e) => {
-                                error!(error = %e, "Invalid token ID");
+                                let msg = format!("Invalid token ID: {e}");
+                                error!("{}", msg);
+                                telegram.send_error(&msg).await.ok();
                                 next_tier_idx += 1;
                                 continue;
                             }
@@ -683,42 +720,74 @@ async fn run_live_mode(
                         let size = d.contracts;
                         let price = d.target_price;
 
-                        match async {
-                            let order = client
-                                .limit_order()
-                                .token_id(token_id)
-                                .size(size)
-                                .price(price)
-                                .side(Side::Buy)
-                                .build()
-                                .await
-                                .context("build order")?;
+                        telegram.send_error(&format!(
+                            "Submitting order: BUY {} @ ${} (token {}...)",
+                            size, price, &d.token_id[..20.min(d.token_id.len())]
+                        )).await.ok();
 
-                            let signed = client
-                                .sign(&signer, order)
-                                .await
-                                .context("sign order")?;
-
-                            let resp =
-                                client.post_order(signed).await.context("post order")?;
-
-                            Ok::<_, anyhow::Error>(resp.order_id.clone())
-                        }
-                        .await
+                        // Step 1: Build order
+                        let order = match client
+                            .limit_order()
+                            .token_id(token_id)
+                            .size(size)
+                            .price(price)
+                            .side(Side::Buy)
+                            .build()
+                            .await
                         {
-                            Ok(oid) => {
-                                info!(
-                                    tier = %d.tier_name,
-                                    order_id = %oid,
-                                    price = %price,
-                                    "Order submitted"
+                            Ok(o) => o,
+                            Err(e) => {
+                                let msg = format!(
+                                    "BUILD ORDER FAILED: tier={} err={:?}",
+                                    d.tier_name, e
                                 );
+                                error!("{}", msg);
+                                telegram.send_error(&msg).await.ok();
+                                next_tier_idx += 1;
+                                active_decision = Some(d);
+                                continue;
+                            }
+                        };
+
+                        // Step 2: Sign order
+                        let signed = match client.sign(&signer, order).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let msg = format!(
+                                    "SIGN ORDER FAILED: tier={} err={:?}",
+                                    d.tier_name, e
+                                );
+                                error!("{}", msg);
+                                telegram.send_error(&msg).await.ok();
+                                next_tier_idx += 1;
+                                active_decision = Some(d);
+                                continue;
+                            }
+                        };
+
+                        // Step 3: Post order to CLOB
+                        match client.post_order(signed).await {
+                            Ok(resp) => {
+                                let oid = resp.order_id.clone();
+                                let msg = format!(
+                                    "Order SUBMITTED: tier={} id={} price=${}",
+                                    d.tier_name, oid, price
+                                );
+                                info!("{}", msg);
+                                telegram.send_error(&msg).await.ok();
                                 active_order_id = Some(oid);
                                 active_decision = Some(d);
                                 next_tier_idx += 1;
                             }
                             Err(e) => {
-                                error!(error = %e, "Order submission failed");
+                                let msg = format!(
+                                    "POST ORDER REJECTED: tier={} price={} size={} token={}... err={:?}",
+                                    d.tier_name, price, size,
+                                    &d.token_id[..20.min(d.token_id.len())],
+                                    e
+                                );
+                                error!("{}", msg);
+                                telegram.send_error(&msg).await.ok();
                                 next_tier_idx += 1;
                             }
                         }
@@ -766,6 +835,7 @@ async fn run_live_mode(
 
             if next_tier_idx >= tiers.len() && active_order_id.is_none() {
                 info!("All tiers exhausted — no fill");
+                telegram.send_error("All tiers exhausted — no fill this window").await.ok();
                 break 'tier_loop;
             }
 
