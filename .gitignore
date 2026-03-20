@@ -1,0 +1,6 @@
+**/target/
+*.db
+.env.local
+bot.log
+*.exe
+Cargo.lock
