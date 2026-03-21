@@ -671,7 +671,7 @@ async fn run_live_mode(
                             "N/A".to_string()
                         };
                         let msg = format!(
-                            "Tier '{}' skipped — delta {}% < min {}%",
+                            "Tier '{}' skipped — delta {}% (need {}%)",
                             tier.name, delta, tier.min_delta_pct
                         );
                         info!("{}", msg);

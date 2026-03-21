@@ -6,13 +6,14 @@ consecutive_loss_pause = 5
 pause_duration_minutes = 30
 
 [signal]
-min_delta_pct = 0.03
+min_delta_pct = 0.005
 max_entry_price = 0.92
 order_lifetime_ms = 8000
 
 [signal.delta_pricing]
 # [min_delta_pct, max_delta_pct, estimated_fair_value]
 tiers = [
+    [0.005, 0.03, 0.53],
     [0.03, 0.05, 0.58],
     [0.05, 0.10, 0.67],
     [0.10, 0.15, 0.78],
@@ -43,7 +44,7 @@ min_delta_pct = 0.04
 name = "late"
 time_before_close_s = 6
 price_offset = -0.02
-min_delta_pct = 0.03
+min_delta_pct = 0.005
 
 # Used when entry_tiers.enabled = false
 [signal.single_entry]
