@@ -1246,14 +1246,14 @@ async fn settle_position(
             pos.direction,
             fill_price,
             fill_size,
-            pos.open_price,
-            Decimal::ZERO,
             won,
             pnl,
             bankroll,
             pos.initial_price,
             pos.tighten_count,
             pos.best_ask_at_entry,
+            pos.edge_score,
+            pos.delta_pct,
             &pos.mode.to_string(),
         )
         .await

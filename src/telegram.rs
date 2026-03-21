@@ -151,14 +151,14 @@ impl TelegramNotifier {
         direction: Direction,
         fill_price: Decimal,
         fill_size: Decimal,
-        open_price: Decimal,
-        close_price: Decimal,
         won: bool,
         pnl: Decimal,
         bankroll: Decimal,
         initial_price: Decimal,
         tighten_count: u32,
         best_ask_at_entry: Decimal,
+        edge_score: f64,
+        delta_pct: Decimal,
         mode_str: &str,
     ) -> Result<()> {
         if !self.enabled || !self.on_trade {
@@ -197,8 +197,8 @@ impl TelegramNotifier {
              \u{200b}  Direction: {dir_arrow} {correct}\n\
              \u{200b}  Book ask: ${best_ask_at_entry} → Post: ${initial_price}{tighten_info}\n\
              \u{200b}  Fill: ${fill_price} × {fill_size} contracts\n\
-             \u{200b}  Open: ${open_price:.0} → Close: ${close_price:.0}\n\
-             \u{200b}  P&amp;L: {pnl_sign}${pnl:.2} ({pnl_sign}{roi_pct}%)\n\
+             \u{200b}  Delta: {delta_pct:.4}% | Edge: {edge_score:.3}\n\
+             \u{200b}  P&L: {pnl_sign}${pnl:.2} ({pnl_sign}{roi_pct}%)\n\
              \u{200b}  Bankroll: ${bankroll:.2}"
         );
 
