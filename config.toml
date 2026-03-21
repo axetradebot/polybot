@@ -6,14 +6,13 @@ consecutive_loss_pause = 5
 pause_duration_minutes = 30
 
 [signal]
-min_delta_pct = 0.03
+min_delta_pct = 0.06
 max_entry_price = 0.92
 order_lifetime_ms = 8000
 
 [signal.delta_pricing]
 # [min_delta_pct, max_delta_pct, estimated_fair_value]
 tiers = [
-    [0.03, 0.06, 0.58],
     [0.06, 0.10, 0.67],
     [0.10, 0.15, 0.78],
     [0.15, 0.20, 0.85],
@@ -31,19 +30,19 @@ watch_start_s = 30
 name = "early"
 time_before_close_s = 20
 price_offset = -0.10
-min_delta_pct = 0.06
+min_delta_pct = 0.10
 
 [[signal.entry_tiers.tiers]]
 name = "mid"
 time_before_close_s = 12
 price_offset = -0.05
-min_delta_pct = 0.05
+min_delta_pct = 0.08
 
 [[signal.entry_tiers.tiers]]
 name = "late"
 time_before_close_s = 6
 price_offset = -0.02
-min_delta_pct = 0.03
+min_delta_pct = 0.06
 
 # Used when entry_tiers.enabled = false
 [signal.single_entry]
