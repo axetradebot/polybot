@@ -966,11 +966,13 @@ async fn run_scanner_loop(
 
                             let pos_id = positions.add(pos).await;
 
+                            let order_type = if opp.is_taker { "TAKER" } else { "MAKER" };
                             info!(
                                 market = %opp.market_name,
                                 order_id = %oid,
                                 price = %opp.suggested_entry,
                                 edge = opp.edge_score,
+                                order_type,
                                 pos_id,
                                 "Live order posted"
                             );

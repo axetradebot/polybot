@@ -82,6 +82,10 @@ pub struct PricingConfig {
     pub min_entry_price: f64,
     #[serde(default = "default_cutoff")]
     pub entry_cutoff_s: u64,
+    /// Delta threshold above which the bot takes the ask directly (taker order)
+    /// instead of undercutting. Set to 0.0 to always use maker orders.
+    #[serde(default)]
+    pub taker_delta_threshold: f64,
 }
 
 fn default_strategy() -> String { "orderbook_aware".into() }

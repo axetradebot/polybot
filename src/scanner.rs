@@ -36,6 +36,7 @@ pub struct MarketOpportunity {
     pub contracts: Decimal,
     pub bet_size_usd: Decimal,
     pub entry_start_s: u64,
+    pub is_taker: bool,
 }
 
 /// A single scanner evaluation record for analytics logging.
@@ -251,7 +252,13 @@ pub async fn scan_all_markets(
             }
         };
 
-        let mut suggested_entry = (ob.best_ask - undercut).round_dp(2);
+        let taker_threshold = config.pricing.taker_delta_threshold;
+        let is_taker = taker_threshold > 0.0 && delta_f64 >= taker_threshold;
+        let mut suggested_entry = if is_taker {
+            ob.best_ask
+        } else {
+            (ob.best_ask - undercut).round_dp(2)
+        };
         if suggested_entry < min_entry {
             suggested_entry = min_entry;
         }
@@ -302,7 +309,8 @@ pub async fn scan_all_markets(
             continue;
         }
 
-        info!(market = %mkt.name, direction = %direction, delta = delta_f64, edge = edge_score, entry = %suggested_entry, best_ask = %ob.best_ask, contracts = %contracts, "OPPORTUNITY FOUND");
+        let order_type = if is_taker { "TAKER" } else { "MAKER" };
+        info!(market = %mkt.name, direction = %direction, delta = delta_f64, edge = edge_score, entry = %suggested_entry, best_ask = %ob.best_ask, contracts = %contracts, order_type, "OPPORTUNITY FOUND");
 
         skip_reasons.remove(&mkt.name);
 
@@ -339,6 +347,7 @@ pub async fn scan_all_markets(
             contracts,
             bet_size_usd: actual_bet,
             entry_start_s: mkt.entry_start_s,
+            is_taker,
         });
     }
 

@@ -13,11 +13,12 @@ pause_duration_minutes = 30
 
 [pricing]
 strategy = "orderbook_aware"
-undercut_offset = 0.03
+undercut_offset = 0.01
 tighten_step = 0.01
-adjust_interval_ms = 2000
+adjust_interval_ms = 1000
 min_entry_price = 0.55
 entry_cutoff_s = 4
+taker_delta_threshold = 0.10
 
 [scanner]
 scan_interval_ms = 1000
@@ -76,8 +77,8 @@ delta_tiers = [
 [[markets]]
 name = "ETH 5-min"
 asset = "ETH"
-mode = "live"
-enabled = true
+mode = "paper"
+enabled = false
 window_seconds = 300
 slug_prefix = "eth-updown-5m"
 binance_symbol = "ethusdt"
@@ -115,7 +116,7 @@ delta_tiers = [
 name = "SOL 5-min"
 asset = "SOL"
 mode = "paper"
-enabled = true
+enabled = false
 window_seconds = 300
 slug_prefix = "sol-updown-5m"
 binance_symbol = "solusdt"
