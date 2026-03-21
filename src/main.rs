@@ -356,6 +356,8 @@ async fn run_scanner_loop(
 
     let mut last_window_ts: HashMap<String, u64> = HashMap::new();
     let mut token_cache: HashMap<String, MarketInfo> = HashMap::new();
+    let mut window_traded: HashMap<String, bool> = HashMap::new(); // "MarketName-windowTs" -> traded?
+    let mut last_skip_reasons: HashMap<String, String> = HashMap::new(); // market name -> last reason
     let scan_interval = Duration::from_millis(config.scanner.scan_interval_ms);
     let adjust_ms = config.pricing.adjust_interval_ms;
     let tighten_step = Decimal::try_from(config.pricing.tighten_step).unwrap_or(dec!(0.01));
@@ -570,6 +572,7 @@ async fn run_scanner_loop(
     loop {
         let cycle_start = tokio::time::Instant::now();
         heartbeat_counter += 1;
+        let mut missed_windows: Vec<(String, String)> = Vec::new();
 
         // Log heartbeat every 60 seconds
         if heartbeat_counter % 60 == 0 {
@@ -642,6 +645,19 @@ async fn run_scanner_loop(
             let prev_ts = last_window_ts.get(&mkt.name).copied();
 
             if prev_ts != Some(window_ts) {
+                // Window transitioned — check if previous window missed trades
+                if let Some(old_ts) = prev_ts {
+                    let key = format!("{}-{}", mkt.name, old_ts);
+                    if !window_traded.get(&key).copied().unwrap_or(false) {
+                        let reason = last_skip_reasons
+                            .get(&mkt.name)
+                            .cloned()
+                            .unwrap_or_else(|| "No opportunity found".into());
+                        missed_windows.push((mkt.name.clone(), reason));
+                    }
+                    window_traded.remove(&key);
+                }
+
                 // New window detected
                 if let Some(price) = price_feeds.get_price(&mkt.binance_symbol).await {
                     price_feeds
@@ -704,6 +720,11 @@ async fn run_scanner_loop(
             }
         }
 
+        // Send Telegram notification for missed windows
+        if !missed_windows.is_empty() {
+            telegram.send_window_miss(&missed_windows).await.ok();
+        }
+
         // Prune old window data periodically
         let now_ts = market::epoch_secs();
         price_feeds.prune_old_window_opens(now_ts, 3600).await;
@@ -718,8 +739,14 @@ async fn run_scanner_loop(
         });
 
         // ── Phase 2: Run edge scanner ──
-        let opportunities =
+        let scan_result =
             scanner::scan_all_markets(config, price_feeds, &token_cache, positions).await;
+        let opportunities = scan_result.opportunities;
+
+        // Update last skip reasons for window-miss reporting
+        for (name, reason) in &scan_result.skip_reasons {
+            last_skip_reasons.insert(name.clone(), reason.clone());
+        }
 
         // ── Phase 3: Fire orders at best opportunities ──
         let mut orders_fired = 0;
@@ -916,6 +943,8 @@ async fn run_scanner_loop(
                 }
 
                 orders_fired += 1;
+                let traded_key = format!("{}-{}", opp.market_name, opp.window_ts);
+                window_traded.insert(traded_key, true);
             }
         }
 

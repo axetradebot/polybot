@@ -370,6 +370,22 @@ impl TelegramNotifier {
         self.send_message(&msg).await
     }
 
+    /// Window miss notification — sent when a window closes with no trades placed.
+    /// Gated by `on_trade`.
+    pub async fn send_window_miss(
+        &self,
+        missed_markets: &[(String, String)], // (market_name, reason)
+    ) -> Result<()> {
+        if !self.enabled || !self.on_trade || missed_markets.is_empty() {
+            return Ok(());
+        }
+        let mut msg = "⏭ Window closed — no trades placed".to_string();
+        for (name, reason) in missed_markets {
+            msg.push_str(&format!("\n\u{200b}  ❌ {name}: {reason}"));
+        }
+        self.send_message(&msg).await
+    }
+
     /// Redemption success notification — gated by `on_trade` (not `on_error`).
     pub async fn send_redeem_success(&self, market_name: &str, tx_hash: &str) -> Result<()> {
         if !self.enabled || !self.on_trade {

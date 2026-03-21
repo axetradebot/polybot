@@ -64,14 +64,24 @@ fn compute_edge_score(
     delta_pct * (1.0 / entry_price) * liquidity * time_factor
 }
 
-/// Scan all enabled markets and return opportunities sorted by edge_score (descending).
+/// Result of scanning all markets: opportunities + per-market skip reasons.
+pub struct ScanResult {
+    pub opportunities: Vec<MarketOpportunity>,
+    /// Per-market skip reason for markets that were evaluated but didn't produce an opportunity.
+    /// Key: market name, Value: human-readable reason with detail.
+    pub skip_reasons: std::collections::HashMap<String, String>,
+}
+
+/// Scan all enabled markets and return opportunities sorted by edge_score (descending),
+/// plus skip reasons for markets that didn't produce opportunities.
 pub async fn scan_all_markets(
     config: &AppConfig,
     price_feeds: &PriceFeeds,
     token_cache: &std::collections::HashMap<String, MarketInfo>,
     positions: &PositionTracker,
-) -> Vec<MarketOpportunity> {
+) -> ScanResult {
     let mut opportunities = Vec::new();
+    let mut skip_reasons = std::collections::HashMap::new();
     let bet_size = Decimal::try_from(config.bankroll.bet_size_usd).unwrap_or(dec!(5));
     let undercut = Decimal::try_from(config.pricing.undercut_offset).unwrap_or(dec!(0.03));
     let min_entry = Decimal::try_from(config.pricing.min_entry_price).unwrap_or(dec!(0.55));
@@ -88,6 +98,9 @@ pub async fn scan_all_markets(
                 entry_window = %format!("{}s-{}s", entry_cutoff_s, mkt.entry_start_s),
                 "Outside entry window"
             );
+            skip_reasons.entry(mkt.name.clone()).or_insert_with(|| {
+                format!("Outside entry window (T-{secs_rem}s, need {}-{}s)", entry_cutoff_s, mkt.entry_start_s)
+            });
             continue;
         }
 
@@ -102,12 +115,14 @@ pub async fn scan_all_markets(
             Some(p) => p,
             None => {
                 info!(market = %mkt.name, "Skip: no price data");
+                skip_reasons.insert(mkt.name.clone(), "No price data from Binance".into());
                 continue;
             }
         };
 
         if !price_feeds.has_fresh_price(&mkt.binance_symbol).await {
             info!(market = %mkt.name, "Skip: stale price data");
+            skip_reasons.insert(mkt.name.clone(), "Stale price data".into());
             continue;
         }
 
@@ -116,6 +131,7 @@ pub async fn scan_all_markets(
             Some(p) => p,
             None => {
                 info!(market = %mkt.name, "Skip: no open price for window");
+                skip_reasons.insert(mkt.name.clone(), "No open price captured for window".into());
                 continue;
             }
         };
@@ -134,6 +150,10 @@ pub async fn scan_all_markets(
                 current = %current_price,
                 "Skip: delta too low"
             );
+            skip_reasons.insert(mkt.name.clone(), format!(
+                "Delta too low: {:.4}% < {:.2}% min ({} ${open_price} → ${current_price})",
+                delta_f64, mkt.min_delta_pct, direction
+            ));
             continue;
         }
 
@@ -141,6 +161,7 @@ pub async fn scan_all_markets(
         let slug = market::build_slug(&mkt.slug_prefix, window_ts);
         if positions.has_position_in_window(&slug).await {
             debug!(market = %mkt.name, slug = %slug, "Skip: already have position");
+            skip_reasons.insert(mkt.name.clone(), "Already have position in this window".into());
             continue;
         }
 
@@ -149,10 +170,12 @@ pub async fn scan_all_markets(
             Some(info) if info.accepting_orders => info,
             Some(_) => {
                 info!(market = %mkt.name, slug = %slug, "Skip: market not accepting orders");
+                skip_reasons.insert(mkt.name.clone(), "Market not accepting orders".into());
                 continue;
             }
             None => {
                 info!(market = %mkt.name, slug = %slug, "Skip: token not resolved yet");
+                skip_reasons.insert(mkt.name.clone(), "Token not resolved from Gamma API".into());
                 continue;
             }
         };
@@ -169,6 +192,7 @@ pub async fn scan_all_markets(
             Ok(ob) => ob,
             Err(e) => {
                 info!(market = %mkt.name, error = %e, "Skip: orderbook fetch failed");
+                skip_reasons.insert(mkt.name.clone(), format!("Orderbook fetch failed: {e}"));
                 continue;
             }
         };
@@ -191,6 +215,10 @@ pub async fn scan_all_markets(
                 ceiling = %max_entry,
                 "Skip: entry price too high for delta"
             );
+            skip_reasons.insert(mkt.name.clone(), format!(
+                "Entry price too high: ${suggested_entry} > ${max_entry} ceiling (delta {delta_f64:.4}%, ask ${:.2})",
+                ob.best_ask
+            ));
             continue;
         }
 
@@ -199,6 +227,7 @@ pub async fn scan_all_markets(
             .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::ToZero);
         if contracts < Decimal::ONE {
             info!(market = %mkt.name, entry = %suggested_entry, "Skip: bet too small for 1 contract");
+            skip_reasons.insert(mkt.name.clone(), format!("Bet too small at ${suggested_entry} entry"));
             continue;
         }
         let actual_bet = contracts * suggested_entry;
@@ -225,6 +254,10 @@ pub async fn scan_all_markets(
                 depth = depth_f64,
                 "Skip: edge score too low"
             );
+            skip_reasons.insert(mkt.name.clone(), format!(
+                "Edge too low: {edge_score:.4} < {:.2} min (delta {delta_f64:.4}%)",
+                config.scanner.min_edge_score
+            ));
             continue;
         }
 
@@ -238,6 +271,9 @@ pub async fn scan_all_markets(
             contracts = %contracts,
             "OPPORTUNITY FOUND"
         );
+
+        // Found an opportunity — remove any skip reason for this market
+        skip_reasons.remove(&mkt.name);
 
         opportunities.push(MarketOpportunity {
             market_name: mkt.name.clone(),
@@ -279,5 +315,8 @@ pub async fn scan_all_markets(
         );
     }
 
-    opportunities
+    ScanResult {
+        opportunities,
+        skip_reasons,
+    }
 }
