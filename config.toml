@@ -1,19 +1,19 @@
 [trading]
-starting_bankroll = 500.0
+starting_bankroll = 274
 max_bet_usd = 5.0
-daily_loss_limit_usd = 500.0
+daily_loss_limit_usd = 30.0
 consecutive_loss_pause = 5
 pause_duration_minutes = 30
 
 [signal]
-min_delta_pct = 0.005
+min_delta_pct = 0.01
 max_entry_price = 0.92
 order_lifetime_ms = 8000
 
 [signal.delta_pricing]
 # [min_delta_pct, max_delta_pct, estimated_fair_value]
 tiers = [
-    [0.005, 0.03, 0.53],
+    [0.01, 0.03, 0.53],
     [0.03, 0.05, 0.58],
     [0.05, 0.10, 0.67],
     [0.10, 0.15, 0.78],
@@ -31,20 +31,20 @@ watch_start_s = 30
 [[signal.entry_tiers.tiers]]
 name = "early"
 time_before_close_s = 20
-price_offset = -0.10
+price_offset = -0.05
 min_delta_pct = 0.06
 
 [[signal.entry_tiers.tiers]]
 name = "mid"
 time_before_close_s = 12
-price_offset = -0.05
+price_offset = -0.03
 min_delta_pct = 0.04
 
 [[signal.entry_tiers.tiers]]
 name = "late"
 time_before_close_s = 6
-price_offset = -0.02
-min_delta_pct = 0.005
+price_offset = -0.01
+min_delta_pct = 0.01
 
 # Used when entry_tiers.enabled = false
 [signal.single_entry]

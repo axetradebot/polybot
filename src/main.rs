@@ -51,6 +51,11 @@ struct FillInfo {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Prevent SDK background thread panics from killing the process
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("Panic caught (non-fatal): {info}");
+    }));
+
     let cli = Cli::parse();
     let mut config = AppConfig::load(&cli.config).context("Failed to load config")?;
     config.apply_cli_overrides(&cli);
@@ -778,6 +783,7 @@ async fn run_live_mode(
                                 active_order_id = Some(oid);
                                 active_decision = Some(d);
                                 next_tier_idx += 1;
+                                break; // let the order sit on the book
                             }
                             Err(e) => {
                                 let msg = format!(
