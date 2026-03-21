@@ -511,7 +511,6 @@ async fn run_live_mode(
     };
 
     info!("Signer created, authenticating with CLOB...");
-    telegram.send_error("LIVE MODE: Authenticating with CLOB...").await.ok();
 
     let mut builder = Client::new(&config.infra.polymarket_clob_url, Config::default())?
         .authentication_builder(&signer);
@@ -537,7 +536,6 @@ async fn run_live_mode(
     };
 
     info!("CLOB client authenticated, entering live trading loop");
-    telegram.send_error("CLOB authenticated OK. Live trading loop starting.").await.ok();
 
     let watch_start = config.watch_start_s();
     let use_tiers = config.signal.entry_tiers.enabled;
@@ -666,19 +664,15 @@ async fn run_live_mode(
 
                 match decision {
                     None => {
-                        let msg = format!(
-                            "Tier '{}' skipped (delta below threshold or price out of range)",
-                            tier.name
-                        );
-                        info!("{}", msg);
-                        telegram.send_error(&msg).await.ok();
+                        info!(tier = %tier.name, "Tier skipped (delta below threshold)");
                         next_tier_idx += 1;
                     }
                     Some(d) => {
-                        telegram.send_error(&format!(
-                            "Tier '{}' signal: {} delta={:.4}% target=${} contracts={}",
-                            d.tier_name, d.direction, d.delta_pct, d.target_price, d.contracts
-                        )).await.ok();
+                        info!(
+                            tier = %d.tier_name, direction = %d.direction,
+                            delta = %d.delta_pct, target = %d.target_price,
+                            contracts = %d.contracts, "Tier signal fired"
+                        );
 
                         // Cancel previous order
                         if active_order_id.is_some() {
@@ -719,11 +713,6 @@ async fn run_live_mode(
 
                         let size = d.contracts;
                         let price = d.target_price;
-
-                        telegram.send_error(&format!(
-                            "Submitting order: BUY {} @ ${} (token {}...)",
-                            size, price, &d.token_id[..20.min(d.token_id.len())]
-                        )).await.ok();
 
                         // Step 1: Build order
                         let order = match client
@@ -835,7 +824,6 @@ async fn run_live_mode(
 
             if next_tier_idx >= tiers.len() && active_order_id.is_none() {
                 info!("All tiers exhausted — no fill");
-                telegram.send_error("All tiers exhausted — no fill this window").await.ok();
                 break 'tier_loop;
             }
 
