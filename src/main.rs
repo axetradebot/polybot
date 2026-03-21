@@ -664,7 +664,18 @@ async fn run_live_mode(
 
                 match decision {
                     None => {
-                        info!(tier = %tier.name, "Tier skipped (delta below threshold)");
+                        let st = state.read().await;
+                        let delta = if st.window_open_price > Decimal::ZERO {
+                            ((st.btc_price - st.window_open_price).abs() / st.window_open_price * Decimal::from(100)).to_string()
+                        } else {
+                            "N/A".to_string()
+                        };
+                        let msg = format!(
+                            "Tier '{}' skipped — delta {}% < min {}%",
+                            tier.name, delta, tier.min_delta_pct
+                        );
+                        info!("{}", msg);
+                        telegram.send_error(&msg).await.ok();
                         next_tier_idx += 1;
                     }
                     Some(d) => {
@@ -824,6 +835,7 @@ async fn run_live_mode(
 
             if next_tier_idx >= tiers.len() && active_order_id.is_none() {
                 info!("All tiers exhausted — no fill");
+                telegram.send_error("All tiers exhausted — no fill this window").await.ok();
                 break 'tier_loop;
             }
 
