@@ -279,7 +279,8 @@ impl TelegramNotifier {
         let msg = format!(
             "⏭️ SKIP {mode_tag}— {market_name}\n\
              \u{200b}  Window: {slug}\n\
-             \u{200b}  Reason: {reason}"
+             \u{200b}  Reason: {}",
+            Self::escape_html(reason)
         );
         self.send_message(&msg).await
     }
@@ -289,7 +290,7 @@ impl TelegramNotifier {
         if !self.enabled || !self.on_error {
             return Ok(());
         }
-        let msg = format!("🚨 {}Error\n{error_msg}", self.mode_tag());
+        let msg = format!("🚨 {}Error\n{}", self.mode_tag(), Self::escape_html(error_msg));
         self.send_message(&msg).await
     }
 
@@ -381,7 +382,7 @@ impl TelegramNotifier {
         }
         let mut msg = "⏭ Window closed — no trades placed".to_string();
         for (name, reason) in missed_markets {
-            msg.push_str(&format!("\n\u{200b}  ❌ {name}: {reason}"));
+            msg.push_str(&format!("\n\u{200b}  ❌ {name}: {}", Self::escape_html(reason)));
         }
         self.send_message(&msg).await
     }
@@ -466,6 +467,12 @@ impl TelegramNotifier {
              \u{200b}  tx: {tx_hash}"
         );
         self.send_message(&msg).await
+    }
+
+    fn escape_html(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
 
     fn mode_tag(&self) -> &'static str {
