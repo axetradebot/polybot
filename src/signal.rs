@@ -2,7 +2,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tracing::{debug, info, warn};
 
-use crate::config::{AppConfig, EntryTier};
+use crate::config::{AppConfig, EntryTier, SweepConfig};
 use crate::state::BotState;
 use crate::types::{Direction, MarketInfo, Signal};
 
@@ -30,6 +30,18 @@ pub struct TierDecision {
     pub token_id: String,
     pub contracts: Decimal,
     pub bet_size_usd: Decimal,
+}
+
+/// Output of sweep evaluation: direction + price ladder to walk through.
+#[derive(Debug, Clone)]
+pub struct SweepPlan {
+    pub direction: Direction,
+    pub delta_pct: Decimal,
+    pub fair_value: Decimal,
+    pub token_id: String,
+    /// Ascending price levels from cheapest (most profit) to most aggressive (most fill).
+    pub prices: Vec<Decimal>,
+    pub max_bet_usd: Decimal,
 }
 
 impl SignalEngine {
@@ -235,6 +247,79 @@ impl SignalEngine {
             token_id,
             contracts,
             bet_size_usd,
+        })
+    }
+
+    // ── Sweep path ────────────────────────────────────────────────────────────
+
+    /// Returns a SweepPlan with direction, fair_value and a price ladder.
+    /// Called once at the start of the sweep window.
+    pub fn evaluate_sweep(
+        &self,
+        state: &BotState,
+        market: &MarketInfo,
+        sweep: &SweepConfig,
+        max_bet_usd: Decimal,
+    ) -> Option<SweepPlan> {
+        if state.btc_price.is_zero() || state.window_open_price.is_zero() {
+            warn!("No BTC price for sweep evaluation");
+            return None;
+        }
+        if !state.has_fresh_price() {
+            warn!(age_ms = ?state.btc_price_age_ms(), "BTC price stale for sweep");
+            return None;
+        }
+
+        let (direction, abs_delta_pct) = compute_delta(state.btc_price, state.window_open_price);
+        let min_delta = Decimal::try_from(sweep.min_delta_pct).unwrap_or(dec!(0.01));
+
+        if abs_delta_pct < min_delta {
+            info!(
+                delta = %abs_delta_pct,
+                min = %min_delta,
+                "Sweep: delta below minimum, skipping"
+            );
+            return None;
+        }
+
+        let fair_value = self.price_for_delta(abs_delta_pct).unwrap_or(dec!(0.55));
+
+        let start_off = Decimal::try_from(sweep.start_offset).unwrap_or(dec!(-0.12));
+        let end_off = Decimal::try_from(sweep.end_offset).unwrap_or(dec!(0.02));
+        let steps = sweep.steps.max(2);
+
+        let step_size = (end_off - start_off) / Decimal::from(steps - 1);
+        let min_price = dec!(0.01);
+        let max_price = self.max_entry_price;
+
+        let prices: Vec<Decimal> = (0..steps)
+            .map(|i| {
+                let p = (fair_value + start_off + step_size * Decimal::from(i))
+                    .round_dp(2);
+                p.max(min_price).min(max_price)
+            })
+            .collect();
+
+        let token_id = match direction {
+            Direction::Up => market.up_token_id.clone(),
+            Direction::Down => market.down_token_id.clone(),
+        };
+
+        info!(
+            direction = %direction,
+            delta_pct = %abs_delta_pct,
+            fair_value = %fair_value,
+            prices = ?prices,
+            "Sweep plan generated"
+        );
+
+        Some(SweepPlan {
+            direction,
+            delta_pct: abs_delta_pct,
+            fair_value,
+            token_id,
+            prices,
+            max_bet_usd,
         })
     }
 

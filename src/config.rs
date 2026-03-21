@@ -37,7 +37,10 @@ pub struct SignalConfig {
     pub max_entry_price: f64,
     pub order_lifetime_ms: u64,
     pub delta_pricing: DeltaPricingConfig,
+    pub sweep: SweepConfig,
+    #[serde(default)]
     pub entry_tiers: EntryTiersConfig,
+    #[serde(default)]
     pub single_entry: SingleEntryConfig,
 }
 
@@ -46,29 +49,53 @@ pub struct DeltaPricingConfig {
     pub tiers: Vec<[f64; 3]>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SweepConfig {
+    /// Seconds before window close to begin sweep.
+    pub start_s: u64,
+    /// Minimum absolute BTC delta % to trigger a sweep.
+    pub min_delta_pct: f64,
+    /// First bid offset from fair value (negative = cheaper, more profit).
+    pub start_offset: f64,
+    /// Last bid offset from fair value (positive = above fair value, ensures fill).
+    pub end_offset: f64,
+    /// Number of price steps in the sweep.
+    pub steps: u32,
+}
+
 /// A single entry tier: fires at T-`time_before_close_s` with `price_offset` from fair value.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EntryTier {
     pub name: String,
-    /// Seconds before window close at which this tier activates.
     pub time_before_close_s: u64,
-    /// Added to estimated fair value to get target price (negative = cheaper, e.g. -0.10).
     pub price_offset: f64,
-    /// Minimum absolute BTC delta % required for this tier to fire.
     pub min_delta_pct: f64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct EntryTiersConfig {
+    #[serde(default)]
     pub enabled: bool,
-    /// Wake up this many seconds before close to start the tier loop.
+    #[serde(default = "default_watch_start")]
     pub watch_start_s: u64,
+    #[serde(default)]
     pub tiers: Vec<EntryTier>,
 }
 
+fn default_watch_start() -> u64 { 30 }
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SingleEntryConfig {
+    #[serde(default = "default_single_entry_time")]
     pub entry_time_before_close_s: u64,
+}
+
+fn default_single_entry_time() -> u64 { 10 }
+
+impl Default for SingleEntryConfig {
+    fn default() -> Self {
+        Self { entry_time_before_close_s: 10 }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,9 +104,12 @@ pub struct InfraConfig {
     pub binance_ws_url: String,
     pub polymarket_clob_url: String,
     pub polymarket_ws_url: String,
+    pub polygon_rpc_url: String,
     pub polygon_chain_id: u64,
     pub signature_type: String,
     pub db_path: String,
+    #[serde(default)]
+    pub auto_redeem: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,9 +140,15 @@ impl AppConfig {
         let toml_cfg: TomlConfig =
             toml::from_str(&toml_str).context("Failed to parse config.toml")?;
 
-        // Validate entry tiers
-        validate_entry_tiers(&toml_cfg.signal.entry_tiers)
-            .context("Invalid [signal.entry_tiers] configuration")?;
+        // Validate sweep config
+        validate_sweep(&toml_cfg.signal.sweep)
+            .context("Invalid [signal.sweep] configuration")?;
+
+        // Validate entry tiers (if present)
+        if toml_cfg.signal.entry_tiers.enabled {
+            validate_entry_tiers(&toml_cfg.signal.entry_tiers)
+                .context("Invalid [signal.entry_tiers] configuration")?;
+        }
 
         let mode: BotMode = std::env::var("BOT_MODE")
             .unwrap_or_else(|_| "paper".to_string())
@@ -145,43 +181,6 @@ impl AppConfig {
                 self.mode = mode;
             }
         }
-
-        if cli.single_entry {
-            self.signal.entry_tiers.enabled = false;
-        }
-
-        if let Some(t) = cli.entry_time {
-            self.signal.single_entry.entry_time_before_close_s = t;
-        }
-
-        if let Some(name) = &cli.skip_tier {
-            self.signal
-                .entry_tiers
-                .tiers
-                .retain(|t| t.name != *name);
-        }
-
-        // Per-tier overrides (matched by position: early=0, mid=1, late=2)
-        if let Some(t) = cli.tier_early_time {
-            if let Some(tier) = self.signal.entry_tiers.tiers.get_mut(0) {
-                tier.time_before_close_s = t;
-            }
-        }
-        if let Some(o) = cli.tier_early_offset {
-            if let Some(tier) = self.signal.entry_tiers.tiers.get_mut(0) {
-                tier.price_offset = o;
-            }
-        }
-        if let Some(t) = cli.tier_mid_time {
-            if let Some(tier) = self.signal.entry_tiers.tiers.get_mut(1) {
-                tier.time_before_close_s = t;
-            }
-        }
-        if let Some(t) = cli.tier_late_time {
-            if let Some(tier) = self.signal.entry_tiers.tiers.get_mut(2) {
-                tier.time_before_close_s = t;
-            }
-        }
     }
 
     pub fn signature_type(&self) -> Result<SignatureType> {
@@ -210,14 +209,33 @@ impl AppConfig {
             && self.telegram_chat_id.is_some()
     }
 
-    /// Watch-start time: when the tier loop begins monitoring.
+    /// Watch-start time: when the sweep loop should wake up.
     pub fn watch_start_s(&self) -> u64 {
-        if self.signal.entry_tiers.enabled {
-            self.signal.entry_tiers.watch_start_s
-        } else {
-            self.signal.single_entry.entry_time_before_close_s + 1
-        }
+        self.signal.sweep.start_s + 2
     }
+}
+
+fn validate_sweep(cfg: &SweepConfig) -> Result<()> {
+    if cfg.start_s < 3 || cfg.start_s > 30 {
+        bail!("sweep.start_s must be 3..=30, got {}", cfg.start_s);
+    }
+    if cfg.steps < 2 || cfg.steps > 20 {
+        bail!("sweep.steps must be 2..=20, got {}", cfg.steps);
+    }
+    if cfg.start_offset >= cfg.end_offset {
+        bail!(
+            "sweep.start_offset ({}) must be < end_offset ({})",
+            cfg.start_offset,
+            cfg.end_offset
+        );
+    }
+    if cfg.min_delta_pct < 0.001 || cfg.min_delta_pct > 1.0 {
+        bail!(
+            "sweep.min_delta_pct must be 0.001..=1.0, got {}",
+            cfg.min_delta_pct
+        );
+    }
+    Ok(())
 }
 
 fn validate_entry_tiers(cfg: &EntryTiersConfig) -> Result<()> {

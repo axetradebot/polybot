@@ -14,8 +14,10 @@ polymarket-client-sdk = { version = "0.4", features = [
     "clob",
     "ws",
     "gamma",
+    "ctf",
     "tracing",
 ] }
+alloy = { version = "1", features = ["provider-http", "signer-local"] }
 
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.28", features = ["native-tls"] }

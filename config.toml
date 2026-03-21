@@ -7,7 +7,7 @@ pause_duration_minutes = 30
 
 [signal]
 min_delta_pct = 0.01
-max_entry_price = 0.92
+max_entry_price = 0.95
 order_lifetime_ms = 8000
 
 [signal.delta_pricing]
@@ -21,42 +21,23 @@ tiers = [
     [0.20, 1.00, 0.90],
 ]
 
-# Tiered entry system: post orders earlier at better prices, tighten as window closes.
-# Set enabled = false to fall back to single_entry behaviour.
-[signal.entry_tiers]
-enabled = true
-# Bot wakes up this many seconds before close and begins the tier loop.
-watch_start_s = 30
-
-[[signal.entry_tiers.tiers]]
-name = "early"
-time_before_close_s = 20
-price_offset = -0.05
-min_delta_pct = 0.06
-
-[[signal.entry_tiers.tiers]]
-name = "mid"
-time_before_close_s = 12
-price_offset = -0.03
-min_delta_pct = 0.04
-
-[[signal.entry_tiers.tiers]]
-name = "late"
-time_before_close_s = 6
-price_offset = 0.0
-min_delta_pct = 0.01
-
-# Used when entry_tiers.enabled = false
-[signal.single_entry]
-entry_time_before_close_s = 10
+# Price sweep: start cheap, ramp up every ~1.3s until filled or window closes.
+[signal.sweep]
+start_s = 20            # begin sweeping at T-20
+min_delta_pct = 0.01    # minimum BTC move % to trigger
+start_offset = -0.06    # first bid: fair_value - 0.06 (near bottom of book)
+end_offset = 0.15       # last bid: fair_value + 0.15 (guarantees fill)
+steps = 15              # 15 price levels over ~20 seconds
 
 [infrastructure]
 binance_ws_url = "wss://stream.binance.com:9443/ws/btcusdt@trade"
 polymarket_clob_url = "https://clob.polymarket.com"
 polymarket_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+polygon_rpc_url = "https://polygon-rpc.com"
 polygon_chain_id = 137
 signature_type = "GnosisSafe"
 db_path = "./trades.db"
+auto_redeem = true
 
 [logging]
 level = "info"

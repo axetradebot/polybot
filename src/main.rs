@@ -21,10 +21,10 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::cli::Cli;
-use crate::config::{AppConfig, EntryTier};
+use crate::config::AppConfig;
 use crate::db::TradeDb;
 use crate::risk::RiskManager;
-use crate::signal::{SignalEngine, TierDecision};
+use crate::signal::{SignalEngine, SweepPlan, TierDecision};
 use crate::state::{new_shared_state, SharedState};
 use crate::telegram::TelegramNotifier;
 use crate::types::{BotMode, Direction, MarketInfo, OrderResult, TradeOutcome, TradeRecord};
@@ -38,6 +38,8 @@ struct PendingSettle {
     fill_size: Decimal,
     tier_name: String,
     btc_open_price: Decimal,
+    condition_id: String,
+    neg_risk: bool,
 }
 
 /// Returned by paper tier / single-entry loops when an order fills.
@@ -162,7 +164,6 @@ async fn run_paper_loop(
     telegram: &Arc<TelegramNotifier>,
 ) -> Result<()> {
     let watch_start = config.watch_start_s();
-    let use_tiers = config.signal.entry_tiers.enabled;
     let mode = config.mode;
     let mut last_window_ts: u64 = 0;
     let mut last_pending_settle: Option<PendingSettle> = None;
@@ -173,7 +174,6 @@ async fn run_paper_loop(
         let window = market::current_window_info();
         let secs_left = window.seconds_remaining;
 
-        // ── New window: set open price, spawn settlement for previous ──
         if window.window_ts != last_window_ts {
             let btc_now = state.read().await.btc_price;
             {
@@ -195,15 +195,17 @@ async fn run_paper_loop(
                 let db2 = db.clone();
                 let tg2 = telegram.clone();
                 let st2 = state.clone();
+                let rpc = config.infra.polygon_rpc_url.clone();
+                let pk = config.private_key.clone();
+                let do_redeem = config.infra.auto_redeem;
                 tokio::spawn(async move {
-                    settle_trade(ps, mode, db2, tg2, st2).await.ok();
+                    settle_trade(ps, mode, db2, tg2, st2, &rpc, &pk, do_redeem).await.ok();
                 });
             }
 
             last_window_ts = window.window_ts;
         }
 
-        // ── Sleep until watch window begins ──
         if secs_left > watch_start + 1 {
             let sleep_secs = secs_left - watch_start - 1;
             info!(sleep_secs, "[PAPER] Waiting for entry window");
@@ -211,13 +213,11 @@ async fn run_paper_loop(
             continue;
         }
 
-        // Skip if window basically over
         if secs_left < 2 {
             tokio::time::sleep(Duration::from_secs(secs_left + 1)).await;
             continue;
         }
 
-        // ── Resolve market ──
         let market_info = match resolve_market_for_window(&state, &window.slug, secs_left).await {
             Some(m) => m,
             None => {
@@ -226,7 +226,6 @@ async fn run_paper_loop(
             }
         };
 
-        // ── Risk check ──
         {
             let st = state.read().await;
             if let Err(veto) = risk_manager.check(&st) {
@@ -236,33 +235,23 @@ async fn run_paper_loop(
             }
         }
 
-        // Capture open price now, before the tier loop might straddle a window boundary.
         let btc_open_price = state.read().await.window_open_price;
+        let max_bet = risk_manager.position_size(&*state.read().await);
+        let sweep_cfg = &config.signal.sweep;
 
-        // ── Tier or single-entry loop ──
-        let fill_info = if use_tiers {
-            run_paper_tier_loop(
-                &state,
-                config,
-                signal_engine,
-                risk_manager,
-                &market_info,
-                db,
-                telegram,
-            )
-            .await
-        } else {
-            run_paper_single_entry(
-                &state,
-                config,
-                signal_engine,
-                risk_manager,
-                &market_info,
-                db,
-                telegram,
-                secs_left,
-            )
-            .await
+        let plan = {
+            let st = state.read().await;
+            signal_engine.evaluate_sweep(&st, &market_info, sweep_cfg, max_bet)
+        };
+
+        let fill_info = match plan {
+            None => {
+                info!("[PAPER] Sweep skipped — delta too low");
+                None
+            }
+            Some(plan) => {
+                run_paper_sweep(&plan, max_bet, config, db, telegram).await
+            }
         };
 
         if let Some(fi) = fill_info {
@@ -274,189 +263,48 @@ async fn run_paper_loop(
                 fill_size: fi.fill_size,
                 tier_name: fi.tier_name,
                 btc_open_price,
+                condition_id: market_info.condition_id.clone(),
+                neg_risk: market_info.neg_risk,
             });
         }
 
-        // ── Sleep until next window ──
         let remaining = market::seconds_until_close();
         tokio::time::sleep(Duration::from_secs(remaining + 2)).await;
     }
 }
 
-/// Tier loop for paper trading. Returns fill info if an order was filled.
-async fn run_paper_tier_loop(
-    state: &SharedState,
+/// Paper sweep: simulate the price sweep and pick the best fill.
+async fn run_paper_sweep(
+    plan: &SweepPlan,
+    max_bet: Decimal,
     config: &AppConfig,
-    signal_engine: &SignalEngine,
-    risk_manager: &RiskManager,
-    market_info: &MarketInfo,
     db: &Arc<TradeDb>,
     telegram: &Arc<TelegramNotifier>,
 ) -> Option<FillInfo> {
-    let tiers: Vec<EntryTier> = config.signal.entry_tiers.tiers.clone();
-    let max_bet = risk_manager.position_size(&*state.read().await);
-
-    let mut next_tier_idx = 0usize;
-    let mut last_order: Option<(String, TierDecision)> = None; // (order_id, decision)
-
-    loop {
-        let secs = market::seconds_until_close();
-
-        if secs < 1 {
-            // Window closing — last order didn't fill
-            if let Some((oid, dec)) = last_order {
-                log_unfilled_paper_order(&oid, &dec, secs, config, db, telegram).await;
-            }
-            info!("[PAPER] Window closing — no fill");
-            return None;
-        }
-
-        // Advance to the next tier whose threshold we've just crossed
-        while next_tier_idx < tiers.len() {
-            let tier = &tiers[next_tier_idx];
-            if secs > tier.time_before_close_s {
-                break; // Haven't reached this tier's time yet
-            }
-
-            info!(
-                tier = %tier.name,
-                secs_left = secs,
-                "Tier threshold crossed"
-            );
-
-            // Evaluate signal for this specific tier
-            let decision = {
-                let st = state.read().await;
-                signal_engine.evaluate_tier(secs, &st, market_info, &tiers, max_bet)
-            };
-
-            match decision {
-                    None => {
-                        info!(tier = %tier.name, "Tier skipped (insufficient delta or price)");
-                        next_tier_idx += 1;
-                    }
-                    Some(d) => {
-                        // Cancel previous pending order (paper: log as unfilled)
-                        if let Some((prev_oid, prev_dec)) = last_order.take() {
-                            info!(
-                                cancelled_tier = %prev_dec.tier_name,
-                                new_tier = %d.tier_name,
-                                "Cancel/replace: moving to next tier"
-                            );
-                            log_unfilled_paper_order(
-                                &prev_oid, &prev_dec, secs, config, db, telegram,
-                            )
-                            .await;
-                        }
-
-                        // Place new paper order for this tier
-                        match orders::place_paper_order(&d, max_bet).await {
-                            Ok(result) => {
-                                if result.filled {
-                                    let fi = FillInfo {
-                                        order_id: result.order_id.clone(),
-                                        direction: d.direction,
-                                        fill_price: result.fill_price,
-                                        fill_size: result.fill_size,
-                                        tier_name: d.tier_name.clone(),
-                                    };
-                                    record_paper_fill(&result, &d, secs, config, db, telegram)
-                                        .await;
-                                    return Some(fi);
-                                } else {
-                                    // Order pending — hold until next tier
-                                    last_order = Some((result.order_id, d));
-                                    next_tier_idx += 1;
-                                }
-                            }
-                            Err(e) => {
-                                error!(tier = %tier.name, error = %e, "Paper order error");
-                                next_tier_idx += 1;
-                            }
-                        }
-                    }
-            }
-        }
-
-        if next_tier_idx >= tiers.len() {
-            // All tiers exhausted
-            if let Some((oid, dec)) = last_order.take() {
-                log_unfilled_paper_order(&oid, &dec, secs, config, db, telegram).await;
-            }
-            info!("[PAPER] All tiers exhausted — no fill this window");
-            return None;
-        }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// Single-entry paper path (tiers disabled).
-async fn run_paper_single_entry(
-    state: &SharedState,
-    config: &AppConfig,
-    signal_engine: &SignalEngine,
-    risk_manager: &RiskManager,
-    market_info: &MarketInfo,
-    db: &Arc<TradeDb>,
-    telegram: &Arc<TelegramNotifier>,
-    secs_left: u64,
-) -> Option<FillInfo> {
-    let entry_time = config.signal.single_entry.entry_time_before_close_s;
-
-    if secs_left > entry_time + 1 {
-        let sleep = secs_left - entry_time - 1;
-        tokio::time::sleep(Duration::from_secs(sleep)).await;
-    }
-
-    let secs = market::seconds_until_close();
-    let max_bet = risk_manager.position_size(&*state.read().await);
-
-    let signal = {
-        let st = state.read().await;
-        signal_engine.evaluate(&st, market_info)
-    };
-
-    let signal = match signal {
-        Some(s) => s,
-        None => {
-            info!("[PAPER] No signal for single-entry window");
-            return None;
-        }
-    };
-
-    let decision = TierDecision {
-        tier_name: "single".to_string(),
-        time_before_close_s: entry_time,
-        direction: signal.direction,
-        target_price: signal.target_price,
-        delta_pct: signal.delta_pct,
-        token_id: signal.token_id.clone(),
-        contracts: (max_bet / signal.target_price)
-            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero),
-        bet_size_usd: max_bet,
-    };
+    // In paper mode, simulate by picking the most aggressive price
+    // (last step) and assuming it fills, since that mirrors real behavior.
+    let best_price = *plan.prices.last()?;
+    let decision = sweep_to_decision(plan, best_price);
 
     match orders::place_paper_order(&decision, max_bet).await {
+        Ok(result) if result.filled => {
+            let secs = market::seconds_until_close();
+            record_paper_fill(&result, &decision, secs, config, db, telegram).await;
+            Some(FillInfo {
+                order_id: result.order_id,
+                direction: plan.direction,
+                fill_price: result.fill_price,
+                fill_size: result.fill_size,
+                tier_name: "sweep".to_string(),
+            })
+        }
         Ok(result) => {
-            if result.filled {
-                let fi = FillInfo {
-                    order_id: result.order_id.clone(),
-                    direction: decision.direction,
-                    fill_price: result.fill_price,
-                    fill_size: result.fill_size,
-                    tier_name: decision.tier_name.clone(),
-                };
-                record_paper_fill(&result, &decision, secs, config, db, telegram).await;
-                Some(fi)
-            } else {
-                log_unfilled_paper_order(&result.order_id, &decision, secs, config, db, telegram)
-                    .await;
-                None
-            }
+            let secs = market::seconds_until_close();
+            log_unfilled_paper_order(&result.order_id, &decision, secs, config, db, telegram).await;
+            None
         }
         Err(e) => {
-            error!(error = %e, "[PAPER] Single-entry order error");
+            error!(error = %e, "[PAPER] Sweep order error");
             None
         }
     }
@@ -543,8 +391,6 @@ async fn run_live_mode(
     info!("CLOB client authenticated, entering live trading loop");
 
     let watch_start = config.watch_start_s();
-    let use_tiers = config.signal.entry_tiers.enabled;
-    let order_lifetime_ms = config.signal.order_lifetime_ms;
     let mode = config.mode;
     let mut last_window_ts: u64 = 0;
     let mut last_pending_settle: Option<PendingSettle> = None;
@@ -576,8 +422,11 @@ async fn run_live_mode(
                 let db2 = db.clone();
                 let tg2 = telegram.clone();
                 let st2 = state.clone();
+                let rpc = config.infra.polygon_rpc_url.clone();
+                let pk = config.private_key.clone();
+                let do_redeem = config.infra.auto_redeem;
                 tokio::spawn(async move {
-                    settle_trade(ps, mode, db2, tg2, st2).await.ok();
+                    settle_trade(ps, mode, db2, tg2, st2, &rpc, &pk, do_redeem).await.ok();
                 });
             }
 
@@ -613,330 +462,248 @@ async fn run_live_mode(
             }
         }
 
-        // ── Tier loop ──
-        let tiers: Vec<EntryTier> = if use_tiers {
-            config.signal.entry_tiers.tiers.clone()
-        } else {
-            // Synthesise a single pseudo-tier from single_entry config
-            vec![crate::config::EntryTier {
-                name: "single".to_string(),
-                time_before_close_s: config.signal.single_entry.entry_time_before_close_s,
-                price_offset: 0.0,
-                min_delta_pct: config.signal.min_delta_pct,
-            }]
+        // ── Sweep loop ──
+        let max_bet = risk_manager.position_size(&*state.read().await);
+        let sweep_cfg = &config.signal.sweep;
+
+        let plan = {
+            let st = state.read().await;
+            signal_engine.evaluate_sweep(&st, &market_info, sweep_cfg, max_bet)
         };
 
-        let max_bet = risk_manager.position_size(&*state.read().await);
-        let mut next_tier_idx = 0usize;
-        let mut active_order_id: Option<String> = None;
-        let mut active_decision: Option<TierDecision> = None;
-
-        'tier_loop: loop {
-            let secs = market::seconds_until_close();
-
-            if secs < 1 {
-                // Cancel any dangling order
-                if active_order_id.is_some() {
-                    if let Err(e) = client.cancel_all_orders().await {
-                        warn!(error = %e, "Cancel failed at window close");
-                    }
-                    if let (Some(oid), Some(dec)) = (active_order_id.take(), active_decision.take()) {
-                        let fake = OrderResult {
-                            order_id: oid,
-                            filled: false,
-                            fill_price: Decimal::ZERO,
-                            fill_size: Decimal::ZERO,
-                        };
-                        record_live_order(&fake, &dec, secs, config, db, telegram).await;
-                    }
-                }
-                break 'tier_loop;
+        let plan = match plan {
+            Some(p) => {
+                let msg = format!(
+                    "Sweep starting: {} delta={}% prices={:?}",
+                    p.direction, p.delta_pct, p.prices
+                );
+                info!("{}", msg);
+                telegram.send_error(&msg).await.ok();
+                p
             }
-
-            // Advance tiers
-            while next_tier_idx < tiers.len() {
-                let tier = &tiers[next_tier_idx];
-                if secs > tier.time_before_close_s {
-                    break;
-                }
-
-                info!(tier = %tier.name, secs_left = secs, "Tier threshold crossed");
-
-                let decision = {
-                    let st = state.read().await;
-                    signal_engine.evaluate_tier(secs, &st, &market_info, &tiers, max_bet)
+            None => {
+                let st = state.read().await;
+                let delta = if st.window_open_price > Decimal::ZERO {
+                    ((st.btc_price - st.window_open_price).abs() / st.window_open_price * Decimal::from(100)).to_string()
+                } else {
+                    "N/A".to_string()
                 };
+                let msg = format!("Sweep skipped — delta {}% (need {}%)", delta, sweep_cfg.min_delta_pct);
+                info!("{}", msg);
+                telegram.send_error(&msg).await.ok();
+                let remaining = market::seconds_until_close();
+                tokio::time::sleep(Duration::from_secs(remaining + 2)).await;
+                continue;
+            }
+        };
 
-                match decision {
-                    None => {
-                        let st = state.read().await;
-                        let delta = if st.window_open_price > Decimal::ZERO {
-                            ((st.btc_price - st.window_open_price).abs() / st.window_open_price * Decimal::from(100)).to_string()
-                        } else {
-                            "N/A".to_string()
-                        };
-                        let msg = format!(
-                            "Tier '{}' skipped — delta {}% (need {}%)",
-                            tier.name, delta, tier.min_delta_pct
-                        );
-                        info!("{}", msg);
-                        telegram.send_error(&msg).await.ok();
-                        next_tier_idx += 1;
-                    }
-                    Some(d) => {
-                        info!(
-                            tier = %d.tier_name, direction = %d.direction,
-                            delta = %d.delta_pct, target = %d.target_price,
-                            contracts = %d.contracts, "Tier signal fired"
-                        );
+        let token_id_u256 = match U256::from_str(&plan.token_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let msg = format!("Invalid token ID: {e}");
+                error!("{}", msg);
+                telegram.send_error(&msg).await.ok();
+                let remaining = market::seconds_until_close();
+                tokio::time::sleep(Duration::from_secs(remaining + 2)).await;
+                continue;
+            }
+        };
 
-                        // Cancel previous order
-                        if active_order_id.is_some() {
-                            let cancel_start = std::time::Instant::now();
-                            if let Err(e) = client.cancel_all_orders().await {
-                                let msg = format!("Cancel failed before replace: {e}");
-                                warn!("{}", msg);
-                                telegram.send_error(&msg).await.ok();
-                            } else {
-                                info!(elapsed_ms = cancel_start.elapsed().as_millis(), "Order cancelled for tier replace");
-                            }
-                            if let (Some(oid), Some(prev_dec)) =
-                                (active_order_id.take(), active_decision.take())
-                            {
-                                let fake = OrderResult {
-                                    order_id: oid,
-                                    filled: false,
-                                    fill_price: Decimal::ZERO,
-                                    fill_size: Decimal::ZERO,
-                                };
-                                record_live_order(&fake, &prev_dec, secs, config, db, telegram)
-                                    .await;
-                            }
-                        }
+        let num_steps = plan.prices.len();
+        let sweep_duration_s = sweep_cfg.start_s.saturating_sub(1);
+        let step_interval_ms = if num_steps > 1 {
+            ((sweep_duration_s as f64 / (num_steps - 1) as f64) * 1000.0) as u64
+        } else {
+            1000
+        };
 
-                        // Place new order
-                        let token_id_res = U256::from_str(&d.token_id);
-                        let token_id = match token_id_res {
-                            Ok(id) => id,
-                            Err(e) => {
-                                let msg = format!("Invalid token ID: {e}");
-                                error!("{}", msg);
-                                telegram.send_error(&msg).await.ok();
-                                next_tier_idx += 1;
-                                continue;
-                            }
-                        };
+        let mut active_order_id: Option<String> = None;
+        let mut last_price = Decimal::ZERO;
+        let mut filled = false;
 
-                        let size = d.contracts;
-                        let price = d.target_price;
+        'sweep: for (step_idx, &price) in plan.prices.iter().enumerate() {
+            let secs = market::seconds_until_close();
+            if secs < 1 {
+                break 'sweep;
+            }
 
-                        // Step 1: Build order
-                        let order = match client
-                            .limit_order()
-                            .token_id(token_id)
-                            .size(size)
-                            .price(price)
-                            .side(Side::Buy)
-                            .build()
-                            .await
-                        {
-                            Ok(o) => o,
-                            Err(e) => {
-                                let msg = format!(
-                                    "BUILD ORDER FAILED: tier={} err={:?}",
-                                    d.tier_name, e
-                                );
-                                error!("{}", msg);
-                                telegram.send_error(&msg).await.ok();
-                                next_tier_idx += 1;
-                                active_decision = Some(d);
-                                continue;
-                            }
-                        };
+            let contracts = (plan.max_bet_usd / price)
+                .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
 
-                        // Step 2: Sign order
-                        let signed = match client.sign(&signer, order).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                let msg = format!(
-                                    "SIGN ORDER FAILED: tier={} err={:?}",
-                                    d.tier_name, e
-                                );
-                                error!("{}", msg);
-                                telegram.send_error(&msg).await.ok();
-                                next_tier_idx += 1;
-                                active_decision = Some(d);
-                                continue;
-                            }
-                        };
+            info!(
+                step = step_idx + 1,
+                of = num_steps,
+                price = %price,
+                contracts = %contracts,
+                secs_left = secs,
+                "Sweep step"
+            );
 
-                        // Step 3: Post order to CLOB
-                        match client.post_order(signed).await {
-                            Ok(resp) => {
-                                let oid = resp.order_id.clone();
-                                let msg = format!(
-                                    "Order SUBMITTED: tier={} id={} price=${}",
-                                    d.tier_name, oid, price
-                                );
-                                info!("{}", msg);
-                                telegram.send_error(&msg).await.ok();
-                                active_order_id = Some(oid);
-                                active_decision = Some(d);
-                                next_tier_idx += 1;
-                                break; // let the order sit on the book
-                            }
-                            Err(e) => {
-                                let msg = format!(
-                                    "POST ORDER REJECTED: tier={} price={} size={} token={}... err={:?}",
-                                    d.tier_name, price, size,
-                                    &d.token_id[..20.min(d.token_id.len())],
-                                    e
-                                );
-                                error!("{}", msg);
-                                telegram.send_error(&msg).await.ok();
-                                next_tier_idx += 1;
-                            }
-                        }
-                    }
+            // Cancel previous order if any
+            if active_order_id.is_some() {
+                if let Err(e) = client.cancel_all_orders().await {
+                    warn!(error = %e, "Cancel failed during sweep");
+                }
+                active_order_id = None;
+            }
+
+            // Build -> Sign -> Post
+            let order = match client
+                .limit_order()
+                .token_id(token_id_u256)
+                .size(contracts)
+                .price(price)
+                .side(Side::Buy)
+                .build()
+                .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!(step = step_idx, error = ?e, "Build order failed");
+                    continue;
+                }
+            };
+
+            let signed = match client.sign(&signer, order).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(step = step_idx, error = ?e, "Sign order failed");
+                    continue;
+                }
+            };
+
+            match client.post_order(signed).await {
+                Ok(resp) => {
+                    let oid = resp.order_id.clone();
+                    info!(step = step_idx, order_id = %oid, price = %price, "Order posted");
+                    active_order_id = Some(oid);
+                    last_price = price;
+                }
+                Err(e) => {
+                    warn!(step = step_idx, price = %price, error = ?e, "Post order rejected");
+                    continue;
                 }
             }
 
-            // Check for fill on active order
-            if let Some(oid) = &active_order_id {
-                let oid_clone = oid.clone();
-                info!(order_id = %oid_clone, secs_left = secs, "Polling for fill...");
-                let poll_result = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    client.orders(&Default::default(), None),
-                ).await;
-                match poll_result {
-                    Ok(Ok(page)) => {
-                        for o in &page.data {
-                            if o.id == oid_clone && o.size_matched > Decimal::ZERO {
-                                info!(order_id = %oid_clone, matched = %o.size_matched, "Live order filled!");
-                                telegram.send_error(&format!(
-                                    "FILLED! order={} matched={} price={}",
-                                    oid_clone, o.size_matched, o.price
-                                )).await.ok();
-                                let result = OrderResult {
-                                    order_id: oid_clone.clone(),
-                                    filled: true,
-                                    fill_price: o.price,
-                                    fill_size: o.size_matched,
-                                };
-                                let dec = active_decision.take().unwrap();
-                                let secs_entry = market::seconds_until_close();
-                                let btc_open = state.read().await.window_open_price;
-                                record_live_order(&result, &dec, secs_entry, config, db, telegram)
-                                    .await;
-                                last_pending_settle = Some(PendingSettle {
-                                    slug: window.slug.clone(),
-                                    order_id: oid_clone.clone(),
-                                    direction: dec.direction,
-                                    fill_price: o.price,
-                                    fill_size: o.size_matched,
-                                    tier_name: dec.tier_name.clone(),
-                                    btc_open_price: btc_open,
-                                });
-                                break 'tier_loop;
-                            }
-                        }
-                        info!(order_id = %oid_clone, "Not filled yet");
-                    }
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "Fill poll API error");
-                    }
-                    Err(_) => {
-                        warn!("Fill poll timed out (5s)");
-                    }
-                }
-            }
+            // Wait for step interval, polling for fill
+            let poll_deadline = tokio::time::Instant::now() + Duration::from_millis(step_interval_ms);
+            while tokio::time::Instant::now() < poll_deadline {
+                tokio::time::sleep(Duration::from_millis(300)).await;
 
-            if next_tier_idx >= tiers.len() && active_order_id.is_none() {
-                info!("All tiers exhausted — no fill");
-                telegram.send_error("All tiers exhausted — no fill this window").await.ok();
-                break 'tier_loop;
-            }
-
-            // All tiers used up but we have an active order — just wait for window close
-            if next_tier_idx >= tiers.len() {
-                // Don't poll forever; sleep until window closes then check once
-                let close_ts = window.close_ts();
-                let now = chrono::Utc::now().timestamp() as u64;
-                if now < close_ts {
-                    let wait = close_ts.saturating_sub(now) + 1;
-                    info!(wait_secs = wait, "All tiers done, waiting for window close");
-                    tokio::time::sleep(Duration::from_secs(wait)).await;
-                }
-                // One final fill check
                 if let Some(oid) = &active_order_id {
                     let oid_clone = oid.clone();
-                    info!(order_id = %oid_clone, "Final fill check at window close");
                     if let Ok(Ok(page)) = tokio::time::timeout(
-                        Duration::from_secs(5),
+                        Duration::from_secs(3),
                         client.orders(&Default::default(), None),
                     ).await {
                         for o in &page.data {
                             if o.id == oid_clone && o.size_matched > Decimal::ZERO {
-                                info!(order_id = %oid_clone, matched = %o.size_matched, "Live order filled!");
+                                info!(order_id = %oid_clone, matched = %o.size_matched, price = %o.price, "FILLED during sweep!");
                                 telegram.send_error(&format!(
-                                    "FILLED! order={} matched={} price={}",
-                                    oid_clone, o.size_matched, o.price
+                                    "FILLED! step={}/{} price=${} matched={}",
+                                    step_idx + 1, num_steps, o.price, o.size_matched
                                 )).await.ok();
+
+                                let decision = sweep_to_decision(&plan, o.price);
+                                let btc_open = state.read().await.window_open_price;
                                 let result = OrderResult {
                                     order_id: oid_clone.clone(),
                                     filled: true,
                                     fill_price: o.price,
                                     fill_size: o.size_matched,
                                 };
-                                let dec = active_decision.take().unwrap();
-                                let btc_open = state.read().await.window_open_price;
-                                record_live_order(&result, &dec, 0, config, db, telegram).await;
+                                record_live_order(&result, &decision, secs, config, db, telegram).await;
                                 last_pending_settle = Some(PendingSettle {
                                     slug: window.slug.clone(),
                                     order_id: oid_clone,
-                                    direction: dec.direction,
+                                    direction: plan.direction,
                                     fill_price: o.price,
                                     fill_size: o.size_matched,
-                                    tier_name: dec.tier_name.clone(),
+                                    tier_name: format!("sweep_{}", step_idx + 1),
                                     btc_open_price: btc_open,
+                                    condition_id: market_info.condition_id.clone(),
+                                    neg_risk: market_info.neg_risk,
                                 });
-                                break 'tier_loop;
+                                filled = true;
+                                break 'sweep;
                             }
                         }
                     }
-                    // Not filled — record as unfilled
-                    info!(order_id = %oid_clone, "Order expired unfilled");
-                    telegram.send_error("Order expired — not filled this window").await.ok();
-                    if let Some(dec) = active_decision.take() {
-                        let fake = OrderResult {
-                            order_id: oid_clone,
-                            filled: false,
-                            fill_price: Decimal::ZERO,
-                            fill_size: Decimal::ZERO,
-                        };
-                        record_live_order(&fake, &dec, 0, config, db, telegram).await;
+                }
+            }
+        }
+
+        // After sweep completes, if there's still an active order, wait for window close
+        if !filled {
+            if let Some(oid) = &active_order_id {
+                let close_ts = window.close_ts();
+                let now = chrono::Utc::now().timestamp() as u64;
+                if now < close_ts {
+                    let wait = close_ts.saturating_sub(now) + 1;
+                    info!(wait_secs = wait, "Sweep done, waiting for window close with last order");
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                }
+
+                // Final fill check
+                let oid_clone = oid.clone();
+                info!(order_id = %oid_clone, "Final fill check at window close");
+                if let Ok(Ok(page)) = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.orders(&Default::default(), None),
+                ).await {
+                    for o in &page.data {
+                        if o.id == oid_clone && o.size_matched > Decimal::ZERO {
+                            info!(order_id = %oid_clone, matched = %o.size_matched, "Filled at window close!");
+                            telegram.send_error(&format!(
+                                "FILLED at close! price=${} matched={}",
+                                o.price, o.size_matched
+                            )).await.ok();
+
+                            let decision = sweep_to_decision(&plan, o.price);
+                            let btc_open = state.read().await.window_open_price;
+                            let result = OrderResult {
+                                order_id: oid_clone.clone(),
+                                filled: true,
+                                fill_price: o.price,
+                                fill_size: o.size_matched,
+                            };
+                            record_live_order(&result, &decision, 0, config, db, telegram).await;
+                            last_pending_settle = Some(PendingSettle {
+                                slug: window.slug.clone(),
+                                order_id: oid_clone.clone(),
+                                direction: plan.direction,
+                                fill_price: o.price,
+                                fill_size: o.size_matched,
+                                tier_name: "sweep_final".to_string(),
+                                btc_open_price: btc_open,
+                                condition_id: market_info.condition_id.clone(),
+                                neg_risk: market_info.neg_risk,
+                            });
+                            filled = true;
+                            break;
+                        }
                     }
                 }
-                break 'tier_loop;
-            }
 
-            // Between-poll deadline: honour order_lifetime_ms cap
-            let min_secs_to_next_tier = tiers
-                .get(next_tier_idx)
-                .map(|t| {
-                    let s = market::seconds_until_close();
-                    s.saturating_sub(t.time_before_close_s)
-                })
-                .unwrap_or(0);
-
-            let sleep_ms = if min_secs_to_next_tier > 0 {
-                250u64 // poll while waiting for next tier
+                if !filled {
+                    info!(order_id = %oid_clone, "Sweep order expired unfilled");
+                    telegram.send_error(&format!("Sweep expired unfilled (last price ${})", last_price)).await.ok();
+                    if let Err(e) = client.cancel_all_orders().await {
+                        warn!(error = %e, "Cancel failed at window close");
+                    }
+                    let decision = sweep_to_decision(&plan, last_price);
+                    let fake = OrderResult {
+                        order_id: oid_clone,
+                        filled: false,
+                        fill_price: Decimal::ZERO,
+                        fill_size: Decimal::ZERO,
+                    };
+                    record_live_order(&fake, &decision, 0, config, db, telegram).await;
+                }
             } else {
-                order_lifetime_ms.min(500)
-            };
-
-            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                info!("Sweep: no orders placed this window");
+                telegram.send_error("Sweep: no orders placed this window").await.ok();
+            }
         }
 
         // Wait for next window
@@ -971,6 +738,21 @@ async fn resolve_market_for_window(
             warn!(error = %e, secs_left, "Failed to resolve market");
             None
         }
+    }
+}
+
+fn sweep_to_decision(plan: &SweepPlan, price: Decimal) -> TierDecision {
+    let contracts = (plan.max_bet_usd / price)
+        .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
+    TierDecision {
+        tier_name: "sweep".to_string(),
+        time_before_close_s: 0,
+        direction: plan.direction,
+        target_price: price,
+        delta_pct: plan.delta_pct,
+        token_id: plan.token_id.clone(),
+        contracts,
+        bet_size_usd: contracts * price,
     }
 }
 
@@ -1056,6 +838,9 @@ async fn settle_trade(
     db: Arc<TradeDb>,
     telegram: Arc<TelegramNotifier>,
     state: SharedState,
+    polygon_rpc_url: &str,
+    private_key: &str,
+    auto_redeem: bool,
 ) -> Result<()> {
     // Wait for the window to fully close and BTC to stabilise.
     tokio::time::sleep(Duration::from_secs(25)).await;
@@ -1147,6 +932,28 @@ async fn settle_trade(
         pnl,
         bankroll,
     ).await.ok();
+
+    // Auto-redeem winning positions on-chain
+    if won && auto_redeem && mode == BotMode::Live && !ps.condition_id.is_empty() {
+        info!(slug = %ps.slug, "Attempting auto-redeem of winning position...");
+        match redeem::auto_redeem(
+            polygon_rpc_url,
+            private_key,
+            &ps.condition_id,
+            ps.neg_risk,
+        ).await {
+            Ok(tx_hash) => {
+                let msg = format!("Auto-redeemed! tx: {}", tx_hash);
+                info!("{}", msg);
+                telegram.send_error(&msg).await.ok();
+            }
+            Err(e) => {
+                let msg = format!("Auto-redeem failed: {e:#}");
+                warn!("{}", msg);
+                telegram.send_error(&msg).await.ok();
+            }
+        }
+    }
 
     Ok(())
 }
