@@ -21,7 +21,7 @@ entry_cutoff_s = 4
 
 [scanner]
 scan_interval_ms = 1000
-min_edge_score = 0.05
+min_edge_score = 0.01
 max_orders_per_cycle = 3
 
 # ============================================================
@@ -38,17 +38,17 @@ max_orders_per_cycle = 3
 [[markets]]
 name = "BTC 5-min"
 asset = "BTC"
-mode = "paper"                         # ← flip to "live" when validated
+mode = "live"
 enabled = true
 window_seconds = 300
 slug_prefix = "btc-updown-5m"
 binance_symbol = "btcusdt"
 chainlink_symbol = "btc/usd"
-entry_start_s = 20
-min_delta_pct = 0.07
-max_entry_price = 0.85
+entry_start_s = 60
+min_delta_pct = 0.06
+max_entry_price = 0.88
 delta_tiers = [
-    [0.07, 0.80],
+    [0.06, 0.80],
     [0.10, 0.83],
     [0.15, 0.86],
     [0.25, 0.88],
@@ -63,9 +63,9 @@ window_seconds = 900
 slug_prefix = "btc-updown-15m"
 binance_symbol = "btcusdt"
 chainlink_symbol = "btc/usd"
-entry_start_s = 45
+entry_start_s = 120
 min_delta_pct = 0.06
-max_entry_price = 0.86
+max_entry_price = 0.88
 delta_tiers = [
     [0.06, 0.80],
     [0.10, 0.83],
@@ -76,20 +76,20 @@ delta_tiers = [
 [[markets]]
 name = "ETH 5-min"
 asset = "ETH"
-mode = "paper"
+mode = "live"
 enabled = true
 window_seconds = 300
 slug_prefix = "eth-updown-5m"
 binance_symbol = "ethusdt"
 chainlink_symbol = "eth/usd"
-entry_start_s = 20
-min_delta_pct = 0.09
-max_entry_price = 0.85
+entry_start_s = 60
+min_delta_pct = 0.06
+max_entry_price = 0.88
 delta_tiers = [
-    [0.09, 0.80],
-    [0.12, 0.83],
-    [0.18, 0.86],
-    [0.30, 0.88],
+    [0.06, 0.80],
+    [0.10, 0.83],
+    [0.15, 0.86],
+    [0.25, 0.88],
 ]
 
 [[markets]]
@@ -101,14 +101,14 @@ window_seconds = 900
 slug_prefix = "eth-updown-15m"
 binance_symbol = "ethusdt"
 chainlink_symbol = "eth/usd"
-entry_start_s = 45
-min_delta_pct = 0.08
-max_entry_price = 0.86
+entry_start_s = 120
+min_delta_pct = 0.06
+max_entry_price = 0.88
 delta_tiers = [
-    [0.08, 0.80],
-    [0.12, 0.83],
-    [0.18, 0.86],
-    [0.30, 0.88],
+    [0.06, 0.80],
+    [0.10, 0.83],
+    [0.15, 0.86],
+    [0.25, 0.88],
 ]
 
 [[markets]]
@@ -120,14 +120,14 @@ window_seconds = 300
 slug_prefix = "sol-updown-5m"
 binance_symbol = "solusdt"
 chainlink_symbol = "sol/usd"
-entry_start_s = 20
-min_delta_pct = 0.12
-max_entry_price = 0.83
+entry_start_s = 60
+min_delta_pct = 0.06
+max_entry_price = 0.88
 delta_tiers = [
-    [0.12, 0.78],
-    [0.18, 0.82],
-    [0.25, 0.85],
-    [0.40, 0.88],
+    [0.06, 0.78],
+    [0.12, 0.82],
+    [0.18, 0.85],
+    [0.30, 0.88],
 ]
 
 [[markets]]
@@ -139,33 +139,33 @@ window_seconds = 900
 slug_prefix = "sol-updown-15m"
 binance_symbol = "solusdt"
 chainlink_symbol = "sol/usd"
-entry_start_s = 45
-min_delta_pct = 0.10
-max_entry_price = 0.84
+entry_start_s = 120
+min_delta_pct = 0.06
+max_entry_price = 0.88
 delta_tiers = [
-    [0.10, 0.78],
-    [0.15, 0.82],
-    [0.22, 0.85],
-    [0.35, 0.88],
+    [0.06, 0.78],
+    [0.12, 0.82],
+    [0.18, 0.85],
+    [0.30, 0.88],
 ]
 
 [[markets]]
 name = "XRP 5-min"
 asset = "XRP"
 mode = "paper"
-enabled = false                        # disabled — enable after others are profitable
+enabled = false
 window_seconds = 300
 slug_prefix = "xrp-updown-5m"
 binance_symbol = "xrpusdt"
 chainlink_symbol = "xrp/usd"
-entry_start_s = 20
-min_delta_pct = 0.15
-max_entry_price = 0.82
+entry_start_s = 60
+min_delta_pct = 0.06
+max_entry_price = 0.88
 delta_tiers = [
-    [0.15, 0.78],
-    [0.20, 0.82],
-    [0.30, 0.85],
-    [0.50, 0.88],
+    [0.06, 0.78],
+    [0.12, 0.82],
+    [0.20, 0.85],
+    [0.35, 0.88],
 ]
 
 [[markets]]
@@ -177,14 +177,14 @@ window_seconds = 900
 slug_prefix = "xrp-updown-15m"
 binance_symbol = "xrpusdt"
 chainlink_symbol = "xrp/usd"
-entry_start_s = 45
-min_delta_pct = 0.12
-max_entry_price = 0.83
+entry_start_s = 120
+min_delta_pct = 0.06
+max_entry_price = 0.88
 delta_tiers = [
-    [0.12, 0.78],
-    [0.18, 0.82],
-    [0.25, 0.85],
-    [0.40, 0.88],
+    [0.06, 0.78],
+    [0.12, 0.82],
+    [0.20, 0.85],
+    [0.35, 0.88],
 ]
 
 [telegram]

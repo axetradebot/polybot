@@ -55,16 +55,11 @@ impl TradeDb {
                 fills           INTEGER NOT NULL DEFAULT 0,
                 total_pnl       TEXT NOT NULL DEFAULT '0',
                 mode            TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_trades_window ON trades(window_ts);
-            CREATE INDEX IF NOT EXISTS idx_trades_outcome ON trades(outcome);
-            CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(market_name);",
+            );",
         )
         .context("Failed to initialize database schema")?;
 
-        // Migrate existing databases that lack newer columns.
+        // Migrate existing databases that lack newer columns (silently skip if already present).
         let migrations = [
             "ALTER TABLE trades ADD COLUMN market_name TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE trades ADD COLUMN asset TEXT NOT NULL DEFAULT ''",
@@ -88,6 +83,15 @@ impl TradeDb {
         for sql in &migrations {
             let _ = conn.execute(sql, []);
         }
+
+        // Create indexes after migrations so columns exist for old databases.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_trades_window ON trades(window_ts);
+             CREATE INDEX IF NOT EXISTS idx_trades_outcome ON trades(outcome);
+             CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
+             CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(market_name);",
+        )
+        .context("Failed to create indexes")?;
 
         info!(path = %path.display(), "Trade database opened");
 

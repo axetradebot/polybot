@@ -105,20 +105,32 @@ async fn main() -> Result<()> {
     // Spawn Binance combined price feed
     price_feeds.spawn_binance_feed(symbols.clone(), &config.infra.binance_ws_base);
 
-    // Wait for at least one price to arrive
+    // Wait for ALL symbols to have fresh prices before starting
     info!("Waiting for initial price data from Binance...");
+    let price_wait_start = tokio::time::Instant::now();
     loop {
-        let mut any_fresh = false;
+        let mut all_fresh = true;
         for sym in &symbols {
-            if price_feeds.has_fresh_price(sym).await {
-                any_fresh = true;
+            if !price_feeds.has_fresh_price(sym).await {
+                all_fresh = false;
                 break;
             }
         }
-        if any_fresh {
+        if all_fresh {
             for sym in &symbols {
                 if let Some(p) = price_feeds.get_price(sym).await {
                     info!(symbol = %sym, price = %p, "Initial price received");
+                }
+            }
+            break;
+        }
+        if price_wait_start.elapsed() > Duration::from_secs(30) {
+            warn!("Timed out waiting for all prices, starting with available data");
+            for sym in &symbols {
+                if let Some(p) = price_feeds.get_price(sym).await {
+                    info!(symbol = %sym, price = %p, "Price available");
+                } else {
+                    warn!(symbol = %sym, "No price data yet");
                 }
             }
             break;
@@ -277,8 +289,36 @@ async fn run_scanner_loop(
         "Entering scanner loop"
     );
 
+    let mut heartbeat_counter: u64 = 0;
+    let hb_symbols = config.binance_symbols();
+
     loop {
         let cycle_start = tokio::time::Instant::now();
+        heartbeat_counter += 1;
+
+        // Heartbeat every 60 seconds
+        if heartbeat_counter % 60 == 0 {
+            let open_pos = positions.open_count().await;
+            let ws_msgs = crate::feeds::binance::messages_received();
+            let st = state.read().await;
+            let mut price_ages = Vec::new();
+            for sym in &hb_symbols {
+                if let Some(age) = price_feeds.price_age_ms(sym).await {
+                    price_ages.push(format!("{}={}ms", sym, age));
+                } else {
+                    price_ages.push(format!("{}=NONE", sym));
+                }
+            }
+            info!(
+                positions = open_pos,
+                bankroll = %st.bankroll,
+                wins = st.daily_wins,
+                losses = st.daily_losses,
+                ws_messages = ws_msgs,
+                price_ages = %price_ages.join(", "),
+                "Heartbeat"
+            );
+        }
 
         // ── Daily reset ──
         state.write().await.reset_daily_if_needed();
@@ -318,6 +358,25 @@ async fn run_scanner_loop(
 
                 last_window_ts.insert(mkt.name.clone(), window_ts);
             } else {
+                // Retry open price capture if it was missed at window start
+                let wo_key_exists = price_feeds
+                    .get_window_open(&mkt.slug_prefix, window_ts)
+                    .await
+                    .is_some();
+                if !wo_key_exists {
+                    if let Some(price) = price_feeds.get_price(&mkt.binance_symbol).await {
+                        price_feeds
+                            .set_window_open(&mkt.slug_prefix, window_ts, price)
+                            .await;
+                        info!(
+                            market = %mkt.name,
+                            window_ts,
+                            open_price = %price,
+                            "Open price set (late capture)"
+                        );
+                    }
+                }
+
                 // Retry token resolution if missing
                 let slug = market::build_slug(&mkt.slug_prefix, window_ts);
                 if !token_cache.contains_key(&slug) && secs_rem > entry_cutoff_s {

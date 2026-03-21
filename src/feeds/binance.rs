@@ -2,18 +2,19 @@ use anyhow::Result;
 use futures::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use super::PriceFeeds;
 use crate::types::{BinanceCombinedMessage, BinanceTrade};
 
-/// Run a Binance combined WebSocket stream for multiple symbols.
-///
-/// Uses the combined-stream endpoint:
-///   wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/...
-///
-/// Each message wraps the trade data with a `stream` field identifying the symbol.
+static MSG_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn messages_received() -> u64 {
+    MSG_COUNT.load(Ordering::Relaxed)
+}
+
 pub async fn run_combined_feed(
     feeds: PriceFeeds,
     symbols: &[String],
@@ -30,23 +31,27 @@ pub async fn run_combined_feed(
         format!("{}?streams={}", base_for_combined, streams_param)
     };
 
+    let mut reconnect_count = 0u32;
+
     loop {
-        info!(url = %url, symbols = ?symbols, "Connecting to Binance WebSocket...");
+        info!(url = %url, symbols = ?symbols, reconnects = reconnect_count, "Connecting to Binance WebSocket...");
 
         match connect_async(&url).await {
             Ok((ws_stream, _response)) => {
                 info!(symbols = ?symbols, "Binance WebSocket connected");
+                reconnect_count = 0;
                 let (mut write, mut read) = ws_stream.split();
 
                 while let Some(msg_result) = read.next().await {
                     match msg_result {
                         Ok(Message::Text(text)) => {
+                            MSG_COUNT.fetch_add(1, Ordering::Relaxed);
                             if symbols.len() == 1 {
                                 if let Err(e) = handle_single_trade(&feeds, &text).await {
-                                    debug!(error = %e, "Failed to parse single-stream trade");
+                                    warn!(error = %e, "Failed to parse single-stream trade");
                                 }
                             } else if let Err(e) = handle_combined_trade(&feeds, &text).await {
-                                debug!(error = %e, "Failed to parse combined-stream trade");
+                                warn!(error = %e, text = %text.chars().take(200).collect::<String>(), "Failed to parse combined-stream trade");
                             }
                         }
                         Ok(Message::Ping(data)) => {
@@ -71,12 +76,13 @@ pub async fn run_combined_feed(
             }
         }
 
-        warn!("Binance WebSocket disconnected, reconnecting in 3s...");
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        reconnect_count += 1;
+        let backoff = std::cmp::min(3 * reconnect_count, 30);
+        warn!(reconnect_in_secs = backoff, attempt = reconnect_count, "Binance WebSocket disconnected, reconnecting...");
+        tokio::time::sleep(std::time::Duration::from_secs(backoff as u64)).await;
     }
 }
 
-/// Handle a single-symbol stream message (legacy format, one symbol only).
 async fn handle_single_trade(feeds: &PriceFeeds, text: &str) -> Result<()> {
     let trade: BinanceTrade = serde_json::from_str(text)?;
     let price = Decimal::from_str(&trade.price)?;
@@ -85,7 +91,6 @@ async fn handle_single_trade(feeds: &PriceFeeds, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Handle a combined-stream message with the `{stream, data}` wrapper.
 async fn handle_combined_trade(feeds: &PriceFeeds, text: &str) -> Result<()> {
     let msg: BinanceCombinedMessage = serde_json::from_str(text)?;
     let price = Decimal::from_str(&msg.data.price)?;

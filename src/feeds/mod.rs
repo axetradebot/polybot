@@ -5,17 +5,13 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::warn;
 
-/// Thread-safe price data for a single symbol.
 struct PriceData {
     price: Decimal,
     updated_at: DateTime<Utc>,
 }
 
-/// Multi-asset price feed manager.
-///
-/// Holds current prices by Binance symbol (e.g. "btcusdt") and
-/// window-open prices by a compound key like "btc-updown-5m:1774090500".
 #[derive(Clone)]
 pub struct PriceFeeds {
     prices: Arc<RwLock<HashMap<String, PriceData>>>,
@@ -30,7 +26,6 @@ impl PriceFeeds {
         }
     }
 
-    /// Update the current price for a symbol.
     pub async fn set_price(&self, symbol: &str, price: Decimal) {
         let mut map = self.prices.write().await;
         map.insert(
@@ -42,37 +37,55 @@ impl PriceFeeds {
         );
     }
 
-    /// Get current price for a symbol.
     pub async fn get_price(&self, symbol: &str) -> Option<Decimal> {
         let map = self.prices.read().await;
         map.get(&symbol.to_lowercase()).map(|d| d.price)
     }
 
-    /// Check if we have a fresh price (< 5s old) for a symbol.
+    /// Check if we have a reasonably recent price (< 60s old).
+    /// If the price exists but is very old, log a warning.
     pub async fn has_fresh_price(&self, symbol: &str) -> bool {
         let map = self.prices.read().await;
+        match map.get(&symbol.to_lowercase()) {
+            Some(d) => {
+                let age_ms = (Utc::now() - d.updated_at).num_milliseconds();
+                if age_ms < 60_000 {
+                    true
+                } else {
+                    warn!(
+                        symbol = symbol,
+                        age_secs = age_ms / 1000,
+                        price = %d.price,
+                        "Price data is stale — Binance feed may be down"
+                    );
+                    false
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// Get the age of the last price update for a symbol (in milliseconds).
+    pub async fn price_age_ms(&self, symbol: &str) -> Option<i64> {
+        let map = self.prices.read().await;
         map.get(&symbol.to_lowercase())
-            .map(|d| (Utc::now() - d.updated_at).num_milliseconds() < 5000)
-            .unwrap_or(false)
+            .map(|d| (Utc::now() - d.updated_at).num_milliseconds())
     }
 
     fn window_key(slug_prefix: &str, window_ts: u64) -> String {
         format!("{}:{}", slug_prefix, window_ts)
     }
 
-    /// Store the window-open price for a market window.
     pub async fn set_window_open(&self, slug_prefix: &str, window_ts: u64, price: Decimal) {
         let key = Self::window_key(slug_prefix, window_ts);
         self.window_opens.write().await.insert(key, price);
     }
 
-    /// Get the window-open price for a market window.
     pub async fn get_window_open(&self, slug_prefix: &str, window_ts: u64) -> Option<Decimal> {
         let key = Self::window_key(slug_prefix, window_ts);
         self.window_opens.read().await.get(&key).copied()
     }
 
-    /// Prune window-open prices older than `max_age_s` seconds.
     pub async fn prune_old_window_opens(&self, current_ts: u64, max_age_s: u64) {
         let mut map = self.window_opens.write().await;
         map.retain(|key, _| {
@@ -83,8 +96,6 @@ impl PriceFeeds {
         });
     }
 
-    /// Launch the Binance combined WebSocket feed for all given symbols.
-    /// Spawns a background tokio task.
     pub fn spawn_binance_feed(&self, symbols: Vec<String>, ws_base: &str) {
         let feeds = self.clone();
         let ws_base = ws_base.to_string();

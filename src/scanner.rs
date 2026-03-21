@@ -1,6 +1,6 @@
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::config::AppConfig;
 use crate::feeds::PriceFeeds;
@@ -65,12 +65,6 @@ fn compute_edge_score(
 }
 
 /// Scan all enabled markets and return opportunities sorted by edge_score (descending).
-///
-/// Only returns opportunities that pass all filters:
-/// - Within entry window
-/// - Delta above market's min_delta_pct
-/// - Entry price below max for delta tier
-/// - Not already holding a position in this window
 pub async fn scan_all_markets(
     config: &AppConfig,
     price_feeds: &PriceFeeds,
@@ -88,23 +82,42 @@ pub async fn scan_all_markets(
 
         // Must be within entry window
         if secs_rem > mkt.entry_start_s || secs_rem < entry_cutoff_s {
+            debug!(
+                market = %mkt.name,
+                secs_remaining = secs_rem,
+                entry_window = %format!("{}s-{}s", entry_cutoff_s, mkt.entry_start_s),
+                "Outside entry window"
+            );
             continue;
         }
+
+        info!(
+            market = %mkt.name,
+            secs_remaining = secs_rem,
+            "In entry window — evaluating"
+        );
 
         // Get current asset price
         let current_price = match price_feeds.get_price(&mkt.binance_symbol).await {
             Some(p) => p,
-            None => continue,
+            None => {
+                info!(market = %mkt.name, "Skip: no price data");
+                continue;
+            }
         };
 
         if !price_feeds.has_fresh_price(&mkt.binance_symbol).await {
+            info!(market = %mkt.name, "Skip: stale price data");
             continue;
         }
 
         // Get window open price
         let open_price = match price_feeds.get_window_open(&mkt.slug_prefix, window_ts).await {
             Some(p) => p,
-            None => continue,
+            None => {
+                info!(market = %mkt.name, "Skip: no open price for window");
+                continue;
+            }
         };
 
         // Compute delta
@@ -112,19 +125,36 @@ pub async fn scan_all_markets(
         let delta_f64: f64 = abs_delta.try_into().unwrap_or(0.0);
 
         if delta_f64 < mkt.min_delta_pct {
+            info!(
+                market = %mkt.name,
+                direction = %direction,
+                delta = delta_f64,
+                min_delta = mkt.min_delta_pct,
+                open = %open_price,
+                current = %current_price,
+                "Skip: delta too low"
+            );
             continue;
         }
 
         // Check for existing position
         let slug = market::build_slug(&mkt.slug_prefix, window_ts);
         if positions.has_position_in_window(&slug).await {
+            debug!(market = %mkt.name, slug = %slug, "Skip: already have position");
             continue;
         }
 
         // Look up token info
         let market_info = match token_cache.get(&slug) {
             Some(info) if info.accepting_orders => info,
-            _ => continue,
+            Some(_) => {
+                info!(market = %mkt.name, slug = %slug, "Skip: market not accepting orders");
+                continue;
+            }
+            None => {
+                info!(market = %mkt.name, slug = %slug, "Skip: token not resolved yet");
+                continue;
+            }
         };
 
         let token_id = match direction {
@@ -138,7 +168,7 @@ pub async fn scan_all_markets(
         {
             Ok(ob) => ob,
             Err(e) => {
-                debug!(market = %mkt.name, error = %e, "Orderbook fetch failed during scan");
+                info!(market = %mkt.name, error = %e, "Skip: orderbook fetch failed");
                 continue;
             }
         };
@@ -152,6 +182,15 @@ pub async fn scan_all_markets(
         let max_entry =
             Decimal::try_from(mkt.max_price_for_delta(delta_f64)).unwrap_or(dec!(0.85));
         if suggested_entry > max_entry {
+            info!(
+                market = %mkt.name,
+                direction = %direction,
+                delta = delta_f64,
+                best_ask = %ob.best_ask,
+                suggested = %suggested_entry,
+                ceiling = %max_entry,
+                "Skip: entry price too high for delta"
+            );
             continue;
         }
 
@@ -159,6 +198,7 @@ pub async fn scan_all_markets(
         let contracts = (bet_size / suggested_entry)
             .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::ToZero);
         if contracts < Decimal::ONE {
+            info!(market = %mkt.name, entry = %suggested_entry, "Skip: bet too small for 1 contract");
             continue;
         }
         let actual_bet = contracts * suggested_entry;
@@ -176,8 +216,28 @@ pub async fn scan_all_markets(
         );
 
         if edge_score < config.scanner.min_edge_score {
+            info!(
+                market = %mkt.name,
+                edge = edge_score,
+                min_edge = config.scanner.min_edge_score,
+                delta = delta_f64,
+                entry = %suggested_entry,
+                depth = depth_f64,
+                "Skip: edge score too low"
+            );
             continue;
         }
+
+        info!(
+            market = %mkt.name,
+            direction = %direction,
+            delta = delta_f64,
+            edge = edge_score,
+            entry = %suggested_entry,
+            best_ask = %ob.best_ask,
+            contracts = %contracts,
+            "OPPORTUNITY FOUND"
+        );
 
         opportunities.push(MarketOpportunity {
             market_name: mkt.name.clone(),
@@ -204,10 +264,14 @@ pub async fn scan_all_markets(
     }
 
     // Sort by edge_score descending
-    opportunities.sort_by(|a, b| b.edge_score.partial_cmp(&a.edge_score).unwrap_or(std::cmp::Ordering::Equal));
+    opportunities.sort_by(|a, b| {
+        b.edge_score
+            .partial_cmp(&a.edge_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     if !opportunities.is_empty() {
-        debug!(
+        info!(
             count = opportunities.len(),
             top_score = opportunities[0].edge_score,
             top_market = %opportunities[0].market_name,
