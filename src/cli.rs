@@ -10,4 +10,20 @@ pub struct Cli {
     /// Path to config file
     #[arg(long, default_value = "config.toml")]
     pub config: String,
+
+    /// Override max entry price
+    #[arg(long)]
+    pub max_entry: Option<f64>,
+
+    /// Override undercut offset
+    #[arg(long)]
+    pub undercut: Option<f64>,
+
+    /// Override minimum delta percentage
+    #[arg(long)]
+    pub min_delta: Option<f64>,
+
+    /// Send skip notifications to Telegram
+    #[arg(long)]
+    pub verbose: bool,
 }

@@ -2,6 +2,7 @@ use anyhow::Result;
 use rust_decimal::Decimal;
 use tracing::{debug, error};
 
+use crate::signal::TradeDecision;
 use crate::types::{BotMode, Direction, TradeRecord};
 
 pub struct TelegramNotifier {
@@ -29,98 +30,62 @@ impl TelegramNotifier {
         }
     }
 
-    /// Tier-aware fill notification.
-    pub async fn send_fill(&self, trade: &TradeRecord) -> Result<()> {
+    /// Orderbook-aware fill notification.
+    pub async fn send_fill_ob(&self, trade: &TradeRecord, decision: &TradeDecision) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
 
         let mode_tag = self.mode_tag();
-        let tier_label = format!("{} (T-{})", trade.tier_name, trade.seconds_at_entry);
-
-        let msg = format!(
-            "📊 FILL {mode_tag}— Window {}\n\
-             \u{200b}  Tier: {tier_label}\n\
-             \u{200b}  Direction: {}\n\
-             \u{200b}  Entry: ${}\n\
-             \u{200b}  Delta: {}%\n\
-             \u{200b}  Contracts: {}\n\
-             \u{200b}  Bet: ${}",
-            trade.window_ts,
-            trade.direction,
-            trade.entry_price,
-            trade.delta_pct,
-            trade.size,
-            trade.cost_usd,
-        );
-
-        self.send_message(&msg).await
-    }
-
-    /// Generic trade placed notification (backward compat).
-    pub async fn send_trade(&self, trade: &TradeRecord) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        let mode_tag = self.mode_tag();
-        let emoji = if trade.filled { "🔵" } else { "⚪" };
-        let msg = format!(
-            "{emoji} {mode_tag}Trade — {}\n\
-             \u{200b}  Tier: {} (T-{})\n\
-             \u{200b}  Direction: {}\n\
-             \u{200b}  Entry: ${}\n\
-             \u{200b}  Size: {} contracts\n\
-             \u{200b}  Cost: ${}\n\
-             \u{200b}  Delta: {}%\n\
-             \u{200b}  Filled: {}",
-            trade.market_slug,
-            trade.tier_name,
-            trade.seconds_at_entry,
-            trade.direction,
-            trade.entry_price,
-            trade.size,
-            trade.cost_usd,
-            trade.delta_pct,
-            if trade.filled { "Yes" } else { "No" }
-        );
-
-        self.send_message(&msg).await
-    }
-
-    pub async fn send_outcome(
-        &self,
-        order_id: &str,
-        outcome: &str,
-        pnl: Decimal,
-    ) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        let mode_tag = self.mode_tag();
-        let emoji = match outcome {
-            "WIN" => "✅",
-            "LOSS" => "❌",
-            _ => "⏳",
+        let tighten_info = if trade.tighten_count > 0 {
+            format!(" (tightened {}x)", trade.tighten_count)
+        } else {
+            String::new()
         };
 
         let msg = format!(
-            "{emoji} {mode_tag}Trade Result\n\
-             \u{200b}  Order: {order_id}\n\
-             \u{200b}  Outcome: {outcome}\n\
-             \u{200b}  P&L: ${pnl}"
+            "📊 FILL {mode_tag}— {}\n\
+             \u{200b}  Direction: {}\n\
+             \u{200b}  Book best ask: ${}\n\
+             \u{200b}  Initial post: ${}\n\
+             \u{200b}  Fill price: ${}{}\n\
+             \u{200b}  Delta: {}%\n\
+             \u{200b}  Contracts: {}\n\
+             \u{200b}  Bet: ${}",
+            trade.market_slug,
+            trade.direction,
+            decision.best_ask_at_entry,
+            decision.initial_price,
+            trade.entry_price,
+            tighten_info,
+            trade.delta_pct,
+            trade.size,
+            trade.cost_usd,
         );
 
         self.send_message(&msg).await
     }
 
-    /// Rich settlement notification with full P&L breakdown.
+    /// Skip notification (for --verbose mode).
+    pub async fn send_skip(&self, slug: &str, reason: &str) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let mode_tag = self.mode_tag();
+        let msg = format!(
+            "⏭️ SKIP {mode_tag}— {slug}\n\
+             \u{200b}  Reason: {reason}"
+        );
+
+        self.send_message(&msg).await
+    }
+
+    /// Rich settlement notification with orderbook context.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_settlement(
         &self,
         slug: &str,
-        tier_name: &str,
         direction: Direction,
         fill_price: Decimal,
         fill_size: Decimal,
@@ -129,6 +94,9 @@ impl TelegramNotifier {
         won: bool,
         pnl: Decimal,
         bankroll: Decimal,
+        initial_price: Decimal,
+        tighten_count: u32,
+        best_ask_at_entry: Decimal,
     ) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -156,10 +124,16 @@ impl TelegramNotifier {
             "0.0".to_string()
         };
 
+        let tighten_info = if tighten_count > 0 {
+            format!(" ({}x tightens)", tighten_count)
+        } else {
+            String::new()
+        };
+
         let msg = format!(
             "{emoji} {mode_tag}{outcome} — {slug}\n\
-             \u{200b}  Tier: {tier_name}\n\
              \u{200b}  Direction: {dir_arrow} {correct}\n\
+             \u{200b}  Book ask: ${best_ask_at_entry} → Post: ${initial_price}{tighten_info}\n\
              \u{200b}  Fill: ${fill_price} × {fill_size} contracts\n\
              \u{200b}  BTC: ${btc_open:.0} → ${btc_close:.0} ({btc_moved})\n\
              \u{200b}  P&amp;L: {pnl_sign}${pnl:.2} ({pnl_sign}{roi_pct}%)\n\
@@ -169,55 +143,27 @@ impl TelegramNotifier {
         self.send_message(&msg).await
     }
 
-    /// Daily summary with per-tier breakdown.
+    /// Legacy fill notification (backward compat).
     #[allow(dead_code)]
-    pub async fn send_daily_summary_with_tiers(
-        &self,
-        date: &str,
-        total_windows: u32,
-        attempts: u32,
-        tier_stats: &[(String, u32, u32, u32, Decimal)], // (name, fills, wins, losses, pnl)
-        total_pnl: Decimal,
-        bankroll: Decimal,
-    ) -> Result<()> {
+    pub async fn send_fill(&self, trade: &TradeRecord) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
 
         let mode_tag = self.mode_tag();
-        let mut tier_lines = String::new();
-        let mut total_fills = 0u32;
-        let mut total_wins = 0u32;
-        let mut total_losses = 0u32;
-
-        for (name, fills, wins, losses, pnl) in tier_stats {
-            total_fills += fills;
-            total_wins += wins;
-            total_losses += losses;
-            let fill_pct = if attempts > 0 {
-                *fills as f64 / attempts as f64 * 100.0
-            } else {
-                0.0
-            };
-            tier_lines.push_str(&format!(
-                "\u{200b}  {name}: {fills} fills ({fill_pct:.0}%) — {wins}W/{losses}L — ${pnl:.2}\n"
-            ));
-        }
-
-        let win_rate = if total_fills > 0 {
-            format!("{:.0}%", total_wins as f64 / total_fills as f64 * 100.0)
-        } else {
-            "N/A".to_string()
-        };
-
         let msg = format!(
-            "📈 {mode_tag}Daily Summary — {date}\n\
-             \u{200b}  Total windows: {total_windows}\n\
-             \u{200b}  Attempts: {attempts}\n\n\
-             Tier breakdown:\n{tier_lines}\n\
-             \u{200b}  Total: {total_fills} fills — {total_wins}W/{total_losses}L ({win_rate})\n\
-             \u{200b}  Net P&L: ${total_pnl:.2}\n\
-             \u{200b}  Bankroll: ${bankroll:.2}"
+            "📊 FILL {mode_tag}— Window {}\n\
+             \u{200b}  Direction: {}\n\
+             \u{200b}  Entry: ${}\n\
+             \u{200b}  Delta: {}%\n\
+             \u{200b}  Contracts: {}\n\
+             \u{200b}  Bet: ${}",
+            trade.window_ts,
+            trade.direction,
+            trade.entry_price,
+            trade.delta_pct,
+            trade.size,
+            trade.cost_usd,
         );
 
         self.send_message(&msg).await
@@ -269,7 +215,35 @@ impl TelegramNotifier {
 
         let mode_tag = self.mode_tag();
         let msg =
-            format!("🚀 {mode_tag}Bot Started\nBankroll: ${bankroll}\nMode: {}", self.mode);
+            format!("🚀 {mode_tag}Bot Started (orderbook-aware)\nBankroll: ${bankroll}\nMode: {}", self.mode);
+        self.send_message(&msg).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn send_outcome(
+        &self,
+        order_id: &str,
+        outcome: &str,
+        pnl: Decimal,
+    ) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let mode_tag = self.mode_tag();
+        let emoji = match outcome {
+            "WIN" => "✅",
+            "LOSS" => "❌",
+            _ => "⏳",
+        };
+
+        let msg = format!(
+            "{emoji} {mode_tag}Trade Result\n\
+             \u{200b}  Order: {order_id}\n\
+             \u{200b}  Outcome: {outcome}\n\
+             \u{200b}  P&L: ${pnl}"
+        );
+
         self.send_message(&msg).await
     }
 

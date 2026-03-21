@@ -17,7 +17,7 @@ pub struct AppConfig {
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
     pub trading: TradingConfig,
-    pub signal: SignalConfig,
+    pub pricing: PricingConfig,
     pub infra: InfraConfig,
     pub logging: LoggingConfig,
 }
@@ -32,70 +32,22 @@ pub struct TradingConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SignalConfig {
+pub struct PricingConfig {
     pub min_delta_pct: f64,
+    pub entry_start_s: u64,
+    pub entry_cutoff_s: u64,
+    pub undercut_offset: f64,
+    pub tighten_step: f64,
+    pub adjust_interval_ms: u64,
     pub max_entry_price: f64,
-    pub order_lifetime_ms: u64,
-    pub delta_pricing: DeltaPricingConfig,
-    pub sweep: SweepConfig,
-    #[serde(default)]
-    pub entry_tiers: EntryTiersConfig,
-    #[serde(default)]
-    pub single_entry: SingleEntryConfig,
+    pub min_entry_price: f64,
+    pub delta_scaling: DeltaScalingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct DeltaPricingConfig {
-    pub tiers: Vec<[f64; 3]>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SweepConfig {
-    /// Seconds before window close to begin sweep.
-    pub start_s: u64,
-    /// Minimum absolute BTC delta % to trigger a sweep.
-    pub min_delta_pct: f64,
-    /// First bid offset from fair value (negative = cheaper, more profit).
-    pub start_offset: f64,
-    /// Last bid offset from fair value (positive = above fair value, ensures fill).
-    pub end_offset: f64,
-    /// Number of price steps in the sweep.
-    pub steps: u32,
-}
-
-/// A single entry tier: fires at T-`time_before_close_s` with `price_offset` from fair value.
-#[derive(Debug, Clone, Deserialize)]
-pub struct EntryTier {
-    pub name: String,
-    pub time_before_close_s: u64,
-    pub price_offset: f64,
-    pub min_delta_pct: f64,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct EntryTiersConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_watch_start")]
-    pub watch_start_s: u64,
-    #[serde(default)]
-    pub tiers: Vec<EntryTier>,
-}
-
-fn default_watch_start() -> u64 { 30 }
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SingleEntryConfig {
-    #[serde(default = "default_single_entry_time")]
-    pub entry_time_before_close_s: u64,
-}
-
-fn default_single_entry_time() -> u64 { 10 }
-
-impl Default for SingleEntryConfig {
-    fn default() -> Self {
-        Self { entry_time_before_close_s: 10 }
-    }
+pub struct DeltaScalingConfig {
+    /// Each entry: [min_delta_pct, max_entry_price_for_this_delta]
+    pub tiers: Vec<[f64; 2]>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -125,7 +77,7 @@ pub struct LoggingConfig {
 #[derive(Deserialize)]
 struct TomlConfig {
     trading: TradingConfig,
-    signal: SignalConfig,
+    pricing: PricingConfig,
     infrastructure: InfraConfig,
     logging: LoggingConfig,
 }
@@ -140,15 +92,8 @@ impl AppConfig {
         let toml_cfg: TomlConfig =
             toml::from_str(&toml_str).context("Failed to parse config.toml")?;
 
-        // Validate sweep config
-        validate_sweep(&toml_cfg.signal.sweep)
-            .context("Invalid [signal.sweep] configuration")?;
-
-        // Validate entry tiers (if present)
-        if toml_cfg.signal.entry_tiers.enabled {
-            validate_entry_tiers(&toml_cfg.signal.entry_tiers)
-                .context("Invalid [signal.entry_tiers] configuration")?;
-        }
+        validate_pricing(&toml_cfg.pricing)
+            .context("Invalid [pricing] configuration")?;
 
         let mode: BotMode = std::env::var("BOT_MODE")
             .unwrap_or_else(|_| "paper".to_string())
@@ -168,18 +113,26 @@ impl AppConfig {
             telegram_bot_token: non_empty_env("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id: non_empty_env("TELEGRAM_CHAT_ID"),
             trading: toml_cfg.trading,
-            signal: toml_cfg.signal,
+            pricing: toml_cfg.pricing,
             infra: toml_cfg.infrastructure,
             logging: toml_cfg.logging,
         })
     }
 
-    /// Apply CLI overrides on top of loaded config.
     pub fn apply_cli_overrides(&mut self, cli: &crate::cli::Cli) {
         if let Some(m) = &cli.mode {
             if let Ok(mode) = m.parse() {
                 self.mode = mode;
             }
+        }
+        if let Some(v) = cli.max_entry {
+            self.pricing.max_entry_price = v;
+        }
+        if let Some(v) = cli.undercut {
+            self.pricing.undercut_offset = v;
+        }
+        if let Some(v) = cli.min_delta {
+            self.pricing.min_delta_pct = v;
         }
     }
 
@@ -209,98 +162,49 @@ impl AppConfig {
             && self.telegram_chat_id.is_some()
     }
 
-    /// Watch-start time: when the sweep loop should wake up.
     pub fn watch_start_s(&self) -> u64 {
-        self.signal.sweep.start_s + 2
+        self.pricing.entry_start_s + 2
+    }
+
+    /// Max entry price for a given delta, using delta_scaling tiers.
+    pub fn max_price_for_delta(&self, delta_pct: f64) -> f64 {
+        let mut ceiling = self.pricing.max_entry_price;
+        for tier in &self.pricing.delta_scaling.tiers {
+            if delta_pct >= tier[0] {
+                ceiling = tier[1];
+            }
+        }
+        ceiling.min(self.pricing.max_entry_price)
     }
 }
 
-fn validate_sweep(cfg: &SweepConfig) -> Result<()> {
-    if cfg.start_s < 3 || cfg.start_s > 30 {
-        bail!("sweep.start_s must be 3..=30, got {}", cfg.start_s);
+fn validate_pricing(cfg: &PricingConfig) -> Result<()> {
+    if cfg.entry_start_s < 5 || cfg.entry_start_s > 60 {
+        bail!("entry_start_s must be 5..=60, got {}", cfg.entry_start_s);
     }
-    if cfg.steps < 2 || cfg.steps > 20 {
-        bail!("sweep.steps must be 2..=20, got {}", cfg.steps);
+    if cfg.entry_cutoff_s >= cfg.entry_start_s {
+        bail!("entry_cutoff_s ({}) must be < entry_start_s ({})", cfg.entry_cutoff_s, cfg.entry_start_s);
     }
-    if cfg.start_offset >= cfg.end_offset {
-        bail!(
-            "sweep.start_offset ({}) must be < end_offset ({})",
-            cfg.start_offset,
-            cfg.end_offset
-        );
+    if cfg.min_entry_price >= cfg.max_entry_price {
+        bail!("min_entry_price ({}) must be < max_entry_price ({})", cfg.min_entry_price, cfg.max_entry_price);
     }
-    if cfg.min_delta_pct < 0.001 || cfg.min_delta_pct > 1.0 {
-        bail!(
-            "sweep.min_delta_pct must be 0.001..=1.0, got {}",
-            cfg.min_delta_pct
-        );
+    if cfg.undercut_offset < 0.0 || cfg.undercut_offset > 0.20 {
+        bail!("undercut_offset must be 0..=0.20, got {}", cfg.undercut_offset);
     }
-    Ok(())
-}
-
-fn validate_entry_tiers(cfg: &EntryTiersConfig) -> Result<()> {
-    if !cfg.enabled {
-        return Ok(());
+    if cfg.tighten_step < 0.005 || cfg.tighten_step > 0.05 {
+        bail!("tighten_step must be 0.005..=0.05, got {}", cfg.tighten_step);
     }
-
-    if cfg.tiers.is_empty() {
-        bail!("At least one entry tier is required when tiered system is enabled");
+    if cfg.min_delta_pct < 0.01 || cfg.min_delta_pct > 1.0 {
+        bail!("min_delta_pct must be 0.01..=1.0, got {}", cfg.min_delta_pct);
     }
-
-    for tier in &cfg.tiers {
-        if tier.time_before_close_s < 3 || tier.time_before_close_s > 60 {
-            bail!(
-                "Tier '{}': time_before_close_s must be 3..=60, got {}",
-                tier.name,
-                tier.time_before_close_s
-            );
-        }
-        if tier.price_offset < -0.30 || tier.price_offset > 0.0 {
-            bail!(
-                "Tier '{}': price_offset must be -0.30..=0.0, got {}",
-                tier.name,
-                tier.price_offset
-            );
-        }
-        if tier.min_delta_pct < 0.01 || tier.min_delta_pct > 1.0 {
-            bail!(
-                "Tier '{}': min_delta_pct must be 0.01..=1.0, got {}",
-                tier.name,
-                tier.min_delta_pct
-            );
+    if cfg.delta_scaling.tiers.is_empty() {
+        bail!("delta_scaling.tiers must have at least one entry");
+    }
+    for (i, tier) in cfg.delta_scaling.tiers.iter().enumerate() {
+        if tier[0] < 0.01 || tier[1] < 0.50 || tier[1] > 0.99 {
+            bail!("delta_scaling tier {}: invalid values {:?}", i, tier);
         }
     }
-
-    // Must be sorted descending by time (earliest tier first)
-    let times: Vec<u64> = cfg.tiers.iter().map(|t| t.time_before_close_s).collect();
-    for w in times.windows(2) {
-        if w[0] <= w[1] {
-            bail!(
-                "Entry tiers must be sorted by time_before_close_s descending \
-                 (e.g. [20, 12, 6]). Got {:?}",
-                times
-            );
-        }
-    }
-
-    // No duplicate times
-    let mut seen = std::collections::HashSet::new();
-    for t in &times {
-        if !seen.insert(t) {
-            bail!("Duplicate time_before_close_s {} in entry tiers", t);
-        }
-    }
-
-    // watch_start_s must give enough buffer
-    let max_tier_time = times[0];
-    if cfg.watch_start_s < max_tier_time + 2 {
-        bail!(
-            "watch_start_s ({}) must be >= earliest tier time ({}) + 2",
-            cfg.watch_start_s,
-            max_tier_time
-        );
-    }
-
     Ok(())
 }
 

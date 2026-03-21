@@ -25,7 +25,7 @@ impl TradeDb {
                 direction       TEXT NOT NULL,
                 token_id        TEXT NOT NULL,
                 order_id        TEXT NOT NULL,
-                tier_name       TEXT NOT NULL DEFAULT 'single',
+                tier_name       TEXT NOT NULL DEFAULT 'ob_aware',
                 entry_price     TEXT NOT NULL,
                 size            TEXT NOT NULL,
                 cost_usd        TEXT NOT NULL,
@@ -36,7 +36,11 @@ impl TradeDb {
                 delta_pct       TEXT NOT NULL,
                 seconds_at_entry TEXT NOT NULL DEFAULT '0',
                 mode            TEXT NOT NULL,
-                filled          INTEGER NOT NULL DEFAULT 0
+                filled          INTEGER NOT NULL DEFAULT 0,
+                initial_price   TEXT NOT NULL DEFAULT '0',
+                tighten_count   INTEGER NOT NULL DEFAULT 0,
+                best_ask_at_entry TEXT NOT NULL DEFAULT '0',
+                skip_reason     TEXT
             );
 
             CREATE TABLE IF NOT EXISTS daily_summary (
@@ -56,16 +60,18 @@ impl TradeDb {
         )
         .context("Failed to initialize database schema")?;
 
-        // Migrate existing databases that lack the new columns.
-        let conn_ref = &conn;
-        let _ = conn_ref.execute(
+        // Migrate existing databases that lack newer columns.
+        let migrations = [
             "ALTER TABLE trades ADD COLUMN tier_name TEXT NOT NULL DEFAULT 'single'",
-            [],
-        );
-        let _ = conn_ref.execute(
             "ALTER TABLE trades ADD COLUMN seconds_at_entry TEXT NOT NULL DEFAULT '0'",
-            [],
-        );
+            "ALTER TABLE trades ADD COLUMN initial_price TEXT NOT NULL DEFAULT '0'",
+            "ALTER TABLE trades ADD COLUMN tighten_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN best_ask_at_entry TEXT NOT NULL DEFAULT '0'",
+            "ALTER TABLE trades ADD COLUMN skip_reason TEXT",
+        ];
+        for sql in &migrations {
+            let _ = conn.execute(sql, []);
+        }
 
         info!(path = %path.display(), "Trade database opened");
 
@@ -80,8 +86,9 @@ impl TradeDb {
             "INSERT INTO trades (
                 timestamp, window_ts, market_slug, direction, token_id,
                 order_id, tier_name, entry_price, size, cost_usd, outcome, pnl,
-                btc_open_price, btc_close_price, delta_pct, seconds_at_entry, mode, filled
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                btc_open_price, btc_close_price, delta_pct, seconds_at_entry, mode, filled,
+                initial_price, tighten_count, best_ask_at_entry, skip_reason
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 trade.timestamp.to_rfc3339(),
                 trade.window_ts,
@@ -101,6 +108,10 @@ impl TradeDb {
                 trade.seconds_at_entry.to_string(),
                 trade.mode,
                 trade.filled as i32,
+                trade.initial_price.to_string(),
+                trade.tighten_count,
+                trade.best_ask_at_entry.to_string(),
+                trade.skip_reason,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -177,7 +188,6 @@ impl TradeDb {
         Ok((total, wins, losses, pnl))
     }
 
-    /// Per-tier stats for today: (tier_name, fills, wins, losses, total_pnl)
     #[allow(dead_code)]
     pub fn tier_stats_today(&self) -> Result<Vec<(String, u32, u32, u32, Decimal)>> {
         let conn = self.conn.lock().unwrap();
@@ -217,7 +227,8 @@ impl TradeDb {
         let mut stmt = conn.prepare(
             "SELECT id, timestamp, window_ts, market_slug, direction, token_id,
                     order_id, tier_name, entry_price, size, cost_usd, outcome, pnl,
-                    btc_open_price, btc_close_price, delta_pct, seconds_at_entry, mode, filled
+                    btc_open_price, btc_close_price, delta_pct, seconds_at_entry, mode, filled,
+                    initial_price, tighten_count, best_ask_at_entry, skip_reason
              FROM trades ORDER BY id DESC LIMIT ?1",
         )?;
 
@@ -244,6 +255,10 @@ impl TradeDb {
                 seconds_at_entry: row.get::<_, String>(16)?.parse().unwrap_or_default(),
                 mode: row.get(17)?,
                 filled: row.get::<_, i32>(18)? != 0,
+                initial_price: row.get::<_, String>(19).unwrap_or_default().parse().unwrap_or_default(),
+                tighten_count: row.get::<_, u32>(20).unwrap_or(0),
+                best_ask_at_entry: row.get::<_, String>(21).unwrap_or_default().parse().unwrap_or_default(),
+                skip_reason: row.get::<_, Option<String>>(22).unwrap_or(None),
             })
         })?;
 

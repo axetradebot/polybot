@@ -76,6 +76,7 @@ impl WindowInfo {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Signal {
     pub direction: Direction,
     pub delta_pct: Decimal,
@@ -105,7 +106,6 @@ pub struct TradeRecord {
     pub direction: String,
     pub token_id: String,
     pub order_id: String,
-    /// "early", "mid", "late", or "single"
     pub tier_name: String,
     pub entry_price: Decimal,
     pub size: Decimal,
@@ -115,10 +115,13 @@ pub struct TradeRecord {
     pub btc_open_price: Decimal,
     pub btc_close_price: Decimal,
     pub delta_pct: Decimal,
-    /// Seconds remaining in the window when the order was placed.
     pub seconds_at_entry: Decimal,
     pub mode: String,
     pub filled: bool,
+    pub initial_price: Decimal,
+    pub tighten_count: u32,
+    pub best_ask_at_entry: Decimal,
+    pub skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
