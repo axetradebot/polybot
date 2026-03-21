@@ -657,6 +657,8 @@ async fn run_scanner_loop(
                     }
                     window_traded.remove(&key);
                 }
+                // Clear skip reason for fresh window
+                last_skip_reasons.remove(&mkt.name);
 
                 // New window detected
                 if let Some(price) = price_feeds.get_price(&mkt.binance_symbol).await {
