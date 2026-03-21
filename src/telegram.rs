@@ -7,6 +7,14 @@ use crate::db::MarketDayStats;
 use crate::scanner::MarketOpportunity;
 use crate::types::{BotMode, Direction, TradeRecord};
 
+pub struct MarketSnapshot {
+    pub name: String,
+    pub is_live: bool,
+    pub current_price: f64,
+    pub delta_pct: f64,
+    pub min_delta: f64,
+}
+
 pub struct TelegramNotifier {
     client: reqwest::Client,
     bot_token: String,
@@ -86,6 +94,49 @@ impl TelegramNotifier {
             trade.bet_size_usd,
             open_positions,
             max_positions,
+        );
+
+        self.send_message(&msg).await
+    }
+
+    /// Simple fill notification from position data — gated by `on_trade`.
+    /// Used for live fills detected via order polling.
+    pub async fn send_fill_from_position(
+        &self,
+        market_name: &str,
+        slug: &str,
+        direction: &str,
+        mode_str: &str,
+        fill_price: Decimal,
+        fill_size: Decimal,
+        edge_score: f64,
+        best_ask: Decimal,
+        delta_pct: Decimal,
+        tighten_count: u32,
+        open_positions: usize,
+        max_positions: usize,
+    ) -> Result<()> {
+        if !self.enabled || !self.on_trade {
+            return Ok(());
+        }
+
+        let mode_tag = self.mode_tag_for(mode_str);
+        let tighten_info = if tighten_count > 0 {
+            format!(" (tightened {}x)", tighten_count)
+        } else {
+            String::new()
+        };
+        let bet_usd = fill_price * fill_size;
+
+        let msg = format!(
+            "📊 FILL {mode_tag}— {market_name}\n\
+             \u{200b}  Window: {slug}\n\
+             \u{200b}  Direction: {direction}\n\
+             \u{200b}  Edge score: {edge_score:.3}\n\
+             \u{200b}  Book ask: ${best_ask} → Filled: ${fill_price}{tighten_info}\n\
+             \u{200b}  Delta: {delta_pct}%\n\
+             \u{200b}  Contracts: {fill_size} | Bet: ${bet_usd:.2}\n\
+             \u{200b}  Open positions: {open_positions}/{max_positions}",
         );
 
         self.send_message(&msg).await
@@ -243,23 +294,79 @@ impl TelegramNotifier {
     }
 
     /// Startup notification — always sent when telegram is enabled.
+    /// Shows each market with its effective mode (LIVE/PAPER).
     pub async fn send_startup(
         &self,
         bankroll: Decimal,
-        enabled_markets: &[String],
+        market_modes: &[(String, String)],
     ) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
-        let mode_tag = self.mode_tag();
-        let markets_list = enabled_markets.join(", ");
+        let mut market_lines = String::new();
+        for (name, mode) in market_modes {
+            let tag = if mode.eq_ignore_ascii_case("live") {
+                "🟢 LIVE"
+            } else {
+                "⚪ PAPER"
+            };
+            market_lines.push_str(&format!("\n\u{200b}  {} — {}", tag, name));
+        }
+
         let msg = format!(
-            "🚀 {mode_tag}Multi-Market Bot Started\n\
-             Bankroll: ${bankroll}\n\
-             Markets: {markets_list}\n\
-             Mode: {}",
-            self.mode
+            "🚀 Multi-Market Bot Started\n\
+             \u{200b}  Bankroll: ${bankroll}{market_lines}"
         );
+        self.send_message(&msg).await
+    }
+
+    /// Periodic heartbeat with market status — sent every N minutes.
+    /// Shows prices, deltas, positions, and why it's quiet if no trades.
+    pub async fn send_heartbeat(
+        &self,
+        market_snapshots: &[MarketSnapshot],
+        open_positions: usize,
+        bankroll: Decimal,
+        daily_wins: u32,
+        daily_losses: u32,
+        daily_pnl: Decimal,
+        windows_scanned: u64,
+        clob_balance: Option<Decimal>,
+    ) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let pnl_sign = if daily_pnl >= Decimal::ZERO { "+" } else { "" };
+        let bal_str = clob_balance
+            .map(|b| format!("${b:.2}"))
+            .unwrap_or_else(|| "N/A".to_string());
+        let mut msg = format!(
+            "📡 Status Update\n\
+             \u{200b}  Positions: {} | CLOB Balance: {bal_str}\n\
+             \u{200b}  Bot Bankroll: ${bankroll:.2}\n\
+             \u{200b}  Today: {}W/{}L | {pnl_sign}${daily_pnl:.2}\n\
+             \u{200b}  Windows scanned: {windows_scanned}\n",
+            open_positions, daily_wins, daily_losses,
+        );
+
+        msg.push_str("\n\u{200b}  MARKETS:");
+        for snap in market_snapshots {
+            let mode_tag = if snap.is_live { "🟢" } else { "⚪" };
+            let delta_str = format!("{:.4}%", snap.delta_pct);
+            let dir = if snap.delta_pct >= 0.0 { "↑" } else { "↓" };
+            let status = if snap.delta_pct.abs() < snap.min_delta {
+                "quiet"
+            } else {
+                "ready"
+            };
+            msg.push_str(&format!(
+                "\n\u{200b}  {} {} ${:.0} | {}{} (need {:.2}%) [{}]",
+                mode_tag, snap.name, snap.current_price,
+                dir, delta_str, snap.min_delta, status,
+            ));
+        }
+
         self.send_message(&msg).await
     }
 

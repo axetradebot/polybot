@@ -7,6 +7,36 @@ use tracing::info;
 
 use crate::types::TradeRecord;
 
+/// A row from the `active_positions` table, used to recover positions across restarts.
+#[derive(Debug, Clone)]
+pub struct PersistedPosition {
+    pub id: i64,
+    pub market_name: String,
+    pub asset: String,
+    pub window_seconds: u64,
+    pub window_ts: u64,
+    pub slug: String,
+    pub direction: String,
+    pub token_id: String,
+    pub condition_id: String,
+    pub neg_risk: bool,
+    pub edge_score: f64,
+    pub delta_pct: String,
+    pub initial_price: String,
+    pub current_price: String,
+    pub max_price: String,
+    pub best_ask_at_entry: String,
+    pub contracts: String,
+    pub bet_size_usd: String,
+    pub order_id: Option<String>,
+    pub tighten_count: u32,
+    pub open_price: String,
+    pub status: String,
+    pub fill_price: Option<String>,
+    pub fill_size: Option<String>,
+    pub mode: String,
+}
+
 pub struct TradeDb {
     conn: Mutex<Connection>,
 }
@@ -55,9 +85,46 @@ impl TradeDb {
                 fills           INTEGER NOT NULL DEFAULT 0,
                 total_pnl       TEXT NOT NULL DEFAULT '0',
                 mode            TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS active_positions (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_name      TEXT NOT NULL,
+                asset            TEXT NOT NULL,
+                window_seconds   INTEGER NOT NULL,
+                window_ts        INTEGER NOT NULL,
+                slug             TEXT NOT NULL,
+                direction        TEXT NOT NULL,
+                token_id         TEXT NOT NULL,
+                condition_id     TEXT NOT NULL DEFAULT '',
+                neg_risk         INTEGER NOT NULL DEFAULT 0,
+                edge_score       REAL NOT NULL DEFAULT 0.0,
+                delta_pct        TEXT NOT NULL DEFAULT '0',
+                initial_price    TEXT NOT NULL,
+                current_price    TEXT NOT NULL,
+                max_price        TEXT NOT NULL,
+                best_ask_at_entry TEXT NOT NULL DEFAULT '0',
+                contracts        TEXT NOT NULL,
+                bet_size_usd     TEXT NOT NULL DEFAULT '0',
+                order_id         TEXT,
+                tighten_count    INTEGER NOT NULL DEFAULT 0,
+                open_price       TEXT NOT NULL DEFAULT '0',
+                status           TEXT NOT NULL DEFAULT 'PENDING',
+                fill_price       TEXT,
+                fill_size        TEXT,
+                mode             TEXT NOT NULL,
+                created_at       TEXT NOT NULL DEFAULT (datetime('now'))
             );",
         )
         .context("Failed to initialize database schema")?;
+
+        // Drop legacy columns that conflict with the current schema.
+        let drop_migrations = [
+            "ALTER TABLE trades DROP COLUMN market_slug",
+        ];
+        for sql in &drop_migrations {
+            let _ = conn.execute(sql, []);
+        }
 
         // Migrate existing databases that lack newer columns (silently skip if already present).
         let migrations = [
@@ -236,6 +303,125 @@ impl TradeDb {
         let pnl: Decimal = pnl_str.parse().unwrap_or_default();
 
         Ok((total, wins, losses, pnl))
+    }
+
+    /// Persist a position so it survives bot restarts.
+    pub fn save_position(
+        &self,
+        market_name: &str,
+        asset: &str,
+        window_seconds: u64,
+        window_ts: u64,
+        slug: &str,
+        direction: &str,
+        token_id: &str,
+        condition_id: &str,
+        neg_risk: bool,
+        edge_score: f64,
+        delta_pct: &str,
+        initial_price: &str,
+        current_price: &str,
+        max_price: &str,
+        best_ask_at_entry: &str,
+        contracts: &str,
+        bet_size_usd: &str,
+        order_id: Option<&str>,
+        tighten_count: u32,
+        open_price: &str,
+        status: &str,
+        fill_price: Option<&str>,
+        fill_size: Option<&str>,
+        mode: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO active_positions (
+                market_name, asset, window_seconds, window_ts, slug, direction,
+                token_id, condition_id, neg_risk, edge_score, delta_pct,
+                initial_price, current_price, max_price, best_ask_at_entry,
+                contracts, bet_size_usd, order_id, tighten_count, open_price,
+                status, fill_price, fill_size, mode
+            ) VALUES (
+                ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24
+            )",
+            params![
+                market_name, asset, window_seconds as i64, window_ts as i64,
+                slug, direction, token_id, condition_id, neg_risk as i32,
+                edge_score, delta_pct, initial_price, current_price, max_price,
+                best_ask_at_entry, contracts, bet_size_usd, order_id,
+                tighten_count, open_price, status, fill_price, fill_size, mode,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Update status of a persisted position (e.g. PENDING → FILLED → SETTLED).
+    pub fn update_position_status(
+        &self,
+        db_id: i64,
+        status: &str,
+        fill_price: Option<&str>,
+        fill_size: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE active_positions SET status = ?1, fill_price = COALESCE(?2, fill_price), fill_size = COALESCE(?3, fill_size) WHERE id = ?4",
+            params![status, fill_price, fill_size, db_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a position from active tracking (after settlement or confirmed expiry).
+    pub fn remove_position(&self, db_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM active_positions WHERE id = ?1", params![db_id])?;
+        Ok(())
+    }
+
+    /// Load all active (non-settled, non-expired) positions for recovery after restart.
+    pub fn load_active_positions(&self) -> Result<Vec<PersistedPosition>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, market_name, asset, window_seconds, window_ts, slug, direction,
+                    token_id, condition_id, neg_risk, edge_score, delta_pct,
+                    initial_price, current_price, max_price, best_ask_at_entry,
+                    contracts, bet_size_usd, order_id, tighten_count, open_price,
+                    status, fill_price, fill_size, mode
+             FROM active_positions
+             WHERE status IN ('PENDING', 'FILLED')"
+        )?;
+
+        let rows = stmt.query_map([], |row: &rusqlite::Row<'_>| {
+            Ok(PersistedPosition {
+                id: row.get(0)?,
+                market_name: row.get(1)?,
+                asset: row.get(2)?,
+                window_seconds: row.get::<_, i64>(3)? as u64,
+                window_ts: row.get::<_, i64>(4)? as u64,
+                slug: row.get(5)?,
+                direction: row.get(6)?,
+                token_id: row.get(7)?,
+                condition_id: row.get(8)?,
+                neg_risk: row.get::<_, i32>(9)? != 0,
+                edge_score: row.get(10)?,
+                delta_pct: row.get(11)?,
+                initial_price: row.get(12)?,
+                current_price: row.get(13)?,
+                max_price: row.get(14)?,
+                best_ask_at_entry: row.get(15)?,
+                contracts: row.get(16)?,
+                bet_size_usd: row.get(17)?,
+                order_id: row.get(18)?,
+                tighten_count: row.get::<_, u32>(19)?,
+                open_price: row.get(20)?,
+                status: row.get(21)?,
+                fill_price: row.get(22)?,
+                fill_size: row.get(23)?,
+                mode: row.get(24)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }
 

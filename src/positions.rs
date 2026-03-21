@@ -11,6 +11,8 @@ use crate::types::{BotMode, Direction, PositionStatus, TradeOutcome};
 #[allow(dead_code)]
 pub struct Position {
     pub id: u64,
+    /// Row ID in the `active_positions` DB table (for persistence across restarts).
+    pub db_id: Option<i64>,
     pub market_name: String,
     pub asset: String,
     pub window_seconds: u64,

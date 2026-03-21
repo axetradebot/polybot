@@ -68,7 +68,6 @@ async fn main() -> Result<()> {
         .init();
 
     let enabled = config.enabled_markets();
-    let market_names: Vec<String> = enabled.iter().map(|m| m.name.clone()).collect();
     let symbols = config.binance_symbols();
 
     info!(
@@ -97,7 +96,11 @@ async fn main() -> Result<()> {
         config.mode,
     ));
 
-    telegram.send_startup(config.bankroll_decimal(), &market_names).await.ok();
+    let market_modes: Vec<(String, String)> = enabled.iter().map(|m| {
+        let mode = if config.is_market_paper(&m.name) { "paper" } else { "live" };
+        (m.name.clone(), mode.to_string())
+    }).collect();
+    telegram.send_startup(config.bankroll_decimal(), &market_modes).await.ok();
 
     let risk_manager = RiskManager::new(&config);
     let verbose = cli.verbose || config.telegram.verbose_skips;
@@ -256,19 +259,67 @@ async fn run_scanner_loop(
         () => {{
             let client = client.as_ref().unwrap();
             let mut fills: Vec<(String, Decimal, Decimal)> = Vec::new();
-            if let Ok(Ok(page)) = tokio::time::timeout(
-                Duration::from_secs(3),
-                client.orders(&Default::default(), None),
-            )
-            .await
-            {
-                for o in &page.data {
-                    if o.size_matched > Decimal::ZERO {
-                        fills.push((o.id.clone(), o.price, o.size_matched));
+            let mut seen_ids = std::collections::HashSet::new();
+
+            // Method 1: Query each pending order by ID to check size_matched.
+            let pending = positions.pending_positions().await;
+            for pos in &pending {
+                if let Some(ref oid) = pos.order_id {
+                    let req = polymarket_client_sdk::clob::types::request::OrdersRequest::builder()
+                        .order_id(oid.as_str())
+                        .build();
+                    if let Ok(Ok(page)) = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        client.orders(&req, None),
+                    )
+                    .await
+                    {
+                        for o in &page.data {
+                            if o.id == *oid && o.size_matched > Decimal::ZERO {
+                                fills.push((o.id.clone(), o.price, o.size_matched));
+                                seen_ids.insert(o.id.clone());
+                            }
+                        }
                     }
                 }
             }
+
+            // Method 2: Query recent trades as backup (catches fills the orders endpoint missed).
+            if let Ok(Ok(page)) = tokio::time::timeout(
+                Duration::from_secs(3),
+                client.trades(
+                    &polymarket_client_sdk::clob::types::request::TradesRequest::default(),
+                    None,
+                ),
+            )
+            .await
+            {
+                for t in &page.data {
+                    if !seen_ids.contains(&t.taker_order_id) && t.size > Decimal::ZERO {
+                        fills.push((t.taker_order_id.clone(), t.price, t.size));
+                    }
+                }
+            }
+
             fills
+        }};
+    }
+
+    // Fetch real USDC balance from the CLOB API.
+    macro_rules! fetch_clob_balance {
+        () => {{
+            if let Some(ref c) = client {
+                use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
+                let req = BalanceAllowanceRequest::builder()
+                    .asset_type(polymarket_client_sdk::clob::types::AssetType::Collateral)
+                    .build();
+                match tokio::time::timeout(Duration::from_secs(3), c.balance_allowance(req)).await {
+                    Ok(Ok(resp)) => Some(resp.balance),
+                    _ => None,
+                }
+            } else {
+                None
+            }
         }};
     }
 
@@ -289,6 +340,201 @@ async fn run_scanner_loop(
         "Entering scanner loop"
     );
 
+    // ── Recover persisted positions from previous session ──
+    match db.load_active_positions() {
+        Ok(persisted) if !persisted.is_empty() => {
+            let persisted: Vec<crate::db::PersistedPosition> = persisted;
+            info!(count = persisted.len(), "Recovering positions from previous session");
+            let now_inst = tokio::time::Instant::now();
+            for pp in &persisted {
+                let direction = if pp.direction.eq_ignore_ascii_case("UP") {
+                    Direction::Up
+                } else {
+                    Direction::Down
+                };
+                let mode = if pp.mode.eq_ignore_ascii_case("live") {
+                    BotMode::Live
+                } else {
+                    BotMode::Paper
+                };
+                let status = match pp.status.as_str() {
+                    "FILLED" => PositionStatus::Filled,
+                    _ => PositionStatus::Pending,
+                };
+                let pos = Position {
+                    id: 0,
+                    db_id: Some(pp.id),
+                    market_name: pp.market_name.clone(),
+                    asset: pp.asset.clone(),
+                    window_seconds: pp.window_seconds,
+                    window_ts: pp.window_ts,
+                    slug: pp.slug.clone(),
+                    direction,
+                    token_id: pp.token_id.clone(),
+                    condition_id: pp.condition_id.clone(),
+                    neg_risk: pp.neg_risk,
+                    edge_score: pp.edge_score,
+                    delta_pct: pp.delta_pct.parse().unwrap_or_default(),
+                    initial_price: pp.initial_price.parse().unwrap_or_default(),
+                    current_price: pp.current_price.parse().unwrap_or_default(),
+                    max_price: pp.max_price.parse().unwrap_or_default(),
+                    best_ask_at_entry: pp.best_ask_at_entry.parse().unwrap_or_default(),
+                    contracts: pp.contracts.parse().unwrap_or_default(),
+                    bet_size_usd: pp.bet_size_usd.parse().unwrap_or_default(),
+                    order_id: pp.order_id.clone(),
+                    tighten_count: pp.tighten_count,
+                    last_adjust_at: now_inst,
+                    placed_at: now_inst,
+                    open_price: pp.open_price.parse().unwrap_or_default(),
+                    status,
+                    fill_price: pp.fill_price.as_ref().and_then(|s| s.parse::<Decimal>().ok()),
+                    fill_size: pp.fill_size.as_ref().and_then(|s| s.parse::<Decimal>().ok()),
+                    outcome: None,
+                    pnl: None,
+                    mode,
+                    settlement_started: false,
+                };
+                let now_epoch = market::epoch_secs();
+                let window_end = pos.window_ts + pos.window_seconds;
+                if now_epoch >= window_end && status == PositionStatus::Filled {
+                    info!(
+                        market = %pos.market_name,
+                        slug = %pos.slug,
+                        direction = %pos.direction,
+                        mode = %pos.mode,
+                        "Recovered FILLED position — spawning settlement"
+                    );
+                    let pos_id = positions.add(pos.clone()).await;
+                    positions.mark_settlement_started(pos_id).await;
+
+                    let pos_for_settle = {
+                        let mut p = pos;
+                        p.id = pos_id;
+                        p
+                    };
+                    let pp_id = pp.id;
+                    let db2 = db.clone();
+                    let tg2 = telegram.clone();
+                    let st2 = state.clone();
+                    let pt2 = positions.clone();
+                    let rpc = config.infra.polygon_rpc_url.clone();
+                    let pk = config.private_key.clone();
+                    let do_redeem = config.infra.auto_redeem;
+
+                    tokio::spawn(async move {
+                        let result = settle_position(
+                            pos_for_settle, db2.clone(), tg2, st2, pt2, &rpc, &pk, do_redeem,
+                        )
+                        .await;
+                        if result.is_ok() {
+                            let _ = db2.remove_position(pp_id);
+                        }
+                    });
+                } else if now_epoch >= window_end && status == PositionStatus::Pending {
+                    info!(
+                        market = %pp.market_name,
+                        slug = %pp.slug,
+                        "Recovered PENDING position past window close — checking for fill"
+                    );
+                    if client.is_some() {
+                        let fills = poll_fills!();
+                        if let Some(ref oid) = pp.order_id {
+                            if let Some((_, fill_price, fill_size)) =
+                                fills.iter().find(|(id, _, _)| id == oid)
+                            {
+                                info!(
+                                    market = %pp.market_name,
+                                    fill_price = %fill_price,
+                                    fill_size = %fill_size,
+                                    "Recovered position was actually FILLED — spawning settlement"
+                                );
+                                let mut filled_pos = pos.clone();
+                                filled_pos.status = PositionStatus::Filled;
+                                filled_pos.fill_price = Some(*fill_price);
+                                filled_pos.fill_size = Some(*fill_size);
+                                let pos_id = positions.add(filled_pos.clone()).await;
+                                positions.mark_settlement_started(pos_id).await;
+                                filled_pos.id = pos_id;
+
+                                let db2 = db.clone();
+                                let tg2 = telegram.clone();
+                                let st2 = state.clone();
+                                let pt2 = positions.clone();
+                                let rpc = config.infra.polygon_rpc_url.clone();
+                                let pk = config.private_key.clone();
+                                let do_redeem = config.infra.auto_redeem;
+                                let pp_id = pp.id;
+
+                                tokio::spawn(async move {
+                                    let result = settle_position(
+                                        filled_pos, db2.clone(), tg2, st2, pt2, &rpc, &pk, do_redeem,
+                                    )
+                                    .await;
+                                    if result.is_ok() {
+                                        let _ = db2.remove_position(pp_id);
+                                    }
+                                });
+                            } else {
+                                info!(
+                                    market = %pp.market_name,
+                                    "Recovered position truly expired — cleaning up"
+                                );
+                                let _ = db.remove_position(pp.id);
+                            }
+                        } else {
+                            let _ = db.remove_position(pp.id);
+                        }
+                    } else if mode == BotMode::Paper {
+                        info!(
+                            market = %pp.market_name,
+                            slug = %pp.slug,
+                            "Recovered PAPER position — spawning settlement"
+                        );
+                        let mut filled_pos = pos.clone();
+                        filled_pos.status = PositionStatus::Filled;
+                        filled_pos.fill_price = Some(filled_pos.current_price);
+                        filled_pos.fill_size = Some(filled_pos.contracts);
+                        let pos_id = positions.add(filled_pos.clone()).await;
+                        positions.mark_settlement_started(pos_id).await;
+                        filled_pos.id = pos_id;
+
+                        let db2 = db.clone();
+                        let tg2 = telegram.clone();
+                        let st2 = state.clone();
+                        let pt2 = positions.clone();
+                        let rpc = config.infra.polygon_rpc_url.clone();
+                        let pk = config.private_key.clone();
+                        let do_redeem = config.infra.auto_redeem;
+                        let pp_id = pp.id;
+
+                        tokio::spawn(async move {
+                            let result = settle_position(
+                                filled_pos, db2.clone(), tg2, st2, pt2, &rpc, &pk, do_redeem,
+                            )
+                            .await;
+                            if result.is_ok() {
+                                let _ = db2.remove_position(pp_id);
+                            }
+                        });
+                    } else {
+                        let _ = db.remove_position(pp.id);
+                    }
+                } else {
+                    let pos_id = positions.add(pos).await;
+                    info!(
+                        market = %pp.market_name,
+                        slug = %pp.slug,
+                        status = %pp.status,
+                        pos_id,
+                        "Recovered position into active tracker"
+                    );
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "Failed to load persisted positions"),
+    }
+
     let mut heartbeat_counter: u64 = 0;
     let hb_symbols = config.binance_symbols();
 
@@ -296,11 +542,12 @@ async fn run_scanner_loop(
         let cycle_start = tokio::time::Instant::now();
         heartbeat_counter += 1;
 
-        // Heartbeat every 60 seconds
+        // Log heartbeat every 60 seconds
         if heartbeat_counter % 60 == 0 {
             let open_pos = positions.open_count().await;
             let ws_msgs = crate::feeds::binance::messages_received();
             let st = state.read().await;
+            let clob_bal = fetch_clob_balance!();
             let mut price_ages = Vec::new();
             for sym in &hb_symbols {
                 if let Some(age) = price_feeds.price_age_ms(sym).await {
@@ -312,12 +559,49 @@ async fn run_scanner_loop(
             info!(
                 positions = open_pos,
                 bankroll = %st.bankroll,
+                clob_balance = ?clob_bal,
                 wins = st.daily_wins,
                 losses = st.daily_losses,
                 ws_messages = ws_msgs,
                 price_ages = %price_ages.join(", "),
                 "Heartbeat"
             );
+        }
+
+        // Telegram heartbeat every 15 minutes
+        if heartbeat_counter % 900 == 0 {
+            let open_pos = positions.open_count().await;
+            let st = state.read().await;
+            let hb_clob_bal = fetch_clob_balance!();
+            let mut snapshots = Vec::new();
+            for mkt in config.enabled_markets() {
+                let current_price = price_feeds.get_price(&mkt.binance_symbol).await.unwrap_or_default();
+                let (window_ts, _) = market::current_window(mkt.window_seconds);
+                let open_price = price_feeds.get_window_open(&mkt.slug_prefix, window_ts).await.unwrap_or(current_price);
+                let delta_pct = if open_price > Decimal::ZERO {
+                    let diff: f64 = ((current_price - open_price).abs() / open_price * Decimal::from(100)).try_into().unwrap_or(0.0);
+                    if current_price >= open_price { diff } else { -diff }
+                } else {
+                    0.0
+                };
+                snapshots.push(crate::telegram::MarketSnapshot {
+                    name: mkt.name.clone(),
+                    is_live: !config.is_market_paper(&mkt.name),
+                    current_price: current_price.try_into().unwrap_or(0.0),
+                    delta_pct,
+                    min_delta: mkt.min_delta_pct,
+                });
+            }
+            telegram.send_heartbeat(
+                &snapshots,
+                open_pos,
+                st.bankroll,
+                st.daily_wins,
+                st.daily_losses,
+                st.daily_pnl,
+                heartbeat_counter / 60,
+                hb_clob_bal,
+            ).await.ok();
         }
 
         // ── Daily reset ──
@@ -447,8 +731,22 @@ async fn run_scanner_loop(
                         Utc::now().timestamp_millis()
                     );
 
+                    let db_id = db.save_position(
+                        &opp.market_name, &opp.asset, opp.window_seconds, opp.window_ts,
+                        &opp.slug, &opp.direction.to_string(), &opp.token_id,
+                        &opp.condition_id, opp.neg_risk, opp.edge_score,
+                        &Decimal::try_from(opp.delta_pct).unwrap_or_default().to_string(),
+                        &opp.suggested_entry.to_string(), &opp.suggested_entry.to_string(),
+                        &opp.max_entry.to_string(), &opp.best_ask.to_string(),
+                        &opp.contracts.to_string(), &opp.bet_size_usd.to_string(),
+                        Some(&order_id), 0, &opp.open_price.to_string(),
+                        "FILLED", Some(&opp.suggested_entry.to_string()),
+                        Some(&opp.contracts.to_string()), "paper",
+                    ).ok();
+
                     let pos = Position {
                         id: 0,
+                        db_id,
                         market_name: opp.market_name.clone(),
                         asset: opp.asset.clone(),
                         window_seconds: opp.window_seconds,
@@ -520,8 +818,21 @@ async fn run_scanner_loop(
 
                     match post_order!(opp.suggested_entry, opp.contracts, token_id_u256) {
                         Ok(oid) => {
+                            let db_id = db.save_position(
+                                &opp.market_name, &opp.asset, opp.window_seconds, opp.window_ts,
+                                &opp.slug, &opp.direction.to_string(), &opp.token_id,
+                                &opp.condition_id, opp.neg_risk, opp.edge_score,
+                                &Decimal::try_from(opp.delta_pct).unwrap_or_default().to_string(),
+                                &opp.suggested_entry.to_string(), &opp.suggested_entry.to_string(),
+                                &opp.max_entry.to_string(), &opp.best_ask.to_string(),
+                                &opp.contracts.to_string(), &opp.bet_size_usd.to_string(),
+                                Some(&oid), 0, &opp.open_price.to_string(),
+                                "PENDING", None, None, "live",
+                            ).ok();
+
                             let pos = Position {
                                 id: 0,
+                                db_id,
                                 market_name: opp.market_name.clone(),
                                 asset: opp.asset.clone(),
                                 window_seconds: opp.window_seconds,
@@ -589,43 +900,48 @@ async fn run_scanner_loop(
 
                 for pos in &pending {
                     if let Some(ref oid) = pos.order_id {
-                        // Check for fill
+                        // Check for fill in the batch poll
                         if let Some((_, fill_price, fill_size)) =
                             fills.iter().find(|(id, _, _)| id == oid)
                         {
-                            positions
-                                .mark_filled(pos.id, *fill_price, *fill_size)
-                                .await;
-
-                            let mut trade = build_trade_record_from_position(pos);
-                            trade.filled = true;
-                            trade.fill_price = Some(*fill_price);
-                            trade.final_price = *fill_price;
-                            trade.contracts = *fill_size;
-                            trade.bet_size_usd = *fill_size * *fill_price;
-                            if let Err(e) = db.insert_trade(&trade) {
-                                error!(error = %e, "Failed to log live fill");
-                            }
-
-                            info!(
-                                market = %pos.market_name,
-                                order_id = %oid,
-                                fill_price = %fill_price,
-                                fill_size = %fill_size,
-                                tightens = pos.tighten_count,
-                                "FILLED!"
-                            );
+                            handle_live_fill(
+                                pos, *fill_price, *fill_size, positions, &db,
+                                &telegram, config,
+                            ).await;
                             continue;
                         }
 
                         // Check for expiry (past window close)
                         let now = market::epoch_secs();
                         if now >= pos.window_ts + pos.window_seconds {
-                            // Cancel the order
-                    if let Some(ref c) = client {
-                        let _ = c.cancel_all_orders().await;
-                    }
+                            // RACE CONDITION FIX: wait a moment and poll fills ONE MORE TIME
+                            // The order may have been matched right at the boundary.
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            let recheck_fills = poll_fills!();
+                            if let Some((_, fill_price, fill_size)) =
+                                recheck_fills.iter().find(|(id, _, _)| id == oid)
+                            {
+                                info!(
+                                    market = %pos.market_name,
+                                    order_id = %oid,
+                                    fill_price = %fill_price,
+                                    "Fill detected on recheck (race condition avoided)"
+                                );
+                                handle_live_fill(
+                                    pos, *fill_price, *fill_size, positions, &db,
+                                    &telegram, config,
+                                ).await;
+                                continue;
+                            }
+
+                            // Truly expired — cancel and clean up
+                            if let Some(ref c) = client {
+                                let _ = c.cancel_all_orders().await;
+                            }
                             positions.mark_expired(pos.id).await;
+                            if let Some(db_id) = pos.db_id {
+                                let _ = db.remove_position(db_id);
+                            }
 
                             let mut trade = build_trade_record_from_position(pos);
                             trade.skip_reason = Some("expired".into());
@@ -636,7 +952,7 @@ async fn run_scanner_loop(
                                 order_id = %oid,
                                 last_price = %pos.current_price,
                                 tightens = pos.tighten_count,
-                                "Order expired unfilled"
+                                "Order expired unfilled (confirmed after recheck)"
                             );
                             continue;
                         }
@@ -705,6 +1021,7 @@ async fn run_scanner_loop(
             positions.mark_settlement_started(pos.id).await;
 
             let pos_clone = pos.clone();
+            let pos_db_id = pos.db_id;
             let db2 = db.clone();
             let tg2 = telegram.clone();
             let st2 = state.clone();
@@ -714,9 +1031,13 @@ async fn run_scanner_loop(
             let do_redeem = config.infra.auto_redeem;
 
             tokio::spawn(async move {
-                settle_position(pos_clone, db2, tg2, st2, pt2, &rpc, &pk, do_redeem)
-                    .await
-                    .ok();
+                let result = settle_position(pos_clone, db2.clone(), tg2, st2, pt2, &rpc, &pk, do_redeem)
+                    .await;
+                if result.is_ok() {
+                    if let Some(db_id) = pos_db_id {
+                        let _ = db2.remove_position(db_id);
+                    }
+                }
             });
         }
 
@@ -915,6 +1236,69 @@ async fn settle_position(
     }
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live fill handler (extracted to avoid duplication between normal + recheck)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn handle_live_fill(
+    pos: &Position,
+    fill_price: Decimal,
+    fill_size: Decimal,
+    positions: &PositionTracker,
+    db: &Arc<TradeDb>,
+    telegram: &Arc<TelegramNotifier>,
+    config: &AppConfig,
+) {
+    positions.mark_filled(pos.id, fill_price, fill_size).await;
+
+    if let Some(db_id) = pos.db_id {
+        let _ = db.update_position_status(
+            db_id,
+            "FILLED",
+            Some(&fill_price.to_string()),
+            Some(&fill_size.to_string()),
+        );
+    }
+
+    let mut trade = build_trade_record_from_position(pos);
+    trade.filled = true;
+    trade.fill_price = Some(fill_price);
+    trade.final_price = fill_price;
+    trade.contracts = fill_size;
+    trade.bet_size_usd = fill_size * fill_price;
+    if let Err(e) = db.insert_trade(&trade) {
+        error!(error = %e, "Failed to log live fill");
+    }
+
+    let open_count = positions.open_count().await;
+    telegram
+        .send_fill_from_position(
+            &pos.market_name,
+            &pos.slug,
+            &pos.direction.to_string(),
+            &pos.mode.to_string(),
+            fill_price,
+            fill_size,
+            pos.edge_score,
+            pos.best_ask_at_entry,
+            pos.delta_pct,
+            pos.tighten_count,
+            open_count,
+            config.bankroll.max_concurrent_positions,
+        )
+        .await
+        .ok();
+
+    info!(
+        market = %pos.market_name,
+        order_id = pos.order_id.as_deref().unwrap_or("?"),
+        fill_price = %fill_price,
+        fill_size = %fill_size,
+        tightens = pos.tighten_count,
+        "FILLED!"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
