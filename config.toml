@@ -43,7 +43,7 @@ min_delta_pct = 0.04
 [[signal.entry_tiers.tiers]]
 name = "late"
 time_before_close_s = 6
-price_offset = -0.01
+price_offset = 0.0
 min_delta_pct = 0.01
 
 # Used when entry_tiers.enabled = false
