@@ -14,9 +14,7 @@ polymarket-client-sdk = { version = "0.4", features = [
     "clob",
     "ws",
     "gamma",
-    "heartbeats",
     "tracing",
-    "rtds",
 ] }
 
 tokio = { version = "1", features = ["full"] }
