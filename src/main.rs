@@ -804,11 +804,20 @@ async fn run_live_mode(
             // Check for fill on active order
             if let Some(oid) = &active_order_id {
                 let oid_clone = oid.clone();
-                match client.orders(&Default::default(), None).await {
-                    Ok(page) => {
+                info!(order_id = %oid_clone, secs_left = secs, "Polling for fill...");
+                let poll_result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.orders(&Default::default(), None),
+                ).await;
+                match poll_result {
+                    Ok(Ok(page)) => {
                         for o in &page.data {
                             if o.id == oid_clone && o.size_matched > Decimal::ZERO {
-                                info!(order_id = %oid_clone, "Live order filled!");
+                                info!(order_id = %oid_clone, matched = %o.size_matched, "Live order filled!");
+                                telegram.send_error(&format!(
+                                    "FILLED! order={} matched={} price={}",
+                                    oid_clone, o.size_matched, o.price
+                                )).await.ok();
                                 let result = OrderResult {
                                     order_id: oid_clone.clone(),
                                     filled: true,
@@ -832,9 +841,13 @@ async fn run_live_mode(
                                 break 'tier_loop;
                             }
                         }
+                        info!(order_id = %oid_clone, "Not filled yet");
                     }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "Poll error");
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "Fill poll API error");
+                    }
+                    Err(_) => {
+                        warn!("Fill poll timed out (5s)");
                     }
                 }
             }
