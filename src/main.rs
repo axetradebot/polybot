@@ -356,8 +356,10 @@ async fn run_scanner_loop(
 
     let mut last_window_ts: HashMap<String, u64> = HashMap::new();
     let mut token_cache: HashMap<String, MarketInfo> = HashMap::new();
-    let mut window_traded: HashMap<String, bool> = HashMap::new(); // "MarketName-windowTs" -> traded?
-    let mut last_skip_reasons: HashMap<String, String> = HashMap::new(); // market name -> last reason
+    let mut window_traded: HashMap<String, bool> = HashMap::new();
+    let mut last_skip_reasons: HashMap<String, String> = HashMap::new();
+    let mut window_max_delta: HashMap<String, (f64, String)> = HashMap::new(); // key -> (max_delta, direction)
+    let mut last_analytics_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let scan_interval = Duration::from_millis(config.scanner.scan_interval_ms);
     let adjust_ms = config.pricing.adjust_interval_ms;
     let tighten_step = Decimal::try_from(config.pricing.tighten_step).unwrap_or(dec!(0.01));
@@ -636,7 +638,21 @@ async fn run_scanner_loop(
             ).await.ok();
         }
 
-        // ── Daily reset ──
+        // ── Daily reset + analytics ──
+        {
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            if today != last_analytics_date {
+                // Day rolled over — send yesterday's analytics
+                match db.daily_analytics() {
+                    Ok(analytics) => {
+                        let st = state.read().await;
+                        telegram.send_daily_analytics(&analytics, st.bankroll).await.ok();
+                    }
+                    Err(e) => warn!(error = %e, "Failed to compute daily analytics"),
+                }
+                last_analytics_date = today;
+            }
+        }
         state.write().await.reset_daily_if_needed();
 
         // ── Phase 1: Window management ──
@@ -648,12 +664,22 @@ async fn run_scanner_loop(
                 // Window transitioned — check if previous window missed trades
                 if let Some(old_ts) = prev_ts {
                     let key = format!("{}-{}", mkt.name, old_ts);
-                    if !window_traded.get(&key).copied().unwrap_or(false) {
+                    let traded = window_traded.get(&key).copied().unwrap_or(false);
+                    if !traded {
                         let reason = last_skip_reasons
                             .get(&mkt.name)
                             .cloned()
                             .unwrap_or_else(|| "No opportunity found".into());
-                        missed_windows.push((mkt.name.clone(), reason));
+                        missed_windows.push((mkt.name.clone(), reason.clone()));
+
+                        // Write window_summary for the missed window
+                        let old_open = price_feeds.get_window_open(&mkt.slug_prefix, old_ts).await.unwrap_or_default();
+                        let current = price_feeds.get_price(&mkt.binance_symbol).await.unwrap_or(old_open);
+                        let (md, md_dir) = window_max_delta.remove(&key).unwrap_or((0.0, String::new()));
+                        let _ = db.upsert_window_summary(
+                            &mkt.name, old_ts, &old_open.to_string(), &current.to_string(),
+                            md, Some(&md_dir), false, None, None, None, Some(&reason),
+                        );
                     }
                     window_traded.remove(&key);
                 }
@@ -748,6 +774,22 @@ async fn run_scanner_loop(
         // Update last skip reasons for window-miss reporting
         for (name, reason) in &scan_result.skip_reasons {
             last_skip_reasons.insert(name.clone(), reason.clone());
+        }
+
+        // Log scanner evaluations to DB
+        for eval in &scan_result.evaluations {
+            if let Err(e) = db.insert_scanner_log(eval) {
+                warn!(error = %e, market = %eval.market_name, "Failed to log scanner eval");
+            }
+            // Track max delta per window for window_summary
+            if let Some(delta) = eval.delta_pct {
+                let key = format!("{}-{}", eval.market_name, eval.window_ts);
+                let entry = window_max_delta.entry(key).or_insert((0.0, String::new()));
+                if delta > entry.0 {
+                    entry.0 = delta;
+                    entry.1 = eval.direction.clone().unwrap_or_default();
+                }
+            }
         }
 
         // ── Phase 3: Fire orders at best opportunities ──
@@ -946,7 +988,16 @@ async fn run_scanner_loop(
 
                 orders_fired += 1;
                 let traded_key = format!("{}-{}", opp.market_name, opp.window_ts);
-                window_traded.insert(traded_key, true);
+                window_traded.insert(traded_key.clone(), true);
+
+                // Write window_summary for the traded window
+                let (md, md_dir) = window_max_delta.get(&traded_key).cloned().unwrap_or((opp.delta_pct, opp.direction.to_string()));
+                let _ = db.upsert_window_summary(
+                    &opp.market_name, opp.window_ts,
+                    &opp.open_price.to_string(), &opp.open_price.to_string(),
+                    md, Some(&md_dir), true, None,
+                    Some(&opp.suggested_entry.to_string()), None, None,
+                );
             }
         }
 
@@ -1400,10 +1451,15 @@ fn build_trade_record(
         open_price: opp.open_price,
         close_price: Decimal::ZERO,
         skip_reason: None,
+        best_bid: opp.best_bid,
+        spread: opp.spread,
+        depth_at_ask: opp.depth_usd,
+        fill_latency_ms: 0,
     }
 }
 
 fn build_trade_record_from_position(pos: &Position) -> TradeRecord {
+    let fill_latency_ms = pos.placed_at.elapsed().as_millis() as i64;
     TradeRecord {
         id: None,
         timestamp: Utc::now(),
@@ -1432,5 +1488,9 @@ fn build_trade_record_from_position(pos: &Position) -> TradeRecord {
         open_price: pos.open_price,
         close_price: Decimal::ZERO,
         skip_reason: None,
+        best_bid: Decimal::ZERO,
+        spread: Decimal::ZERO,
+        depth_at_ask: Decimal::ZERO,
+        fill_latency_ms,
     }
 }

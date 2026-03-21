@@ -3,7 +3,7 @@ use rust_decimal::Decimal;
 use tracing::{debug, error};
 
 use crate::config::TelegramConfig;
-use crate::db::MarketDayStats;
+use crate::db::{DailyAnalytics, MarketDayStats};
 use crate::scanner::MarketOpportunity;
 use crate::types::{BotMode, Direction, TradeRecord};
 
@@ -383,6 +383,76 @@ impl TelegramNotifier {
         for (name, reason) in missed_markets {
             msg.push_str(&format!("\n\u{200b}  ❌ {name}: {reason}"));
         }
+        self.send_message(&msg).await
+    }
+
+    /// Daily analytics report with delta/timing breakdowns — gated by `daily_summary`.
+    pub async fn send_daily_analytics(
+        &self,
+        analytics: &DailyAnalytics,
+        bankroll: Decimal,
+    ) -> Result<()> {
+        if !self.enabled || !self.on_daily_summary {
+            return Ok(());
+        }
+
+        let total_trades: u32 = analytics.market_stats.iter().map(|s| s.fills).sum();
+        let total_wins: u32 = analytics.market_stats.iter().map(|s| s.wins).sum();
+        let total_pnl: Decimal = analytics.market_stats.iter().map(|s| s.pnl).sum();
+        let pnl_sign = if total_pnl >= Decimal::ZERO { "+" } else { "" };
+        let win_rate = if total_trades > 0 {
+            format!("{:.1}%", total_wins as f64 / total_trades as f64 * 100.0)
+        } else {
+            "N/A".to_string()
+        };
+
+        let mut msg = format!(
+            "📊 Daily Analytics Report\n\n\
+             \u{200b}  Trades: {} | Win rate: {} | {pnl_sign}${total_pnl:.2}\n\
+             \u{200b}  Missed windows: {}\n\
+             \u{200b}  Bankroll: ${bankroll:.2}\n",
+            total_trades, win_rate, analytics.missed_windows,
+        );
+
+        if !analytics.delta_buckets.is_empty() {
+            msg.push_str("\n\u{200b}  DELTA BREAKDOWN:");
+            for b in &analytics.delta_buckets {
+                let wr = if b.trades > 0 {
+                    format!("{:.0}%", b.wins as f64 / b.trades as f64 * 100.0)
+                } else { "—".into() };
+                let ps = if b.pnl >= 0.0 { "+" } else { "" };
+                msg.push_str(&format!(
+                    "\n\u{200b}    {}: {} trades, {} WR, {ps}${:.2}",
+                    b.label, b.trades, wr, b.pnl
+                ));
+            }
+        }
+
+        if !analytics.timing_buckets.is_empty() {
+            msg.push_str("\n\n\u{200b}  ENTRY TIMING:");
+            for b in &analytics.timing_buckets {
+                let wr = if b.trades > 0 {
+                    format!("{:.0}%", b.wins as f64 / b.trades as f64 * 100.0)
+                } else { "—".into() };
+                let ps = if b.pnl >= 0.0 { "+" } else { "" };
+                msg.push_str(&format!(
+                    "\n\u{200b}    {}: {} trades, {} WR, {ps}${:.2}",
+                    b.label, b.trades, wr, b.pnl
+                ));
+            }
+        }
+
+        if !analytics.market_stats.is_empty() {
+            msg.push_str("\n\n\u{200b}  BY MARKET:");
+            for s in &analytics.market_stats {
+                let ps = if s.pnl >= Decimal::ZERO { "+" } else { "" };
+                msg.push_str(&format!(
+                    "\n\u{200b}    {}: {}W/{}L — {ps}${:.2}",
+                    s.market_name, s.wins, s.losses, s.pnl.round_dp(2)
+                ));
+            }
+        }
+
         self.send_message(&msg).await
     }
 

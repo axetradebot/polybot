@@ -87,6 +87,43 @@ impl TradeDb {
                 mode            TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS scanner_log (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp        TEXT NOT NULL DEFAULT (datetime('now')),
+                market_name      TEXT NOT NULL,
+                window_ts        INTEGER NOT NULL,
+                secs_remaining   INTEGER NOT NULL,
+                direction        TEXT,
+                delta_pct        REAL,
+                open_price       TEXT,
+                current_price    TEXT,
+                best_ask         TEXT,
+                best_bid         TEXT,
+                spread           TEXT,
+                depth_at_ask     TEXT,
+                suggested_entry  TEXT,
+                max_entry        TEXT,
+                edge_score       REAL,
+                result           TEXT NOT NULL,
+                detail           TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS window_summary (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_name      TEXT NOT NULL,
+                window_ts        INTEGER NOT NULL,
+                open_price       TEXT NOT NULL,
+                close_price      TEXT NOT NULL DEFAULT '0',
+                max_delta_pct    REAL NOT NULL DEFAULT 0,
+                peak_direction   TEXT,
+                trade_placed     INTEGER NOT NULL DEFAULT 0,
+                trade_won        INTEGER,
+                entry_price      TEXT,
+                pnl              TEXT,
+                skip_reason      TEXT,
+                UNIQUE(market_name, window_ts)
+            );
+
             CREATE TABLE IF NOT EXISTS active_positions (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 market_name      TEXT NOT NULL,
@@ -146,6 +183,10 @@ impl TradeDb {
             "ALTER TABLE trades ADD COLUMN skip_reason TEXT",
             "ALTER TABLE trades ADD COLUMN token_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE trades ADD COLUMN order_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE trades ADD COLUMN best_bid TEXT NOT NULL DEFAULT '0'",
+            "ALTER TABLE trades ADD COLUMN spread TEXT NOT NULL DEFAULT '0'",
+            "ALTER TABLE trades ADD COLUMN depth_at_ask TEXT NOT NULL DEFAULT '0'",
+            "ALTER TABLE trades ADD COLUMN fill_latency_ms INTEGER NOT NULL DEFAULT 0",
         ];
         for sql in &migrations {
             let _ = conn.execute(sql, []);
@@ -156,7 +197,11 @@ impl TradeDb {
             "CREATE INDEX IF NOT EXISTS idx_trades_window ON trades(window_ts);
              CREATE INDEX IF NOT EXISTS idx_trades_outcome ON trades(outcome);
              CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
-             CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(market_name);",
+             CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(market_name);
+             CREATE INDEX IF NOT EXISTS idx_scanlog_window ON scanner_log(window_ts);
+             CREATE INDEX IF NOT EXISTS idx_scanlog_market ON scanner_log(market_name);
+             CREATE INDEX IF NOT EXISTS idx_scanlog_ts ON scanner_log(timestamp);
+             CREATE INDEX IF NOT EXISTS idx_winsummary_mkt ON window_summary(market_name, window_ts);",
         )
         .context("Failed to create indexes")?;
 
@@ -175,10 +220,11 @@ impl TradeDb {
                 mode, direction, token_id, order_id, initial_price, final_price,
                 tighten_count, best_ask_at_entry, filled, fill_price, outcome,
                 pnl, delta_pct, edge_score, seconds_remaining, contracts,
-                bet_size_usd, open_price, close_price, skip_reason
+                bet_size_usd, open_price, close_price, skip_reason,
+                best_bid, spread, depth_at_ask, fill_latency_ms
             ) VALUES (
                 ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,
-                ?18,?19,?20,?21,?22,?23,?24,?25,?26
+                ?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30
             )",
             params![
                 trade.timestamp.to_rfc3339(),
@@ -207,6 +253,10 @@ impl TradeDb {
                 trade.open_price.to_string(),
                 trade.close_price.to_string(),
                 trade.skip_reason,
+                trade.best_bid.to_string(),
+                trade.spread.to_string(),
+                trade.depth_at_ask.to_string(),
+                trade.fill_latency_ms,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -423,6 +473,199 @@ impl TradeDb {
 
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    pub fn insert_scanner_log(
+        &self,
+        eval: &crate::scanner::ScanEvaluation,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO scanner_log (
+                market_name, window_ts, secs_remaining, direction, delta_pct,
+                open_price, current_price, best_ask, best_bid, spread,
+                depth_at_ask, suggested_entry, max_entry, edge_score, result, detail
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            params![
+                eval.market_name,
+                eval.window_ts as i64,
+                eval.secs_remaining as i64,
+                eval.direction,
+                eval.delta_pct,
+                eval.open_price.map(|d| d.to_string()),
+                eval.current_price.map(|d| d.to_string()),
+                eval.best_ask.map(|d| d.to_string()),
+                eval.best_bid.map(|d| d.to_string()),
+                eval.spread.map(|d| d.to_string()),
+                eval.depth_at_ask.map(|d| d.to_string()),
+                eval.suggested_entry.map(|d| d.to_string()),
+                eval.max_entry.map(|d| d.to_string()),
+                eval.edge_score,
+                eval.result,
+                eval.detail,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_window_summary(
+        &self,
+        market_name: &str,
+        window_ts: u64,
+        open_price: &str,
+        close_price: &str,
+        max_delta_pct: f64,
+        peak_direction: Option<&str>,
+        trade_placed: bool,
+        trade_won: Option<bool>,
+        entry_price: Option<&str>,
+        pnl: Option<&str>,
+        skip_reason: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO window_summary (
+                market_name, window_ts, open_price, close_price, max_delta_pct,
+                peak_direction, trade_placed, trade_won, entry_price, pnl, skip_reason
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+            ON CONFLICT(market_name, window_ts) DO UPDATE SET
+                close_price = excluded.close_price,
+                max_delta_pct = MAX(window_summary.max_delta_pct, excluded.max_delta_pct),
+                peak_direction = COALESCE(excluded.peak_direction, window_summary.peak_direction),
+                trade_placed = MAX(window_summary.trade_placed, excluded.trade_placed),
+                trade_won = COALESCE(excluded.trade_won, window_summary.trade_won),
+                entry_price = COALESCE(excluded.entry_price, window_summary.entry_price),
+                pnl = COALESCE(excluded.pnl, window_summary.pnl),
+                skip_reason = COALESCE(excluded.skip_reason, window_summary.skip_reason)",
+            params![
+                market_name,
+                window_ts as i64,
+                open_price,
+                close_price,
+                max_delta_pct,
+                peak_direction,
+                trade_placed as i32,
+                trade_won.map(|w| w as i32),
+                entry_price,
+                pnl,
+                skip_reason,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn daily_analytics(&self) -> Result<DailyAnalytics> {
+        let conn = self.conn.lock().unwrap();
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+        let mut delta_buckets = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT
+                    CASE
+                        WHEN CAST(delta_pct AS REAL) < 0.08 THEN '0.06-0.08'
+                        WHEN CAST(delta_pct AS REAL) < 0.10 THEN '0.08-0.10'
+                        WHEN CAST(delta_pct AS REAL) < 0.15 THEN '0.10-0.15'
+                        ELSE '0.15+'
+                    END as bucket,
+                    COUNT(*) as trades,
+                    SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) as wins,
+                    ROUND(COALESCE(SUM(CAST(pnl AS REAL)), 0), 4) as total_pnl
+                 FROM trades
+                 WHERE date(timestamp) = ?1 AND filled = 1
+                 GROUP BY bucket ORDER BY bucket"
+            )?;
+            let rows = stmt.query_map(params![today], |row| {
+                Ok(AnalyticsBucket {
+                    label: row.get(0)?,
+                    trades: row.get(1)?,
+                    wins: row.get(2)?,
+                    pnl: row.get::<_, String>(3).unwrap_or_default().parse().unwrap_or(0.0),
+                })
+            })?;
+            for r in rows { if let Ok(b) = r { delta_buckets.push(b); } }
+        }
+
+        let mut timing_buckets = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT
+                    CASE
+                        WHEN seconds_remaining > 15 THEN 'T-20 to T-15'
+                        WHEN seconds_remaining > 10 THEN 'T-15 to T-10'
+                        WHEN seconds_remaining > 5  THEN 'T-10 to T-5'
+                        ELSE 'T-5 to T-4'
+                    END as bucket,
+                    COUNT(*) as trades,
+                    SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) as wins,
+                    ROUND(COALESCE(SUM(CAST(pnl AS REAL)), 0), 4) as total_pnl
+                 FROM trades
+                 WHERE date(timestamp) = ?1 AND filled = 1
+                 GROUP BY bucket ORDER BY bucket"
+            )?;
+            let rows = stmt.query_map(params![today], |row| {
+                Ok(AnalyticsBucket {
+                    label: row.get(0)?,
+                    trades: row.get(1)?,
+                    wins: row.get(2)?,
+                    pnl: row.get::<_, String>(3).unwrap_or_default().parse().unwrap_or(0.0),
+                })
+            })?;
+            for r in rows { if let Ok(b) = r { timing_buckets.push(b); } }
+        }
+
+        let mut market_stats = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT market_name,
+                    COUNT(*) as trades,
+                    SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END) as losses,
+                    ROUND(COALESCE(SUM(CAST(pnl AS REAL)), 0), 4) as total_pnl
+                 FROM trades
+                 WHERE date(timestamp) = ?1 AND filled = 1 AND market_name != ''
+                 GROUP BY market_name ORDER BY market_name"
+            )?;
+            let rows = stmt.query_map(params![today], |row| {
+                Ok(MarketDayStats {
+                    market_name: row.get(0)?,
+                    fills: row.get(1)?,
+                    wins: row.get(2)?,
+                    losses: row.get(3)?,
+                    pnl: row.get::<_, String>(4).unwrap_or_default().parse::<Decimal>().unwrap_or_default(),
+                })
+            })?;
+            for r in rows { if let Ok(s) = r { market_stats.push(s); } }
+        }
+
+        let missed_windows: u32 = conn.query_row(
+            "SELECT COUNT(*) FROM window_summary WHERE date(datetime(window_ts, 'unixepoch')) = ?1 AND trade_placed = 0",
+            params![today],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        Ok(DailyAnalytics {
+            delta_buckets,
+            timing_buckets,
+            market_stats,
+            missed_windows,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct AnalyticsBucket {
+    pub label: String,
+    pub trades: u32,
+    pub wins: u32,
+    pub pnl: f64,
+}
+
+#[derive(Debug)]
+pub struct DailyAnalytics {
+    pub delta_buckets: Vec<AnalyticsBucket>,
+    pub timing_buckets: Vec<AnalyticsBucket>,
+    pub market_stats: Vec<MarketDayStats>,
+    pub missed_windows: u32,
 }
 
 #[derive(Debug)]

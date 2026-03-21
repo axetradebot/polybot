@@ -124,6 +124,10 @@ pub struct TradeRecord {
     pub open_price: Decimal,
     pub close_price: Decimal,
     pub skip_reason: Option<String>,
+    pub best_bid: Decimal,
+    pub spread: Decimal,
+    pub depth_at_ask: Decimal,
+    pub fill_latency_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
