@@ -225,7 +225,8 @@ async fn run_scanner_loop(
                 .build();
             match c.balance_allowance(req).await {
                 Ok(resp) => {
-                    let real_balance = resp.balance;
+                    let usdc_decimals = Decimal::from(1_000_000u64);
+                    let real_balance = resp.balance / usdc_decimals;
                     info!(clob_balance = %real_balance, config_bankroll = %config.bankroll.total, "Syncing bankroll from Polymarket");
                     let mut st = state.write().await;
                     st.bankroll = real_balance;
@@ -339,7 +340,10 @@ async fn run_scanner_loop(
                     .asset_type(polymarket_client_sdk::clob::types::AssetType::Collateral)
                     .build();
                 match tokio::time::timeout(Duration::from_secs(3), c.balance_allowance(req)).await {
-                    Ok(Ok(resp)) => Some(resp.balance),
+                    Ok(Ok(resp)) => {
+                        let usdc_decimals = Decimal::from(1_000_000u64);
+                        Some(resp.balance / usdc_decimals)
+                    }
                     _ => None,
                 }
             } else {
