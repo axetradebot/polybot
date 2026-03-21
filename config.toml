@@ -188,6 +188,30 @@ delta_tiers = [
     [0.35, 0.88],
 ]
 
+[[markets]]
+name = "BTC Hourly"
+asset = "BTC"
+market_type = "hourly"
+mode = "paper"
+enabled = true
+window_seconds = 3600
+slug_prefix = "bitcoin-up-or-down"
+binance_symbol = "btcusdt"
+resolution_source = "binance"
+entry_start_s = 300
+entry_cutoff_s = 30
+min_delta_pct = 0.05
+max_entry_price = 0.88
+undercut_offset = 0.01
+tighten_step = 0.01
+adjust_interval_ms = 5000
+delta_tiers = [
+    [0.05, 0.80],
+    [0.10, 0.84],
+    [0.20, 0.87],
+    [0.35, 0.90],
+]
+
 [telegram]
 enabled = true
 on_trade = true

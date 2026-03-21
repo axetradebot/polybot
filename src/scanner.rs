@@ -16,6 +16,7 @@ use crate::types::{Direction, MarketInfo};
 pub struct MarketOpportunity {
     pub market_name: String,
     pub asset: String,
+    pub market_type: String,
     pub window_seconds: u64,
     pub window_ts: u64,
     pub slug: String,
@@ -102,17 +103,17 @@ pub async fn scan_all_markets(
     price_feeds: &PriceFeeds,
     token_cache: &std::collections::HashMap<String, MarketInfo>,
     positions: &PositionTracker,
+    hourly_slugs: &std::collections::HashMap<String, String>,
 ) -> ScanResult {
     let mut opportunities = Vec::new();
     let mut skip_reasons = std::collections::HashMap::new();
     let mut evaluations = Vec::new();
     let bet_size = Decimal::try_from(config.bankroll.bet_size_usd).unwrap_or(dec!(5));
-    let undercut = Decimal::try_from(config.pricing.undercut_offset).unwrap_or(dec!(0.03));
     let min_entry = Decimal::try_from(config.pricing.min_entry_price).unwrap_or(dec!(0.55));
-    let entry_cutoff_s = config.pricing.entry_cutoff_s;
 
     for mkt in config.enabled_markets() {
         let (window_ts, secs_rem) = market::current_window(mkt.window_seconds);
+        let entry_cutoff_s = mkt.effective_entry_cutoff(config.pricing.entry_cutoff_s);
 
         if secs_rem > mkt.entry_start_s || secs_rem < entry_cutoff_s {
             debug!(
@@ -193,7 +194,17 @@ pub async fn scan_all_markets(
             continue;
         }
 
-        let slug = market::build_slug(&mkt.slug_prefix, window_ts);
+        let slug = if mkt.is_hourly() {
+            match hourly_slugs.get(&mkt.name) {
+                Some(s) => s.clone(),
+                None => {
+                    debug!(market = %mkt.name, "Skip: no active hourly market discovered");
+                    continue;
+                }
+            }
+        } else {
+            market::build_slug(&mkt.slug_prefix, window_ts)
+        };
         if positions.has_position_in_window(&slug).await {
             debug!(market = %mkt.name, slug = %slug, "Skip: already have position");
             skip_reasons.insert(mkt.name.clone(), "Already have position in this window".into());
@@ -252,6 +263,7 @@ pub async fn scan_all_markets(
             }
         };
 
+        let undercut = Decimal::try_from(mkt.effective_undercut_offset(config.pricing.undercut_offset)).unwrap_or(dec!(0.03));
         let taker_threshold = config.pricing.taker_delta_threshold;
         let is_taker = taker_threshold > 0.0 && delta_f64 >= taker_threshold;
         let mut suggested_entry = if is_taker {
@@ -327,6 +339,7 @@ pub async fn scan_all_markets(
         opportunities.push(MarketOpportunity {
             market_name: mkt.name.clone(),
             asset: mkt.asset.clone(),
+            market_type: mkt.market_type.clone(),
             window_seconds: mkt.window_seconds,
             window_ts,
             slug,

@@ -101,6 +101,7 @@ pub struct TradeRecord {
     pub timestamp: DateTime<Utc>,
     pub market_name: String,
     pub asset: String,
+    pub market_type: String,
     pub window_seconds: u64,
     pub window_ts: u64,
     pub slug: String,

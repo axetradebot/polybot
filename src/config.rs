@@ -114,11 +114,15 @@ fn default_max_orders() -> usize { 3 }
 pub struct MarketConfig {
     pub name: String,
     pub asset: String,
+    #[serde(default = "default_market_type")]
+    pub market_type: String,
     pub window_seconds: u64,
     pub slug_prefix: String,
     pub binance_symbol: String,
     #[serde(default)]
     pub chainlink_symbol: String,
+    #[serde(default = "default_resolution_source")]
+    pub resolution_source: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Per-market mode override: "paper" | "live".
@@ -127,14 +131,24 @@ pub struct MarketConfig {
     pub mode: Option<String>,
     #[serde(default = "default_entry_start")]
     pub entry_start_s: u64,
+    #[serde(default)]
+    pub entry_cutoff_s: Option<u64>,
     #[serde(default = "default_min_delta")]
     pub min_delta_pct: f64,
     #[serde(default = "default_max_entry_mkt")]
     pub max_entry_price: f64,
     pub delta_tiers: Vec<[f64; 2]>,
+    #[serde(default)]
+    pub undercut_offset: Option<f64>,
+    #[serde(default)]
+    pub tighten_step: Option<f64>,
+    #[serde(default)]
+    pub adjust_interval_ms: Option<u64>,
 }
 
 fn default_true() -> bool { true }
+fn default_market_type() -> String { "5min".into() }
+fn default_resolution_source() -> String { "chainlink".into() }
 fn default_entry_start() -> u64 { 20 }
 fn default_min_delta() -> f64 { 0.07 }
 fn default_max_entry_mkt() -> f64 { 0.85 }
@@ -351,6 +365,26 @@ impl MarketConfig {
     pub fn watch_start_s(&self) -> u64 {
         self.entry_start_s + 2
     }
+
+    pub fn is_hourly(&self) -> bool {
+        self.market_type == "hourly"
+    }
+
+    pub fn effective_entry_cutoff(&self, global: u64) -> u64 {
+        self.entry_cutoff_s.unwrap_or(global)
+    }
+
+    pub fn effective_undercut_offset(&self, global: f64) -> f64 {
+        self.undercut_offset.unwrap_or(global)
+    }
+
+    pub fn effective_tighten_step(&self, global: f64) -> f64 {
+        self.tighten_step.unwrap_or(global)
+    }
+
+    pub fn effective_adjust_interval_ms(&self, global: u64) -> u64 {
+        self.adjust_interval_ms.unwrap_or(global)
+    }
 }
 
 // ─── Validation ──────────────────────────────────────────────────────────────
@@ -363,8 +397,8 @@ fn validate_markets(markets: &[MarketConfig]) -> Result<()> {
         if m.name.is_empty() {
             bail!("Market {i}: name cannot be empty");
         }
-        if m.window_seconds != 300 && m.window_seconds != 900 {
-            bail!("Market '{}': window_seconds must be 300 or 900", m.name);
+        if m.window_seconds != 300 && m.window_seconds != 900 && m.window_seconds != 3600 {
+            bail!("Market '{}': window_seconds must be 300, 900, or 3600", m.name);
         }
         if m.delta_tiers.is_empty() {
             bail!("Market '{}': delta_tiers must have at least one entry", m.name);

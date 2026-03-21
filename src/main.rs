@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod db;
 mod feeds;
+mod hourly_discovery;
 mod market;
 mod orderbook;
 mod positions;
@@ -366,6 +367,10 @@ async fn run_scanner_loop(
     let entry_cutoff_s = config.pricing.entry_cutoff_s;
     let clob_url = config.infra.polymarket_clob_url.clone();
 
+    // Hourly market discovery
+    let hourly_discovery = hourly_discovery::HourlyDiscovery::new();
+    let mut hourly_slug_map: HashMap<String, String> = HashMap::new();
+
     info!(
         scan_interval_ms = config.scanner.scan_interval_ms,
         max_concurrent = config.bankroll.max_concurrent_positions,
@@ -701,15 +706,35 @@ async fn run_scanner_loop(
                 }
 
                 // Resolve tokens for this window (best-effort)
-                let slug = market::build_slug(&mkt.slug_prefix, window_ts);
-                let slug_clone = slug.clone();
-                // We do a quick single attempt; scanner will skip if not yet resolved
-                match market::resolve_market(&slug_clone).await {
-                    Ok(info) => {
-                        token_cache.insert(slug, info);
+                if mkt.is_hourly() {
+                    // Clear previous hourly slug on window transition
+                    if let Some(old_slug) = hourly_slug_map.remove(&mkt.name) {
+                        token_cache.remove(&old_slug);
                     }
-                    Err(e) => {
-                        warn!(market = %mkt.name, slug = %slug_clone, error = %e, "Token resolve failed (will retry)");
+                    hourly_discovery.invalidate_cache().await;
+                    match hourly_discovery.get_current_market(&mkt.slug_prefix).await {
+                        Ok(Some(hm)) => {
+                            info!(market = %mkt.name, slug = %hm.event_slug, end_time = hm.end_time, "Hourly market resolved");
+                            token_cache.insert(hm.event_slug.clone(), hm.to_market_info());
+                            hourly_slug_map.insert(mkt.name.clone(), hm.event_slug);
+                        }
+                        Ok(None) => {
+                            warn!(market = %mkt.name, "No active hourly market found (will retry)");
+                        }
+                        Err(e) => {
+                            warn!(market = %mkt.name, error = %e, "Hourly market discovery failed (will retry)");
+                        }
+                    }
+                } else {
+                    let slug = market::build_slug(&mkt.slug_prefix, window_ts);
+                    let slug_clone = slug.clone();
+                    match market::resolve_market(&slug_clone).await {
+                        Ok(info) => {
+                            token_cache.insert(slug, info);
+                        }
+                        Err(e) => {
+                            warn!(market = %mkt.name, slug = %slug_clone, error = %e, "Token resolve failed (will retry)");
+                        }
                     }
                 }
 
@@ -735,14 +760,31 @@ async fn run_scanner_loop(
                 }
 
                 // Retry token resolution if missing
-                let slug = market::build_slug(&mkt.slug_prefix, window_ts);
-                if !token_cache.contains_key(&slug) && secs_rem > entry_cutoff_s {
-                    match market::resolve_market(&slug).await {
-                        Ok(info) => {
-                            info!(market = %mkt.name, slug = %slug, "Token resolved on retry");
-                            token_cache.insert(slug, info);
+                if mkt.is_hourly() {
+                    let has_slug = hourly_slug_map.contains_key(&mkt.name);
+                    let has_token = has_slug
+                        && token_cache.contains_key(hourly_slug_map.get(&mkt.name).unwrap());
+                    let mkt_cutoff = mkt.effective_entry_cutoff(entry_cutoff_s);
+                    if !has_token && secs_rem > mkt_cutoff {
+                        match hourly_discovery.get_current_market(&mkt.slug_prefix).await {
+                            Ok(Some(hm)) => {
+                                info!(market = %mkt.name, slug = %hm.event_slug, "Hourly market resolved on retry");
+                                token_cache.insert(hm.event_slug.clone(), hm.to_market_info());
+                                hourly_slug_map.insert(mkt.name.clone(), hm.event_slug);
+                            }
+                            _ => {}
                         }
-                        Err(_) => {}
+                    }
+                } else {
+                    let slug = market::build_slug(&mkt.slug_prefix, window_ts);
+                    if !token_cache.contains_key(&slug) && secs_rem > entry_cutoff_s {
+                        match market::resolve_market(&slug).await {
+                            Ok(info) => {
+                                info!(market = %mkt.name, slug = %slug, "Token resolved on retry");
+                                token_cache.insert(slug, info);
+                            }
+                            Err(_) => {}
+                        }
                     }
                 }
             }
@@ -758,8 +800,11 @@ async fn run_scanner_loop(
         price_feeds.prune_old_window_opens(now_ts, 3600).await;
         positions.prune_old(7200).await;
 
-        // Clean expired token cache entries
+        // Clean expired token cache entries (preserve active hourly slugs)
         token_cache.retain(|slug, _| {
+            if hourly_slug_map.values().any(|s| s == slug) {
+                return true;
+            }
             slug.rsplit_once('-')
                 .and_then(|(_, ts)| ts.parse::<u64>().ok())
                 .map(|ts| now_ts.saturating_sub(ts) < 3600)
@@ -768,7 +813,7 @@ async fn run_scanner_loop(
 
         // ── Phase 2: Run edge scanner ──
         let scan_result =
-            scanner::scan_all_markets(config, price_feeds, &token_cache, positions).await;
+            scanner::scan_all_markets(config, price_feeds, &token_cache, positions, &hourly_slug_map).await;
         let opportunities = scan_result.opportunities;
 
         // Update last skip reasons for window-miss reporting
@@ -1072,18 +1117,42 @@ async fn run_scanner_loop(
                     }
                 }
 
-                // Tighten eligible positions
-                let to_tighten = positions.needs_tighten(adjust_ms).await;
+                // Tighten eligible positions (use smallest interval to get all candidates)
+                let min_adjust = config
+                    .enabled_markets()
+                    .iter()
+                    .filter_map(|m| m.adjust_interval_ms)
+                    .min()
+                    .unwrap_or(adjust_ms)
+                    .min(adjust_ms);
+                let to_tighten = positions.needs_tighten(min_adjust).await;
                 for pos in &to_tighten {
-                    let (_, secs_rem) = market::current_window(pos.window_seconds);
-                    if secs_rem < entry_cutoff_s {
+                    // Per-market tighten interval check
+                    let mkt_cfg = config.markets.iter().find(|m| m.name == pos.market_name);
+                    let pos_adjust_ms = mkt_cfg
+                        .map(|m| m.effective_adjust_interval_ms(adjust_ms))
+                        .unwrap_or(adjust_ms);
+                    let pos_interval = Duration::from_millis(pos_adjust_ms);
+                    if tokio::time::Instant::now().duration_since(pos.last_adjust_at) < pos_interval {
                         continue;
                     }
+
+                    let pos_cutoff = mkt_cfg
+                        .map(|m| m.effective_entry_cutoff(entry_cutoff_s))
+                        .unwrap_or(entry_cutoff_s);
+                    let (_, secs_rem) = market::current_window(pos.window_seconds);
+                    if secs_rem < pos_cutoff {
+                        continue;
+                    }
+
+                    let pos_tighten_step = mkt_cfg
+                        .map(|m| Decimal::try_from(m.effective_tighten_step(config.pricing.tighten_step)).unwrap_or(tighten_step))
+                        .unwrap_or(tighten_step);
 
                     let fresh_ask =
                         orderbook::refresh_best_ask(&clob_url, &pos.token_id).await;
                     let new_price = {
-                        let stepped = pos.current_price + tighten_step;
+                        let stepped = pos.current_price + pos_tighten_step;
                         let ask_bound = fresh_ask
                             .map(|a| a - dec!(0.01))
                             .unwrap_or(stepped);
@@ -1430,6 +1499,7 @@ fn build_trade_record(
         timestamp: Utc::now(),
         market_name: opp.market_name.clone(),
         asset: opp.asset.clone(),
+        market_type: opp.market_type.clone(),
         window_seconds: opp.window_seconds,
         window_ts: opp.window_ts,
         slug: opp.slug.clone(),
@@ -1460,6 +1530,15 @@ fn build_trade_record(
     }
 }
 
+fn infer_market_type(window_seconds: u64) -> &'static str {
+    match window_seconds {
+        300 => "5min",
+        900 => "15min",
+        3600 => "hourly",
+        _ => "5min",
+    }
+}
+
 fn build_trade_record_from_position(pos: &Position) -> TradeRecord {
     let fill_latency_ms = pos.placed_at.elapsed().as_millis() as i64;
     TradeRecord {
@@ -1467,6 +1546,7 @@ fn build_trade_record_from_position(pos: &Position) -> TradeRecord {
         timestamp: Utc::now(),
         market_name: pos.market_name.clone(),
         asset: pos.asset.clone(),
+        market_type: infer_market_type(pos.window_seconds).to_string(),
         window_seconds: pos.window_seconds,
         window_ts: pos.window_ts,
         slug: pos.slug.clone(),

@@ -187,6 +187,7 @@ impl TradeDb {
             "ALTER TABLE trades ADD COLUMN spread TEXT NOT NULL DEFAULT '0'",
             "ALTER TABLE trades ADD COLUMN depth_at_ask TEXT NOT NULL DEFAULT '0'",
             "ALTER TABLE trades ADD COLUMN fill_latency_ms INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN market_type TEXT NOT NULL DEFAULT '5min'",
         ];
         for sql in &migrations {
             let _ = conn.execute(sql, []);
@@ -216,7 +217,7 @@ impl TradeDb {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO trades (
-                timestamp, market_name, asset, window_seconds, window_ts, slug,
+                timestamp, market_name, asset, market_type, window_seconds, window_ts, slug,
                 mode, direction, token_id, order_id, initial_price, final_price,
                 tighten_count, best_ask_at_entry, filled, fill_price, outcome,
                 pnl, delta_pct, edge_score, seconds_remaining, contracts,
@@ -224,12 +225,13 @@ impl TradeDb {
                 best_bid, spread, depth_at_ask, fill_latency_ms
             ) VALUES (
                 ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,
-                ?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30
+                ?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31
             )",
             params![
                 trade.timestamp.to_rfc3339(),
                 trade.market_name,
                 trade.asset,
+                trade.market_type,
                 trade.window_seconds as i64,
                 trade.window_ts as i64,
                 trade.slug,
