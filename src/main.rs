@@ -96,12 +96,6 @@ async fn main() -> Result<()> {
         config.mode,
     ));
 
-    let market_modes: Vec<(String, String)> = enabled.iter().map(|m| {
-        let mode = if config.is_market_paper(&m.name) { "paper" } else { "live" };
-        (m.name.clone(), mode.to_string())
-    }).collect();
-    telegram.send_startup(config.bankroll_decimal(), &market_modes).await.ok();
-
     let risk_manager = RiskManager::new(&config);
     let verbose = cli.verbose || config.telegram.verbose_skips;
 
@@ -221,11 +215,42 @@ async fn run_scanner_loop(
         };
 
         info!("CLOB client authenticated");
+
+        // Sync bankroll with real Polymarket portfolio balance
+        {
+            use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
+            use polymarket_client_sdk::clob::types::AssetType;
+            let req = BalanceAllowanceRequest::builder()
+                .asset_type(AssetType::Collateral)
+                .build();
+            match c.balance_allowance(req).await {
+                Ok(resp) => {
+                    let real_balance = resp.balance;
+                    info!(clob_balance = %real_balance, config_bankroll = %config.bankroll.total, "Syncing bankroll from Polymarket");
+                    let mut st = state.write().await;
+                    st.bankroll = real_balance;
+                }
+                Err(e) => {
+                    warn!(error = %e, "Could not fetch CLOB balance, using config bankroll");
+                }
+            }
+        }
+
         (Some(c), Some(s))
     } else {
         info!("Pure paper mode — no CLOB client needed");
         (None, None)
     };
+
+    // Send startup message with real balance
+    {
+        let st = state.read().await;
+        let market_modes: Vec<(String, String)> = config.enabled_markets().iter().map(|m| {
+            let mode = if config.is_market_paper(&m.name) { "paper" } else { "live" };
+            (m.name.clone(), mode.to_string())
+        }).collect();
+        telegram.send_startup(st.bankroll, &market_modes).await.ok();
+    }
 
     // ── Macros for CLOB operations ──
 
