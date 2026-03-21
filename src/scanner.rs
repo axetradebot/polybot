@@ -90,7 +90,9 @@ pub async fn scan_all_markets(
     for mkt in config.enabled_markets() {
         let (window_ts, secs_rem) = market::current_window(mkt.window_seconds);
 
-        // Must be within entry window — don't overwrite real skip reasons
+        // Must be within entry window — don't report this as a skip reason,
+        // it's the normal state for most of the window. Only real evaluation
+        // results (delta too low, price too high, etc.) get reported.
         if secs_rem > mkt.entry_start_s || secs_rem < entry_cutoff_s {
             debug!(
                 market = %mkt.name,
@@ -98,11 +100,6 @@ pub async fn scan_all_markets(
                 entry_window = %format!("{}s-{}s", entry_cutoff_s, mkt.entry_start_s),
                 "Outside entry window"
             );
-            if !skip_reasons.contains_key(&mkt.name) {
-                skip_reasons.insert(mkt.name.clone(),
-                    format!("No entry window reached (need T-{} to T-{}s)", mkt.entry_start_s, entry_cutoff_s)
-                );
-            }
             continue;
         }
 
