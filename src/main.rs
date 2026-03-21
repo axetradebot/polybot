@@ -858,6 +858,69 @@ async fn run_live_mode(
                 break 'tier_loop;
             }
 
+            // All tiers used up but we have an active order — just wait for window close
+            if next_tier_idx >= tiers.len() {
+                // Don't poll forever; sleep until window closes then check once
+                let close_ts = window.close_ts();
+                let now = chrono::Utc::now().timestamp() as u64;
+                if now < close_ts {
+                    let wait = close_ts.saturating_sub(now) + 1;
+                    info!(wait_secs = wait, "All tiers done, waiting for window close");
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                }
+                // One final fill check
+                if let Some(oid) = &active_order_id {
+                    let oid_clone = oid.clone();
+                    info!(order_id = %oid_clone, "Final fill check at window close");
+                    if let Ok(Ok(page)) = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        client.orders(&Default::default(), None),
+                    ).await {
+                        for o in &page.data {
+                            if o.id == oid_clone && o.size_matched > Decimal::ZERO {
+                                info!(order_id = %oid_clone, matched = %o.size_matched, "Live order filled!");
+                                telegram.send_error(&format!(
+                                    "FILLED! order={} matched={} price={}",
+                                    oid_clone, o.size_matched, o.price
+                                )).await.ok();
+                                let result = OrderResult {
+                                    order_id: oid_clone.clone(),
+                                    filled: true,
+                                    fill_price: o.price,
+                                    fill_size: o.size_matched,
+                                };
+                                let dec = active_decision.take().unwrap();
+                                let btc_open = state.read().await.window_open_price;
+                                record_live_order(&result, &dec, 0, config, db, telegram).await;
+                                last_pending_settle = Some(PendingSettle {
+                                    slug: window.slug.clone(),
+                                    order_id: oid_clone,
+                                    direction: dec.direction,
+                                    fill_price: o.price,
+                                    fill_size: o.size_matched,
+                                    tier_name: dec.tier_name.clone(),
+                                    btc_open_price: btc_open,
+                                });
+                                break 'tier_loop;
+                            }
+                        }
+                    }
+                    // Not filled — record as unfilled
+                    info!(order_id = %oid_clone, "Order expired unfilled");
+                    telegram.send_error("Order expired — not filled this window").await.ok();
+                    if let Some(dec) = active_decision.take() {
+                        let fake = OrderResult {
+                            order_id: oid_clone,
+                            filled: false,
+                            fill_price: Decimal::ZERO,
+                            fill_size: Decimal::ZERO,
+                        };
+                        record_live_order(&fake, &dec, 0, config, db, telegram).await;
+                    }
+                }
+                break 'tier_loop;
+            }
+
             // Between-poll deadline: honour order_lifetime_ms cap
             let min_secs_to_next_tier = tiers
                 .get(next_tier_idx)

@@ -69,6 +69,12 @@ pub struct WindowInfo {
     pub seconds_remaining: u64,
 }
 
+impl WindowInfo {
+    pub fn close_ts(&self) -> u64 {
+        self.window_ts + 300
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Signal {
     pub direction: Direction,
