@@ -62,27 +62,25 @@ impl fmt::Display for TradeOutcome {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct WindowInfo {
-    pub window_ts: u64,
-    pub slug: String,
-    pub seconds_remaining: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionStatus {
+    Pending,
+    Filled,
+    Settled,
+    Expired,
+    Cancelled,
 }
 
-impl WindowInfo {
-    pub fn close_ts(&self) -> u64 {
-        self.window_ts + 300
+impl fmt::Display for PositionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PositionStatus::Pending => write!(f, "PENDING"),
+            PositionStatus::Filled => write!(f, "FILLED"),
+            PositionStatus::Settled => write!(f, "SETTLED"),
+            PositionStatus::Expired => write!(f, "EXPIRED"),
+            PositionStatus::Cancelled => write!(f, "CANCELLED"),
+        }
     }
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct Signal {
-    pub direction: Direction,
-    pub delta_pct: Decimal,
-    pub target_price: Decimal,
-    pub token_id: String,
-    pub window_ts: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -101,36 +99,31 @@ pub struct MarketInfo {
 pub struct TradeRecord {
     pub id: Option<i64>,
     pub timestamp: DateTime<Utc>,
+    pub market_name: String,
+    pub asset: String,
+    pub window_seconds: u64,
     pub window_ts: u64,
-    pub market_slug: String,
+    pub slug: String,
+    pub mode: String,
     pub direction: String,
     pub token_id: String,
     pub order_id: String,
-    pub tier_name: String,
-    pub entry_price: Decimal,
-    pub size: Decimal,
-    pub cost_usd: Decimal,
-    pub outcome: String,
-    pub pnl: Decimal,
-    pub btc_open_price: Decimal,
-    pub btc_close_price: Decimal,
-    pub delta_pct: Decimal,
-    pub seconds_at_entry: Decimal,
-    pub mode: String,
-    pub filled: bool,
     pub initial_price: Decimal,
+    pub final_price: Decimal,
     pub tighten_count: u32,
     pub best_ask_at_entry: Decimal,
-    pub skip_reason: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct OrderResult {
-    pub order_id: String,
     pub filled: bool,
-    pub fill_price: Decimal,
-    pub fill_size: Decimal,
+    pub fill_price: Option<Decimal>,
+    pub outcome: String,
+    pub pnl: Decimal,
+    pub delta_pct: Decimal,
+    pub edge_score: f64,
+    pub seconds_remaining: f64,
+    pub contracts: Decimal,
+    pub bet_size_usd: Decimal,
+    pub open_price: Decimal,
+    pub close_price: Decimal,
+    pub skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +142,14 @@ pub struct BinanceTrade {
     pub trade_time: u64,
     #[serde(rename = "m")]
     pub is_buyer_maker: bool,
+}
+
+/// Wrapper for Binance combined-stream messages.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct BinanceCombinedMessage {
+    pub stream: String,
+    pub data: BinanceTrade,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,9 +1,12 @@
 use anyhow::{bail, Context, Result};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::types::{BotMode, SignatureType};
+
+// ─── Top-level application config ────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -16,71 +19,173 @@ pub struct AppConfig {
     pub api_passphrase: Option<String>,
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
-    pub trading: TradingConfig,
+    pub general: GeneralConfig,
+    pub bankroll: BankrollConfig,
     pub pricing: PricingConfig,
+    pub scanner: ScannerConfig,
+    pub markets: Vec<MarketConfig>,
+    pub telegram: TelegramConfig,
     pub infra: InfraConfig,
-    pub logging: LoggingConfig,
+    /// Markets that should run in paper mode even when the bot is in live mode.
+    pub paper_markets: HashSet<String>,
 }
 
+// ─── Section configs ─────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Deserialize)]
-pub struct TradingConfig {
-    pub starting_bankroll: f64,
-    pub max_bet_usd: f64,
+pub struct GeneralConfig {
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+}
+
+fn default_mode() -> String { "paper".into() }
+fn default_log_level() -> String { "info".into() }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BankrollConfig {
+    pub total: f64,
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent_positions: usize,
+    #[serde(default = "default_max_per_market")]
+    pub max_per_market: usize,
+    #[serde(default = "default_bet_size")]
+    pub bet_size_usd: f64,
+    #[serde(default = "default_daily_loss")]
     pub daily_loss_limit_usd: f64,
+    #[serde(default = "default_consec_pause")]
     pub consecutive_loss_pause: u32,
+    #[serde(default = "default_pause_min")]
     pub pause_duration_minutes: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct PricingConfig {
-    pub min_delta_pct: f64,
-    pub entry_start_s: u64,
-    pub entry_cutoff_s: u64,
-    pub undercut_offset: f64,
-    pub tighten_step: f64,
-    pub adjust_interval_ms: u64,
-    pub max_entry_price: f64,
-    pub min_entry_price: f64,
-    pub delta_scaling: DeltaScalingConfig,
-}
+fn default_max_concurrent() -> usize { 6 }
+fn default_max_per_market() -> usize { 2 }
+fn default_bet_size() -> f64 { 5.0 }
+fn default_daily_loss() -> f64 { 50.0 }
+fn default_consec_pause() -> u32 { 5 }
+fn default_pause_min() -> u64 { 15 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct DeltaScalingConfig {
-    /// Each entry: [min_delta_pct, max_entry_price_for_this_delta]
-    pub tiers: Vec<[f64; 2]>,
+#[allow(dead_code)]
+pub struct PricingConfig {
+    #[serde(default = "default_strategy")]
+    pub strategy: String,
+    #[serde(default = "default_undercut")]
+    pub undercut_offset: f64,
+    #[serde(default = "default_tighten")]
+    pub tighten_step: f64,
+    #[serde(default = "default_adjust_ms")]
+    pub adjust_interval_ms: u64,
+    #[serde(default = "default_min_entry")]
+    pub min_entry_price: f64,
+    #[serde(default = "default_cutoff")]
+    pub entry_cutoff_s: u64,
+}
+
+fn default_strategy() -> String { "orderbook_aware".into() }
+fn default_undercut() -> f64 { 0.03 }
+fn default_tighten() -> f64 { 0.01 }
+fn default_adjust_ms() -> u64 { 2000 }
+fn default_min_entry() -> f64 { 0.55 }
+fn default_cutoff() -> u64 { 4 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScannerConfig {
+    #[serde(default = "default_scan_ms")]
+    pub scan_interval_ms: u64,
+    #[serde(default = "default_min_edge")]
+    pub min_edge_score: f64,
+    #[serde(default = "default_max_orders")]
+    pub max_orders_per_cycle: usize,
+}
+
+fn default_scan_ms() -> u64 { 1000 }
+fn default_min_edge() -> f64 { 0.05 }
+fn default_max_orders() -> usize { 3 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct MarketConfig {
+    pub name: String,
+    pub asset: String,
+    pub window_seconds: u64,
+    pub slug_prefix: String,
+    pub binance_symbol: String,
+    #[serde(default)]
+    pub chainlink_symbol: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Per-market mode override: "paper" | "live".
+    /// If omitted, inherits from [general].mode.
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default = "default_entry_start")]
+    pub entry_start_s: u64,
+    #[serde(default = "default_min_delta")]
+    pub min_delta_pct: f64,
+    #[serde(default = "default_max_entry_mkt")]
+    pub max_entry_price: f64,
+    pub delta_tiers: Vec<[f64; 2]>,
+}
+
+fn default_true() -> bool { true }
+fn default_entry_start() -> u64 { 20 }
+fn default_min_delta() -> f64 { 0.07 }
+fn default_max_entry_mkt() -> f64 { 0.85 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct TelegramConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub on_trade: bool,
+    #[serde(default)]
+    pub on_error: bool,
+    #[serde(default)]
+    pub daily_summary: bool,
+    #[serde(default)]
+    pub verbose_skips: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct InfraConfig {
-    pub binance_ws_url: String,
+    pub binance_ws_base: String,
     pub polymarket_clob_url: String,
-    pub polymarket_ws_url: String,
+    #[serde(default = "default_rpc")]
     pub polygon_rpc_url: String,
+    #[serde(default = "default_chain_id")]
     pub polygon_chain_id: u64,
+    #[serde(default = "default_sig_type")]
     pub signature_type: String,
+    #[serde(default = "default_db_path")]
     pub db_path: String,
     #[serde(default)]
     pub auto_redeem: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct LoggingConfig {
-    pub level: String,
-    pub telegram_enabled: bool,
-    pub telegram_on_trade: bool,
-    pub telegram_on_error: bool,
-    pub telegram_daily_summary: bool,
-}
+fn default_rpc() -> String { "https://polygon-rpc.com".into() }
+fn default_chain_id() -> u64 { 137 }
+fn default_sig_type() -> String { "GnosisSafe".into() }
+fn default_db_path() -> String { "./trades.db".into() }
+
+// ─── TOML deserialization target ─────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct TomlConfig {
-    trading: TradingConfig,
+    general: GeneralConfig,
+    bankroll: BankrollConfig,
     pricing: PricingConfig,
+    scanner: ScannerConfig,
+    markets: Vec<MarketConfig>,
+    telegram: TelegramConfig,
     infrastructure: InfraConfig,
-    logging: LoggingConfig,
 }
+
+// ─── AppConfig implementation ────────────────────────────────────────────────
 
 impl AppConfig {
     pub fn load(config_path: &str) -> Result<Self> {
@@ -92,11 +197,10 @@ impl AppConfig {
         let toml_cfg: TomlConfig =
             toml::from_str(&toml_str).context("Failed to parse config.toml")?;
 
-        validate_pricing(&toml_cfg.pricing)
-            .context("Invalid [pricing] configuration")?;
+        validate_markets(&toml_cfg.markets)?;
 
         let mode: BotMode = std::env::var("BOT_MODE")
-            .unwrap_or_else(|_| "paper".to_string())
+            .unwrap_or_else(|_| toml_cfg.general.mode.clone())
             .parse()
             .context("Invalid BOT_MODE")?;
 
@@ -112,10 +216,14 @@ impl AppConfig {
             api_passphrase: non_empty_env("POLY_API_PASSPHRASE"),
             telegram_bot_token: non_empty_env("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id: non_empty_env("TELEGRAM_CHAT_ID"),
-            trading: toml_cfg.trading,
+            general: toml_cfg.general,
+            bankroll: toml_cfg.bankroll,
             pricing: toml_cfg.pricing,
+            scanner: toml_cfg.scanner,
+            markets: toml_cfg.markets,
+            telegram: toml_cfg.telegram,
             infra: toml_cfg.infrastructure,
-            logging: toml_cfg.logging,
+            paper_markets: HashSet::new(),
         })
     }
 
@@ -125,31 +233,91 @@ impl AppConfig {
                 self.mode = mode;
             }
         }
-        if let Some(v) = cli.max_entry {
-            self.pricing.max_entry_price = v;
+        if let Some(v) = cli.bet_size {
+            self.bankroll.bet_size_usd = v;
         }
-        if let Some(v) = cli.undercut {
-            self.pricing.undercut_offset = v;
+        if let Some(v) = cli.max_positions {
+            self.bankroll.max_concurrent_positions = v;
         }
-        if let Some(v) = cli.min_delta {
-            self.pricing.min_delta_pct = v;
+
+        // --markets: only enable listed markets
+        if let Some(ref list) = cli.markets {
+            let allowed: HashSet<&str> = list.split(',').map(str::trim).collect();
+            for m in &mut self.markets {
+                m.enabled = allowed.contains(m.name.as_str());
+            }
         }
+
+        // --disable-market: disable specific markets
+        if let Some(ref list) = cli.disable_market {
+            let disabled: HashSet<&str> = list.split(',').map(str::trim).collect();
+            for m in &mut self.markets {
+                if disabled.contains(m.name.as_str()) {
+                    m.enabled = false;
+                }
+            }
+        }
+
+        // --paper-markets: run specific markets in paper mode even in live
+        if let Some(ref list) = cli.paper_markets {
+            self.paper_markets = list.split(',').map(|s| s.trim().to_string()).collect();
+        }
+    }
+
+    pub fn enabled_markets(&self) -> Vec<&MarketConfig> {
+        self.markets.iter().filter(|m| m.enabled).collect()
+    }
+
+    /// Unique Binance symbols across all enabled markets.
+    pub fn binance_symbols(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        self.enabled_markets()
+            .iter()
+            .filter_map(|m| {
+                if seen.insert(m.binance_symbol.clone()) {
+                    Some(m.binance_symbol.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Resolve the effective mode for a market.
+    /// Priority: CLI --paper-markets > per-market mode > global mode.
+    pub fn is_market_paper(&self, market_name: &str) -> bool {
+        // CLI override wins
+        if self.paper_markets.contains(market_name) {
+            return true;
+        }
+        // Per-market config override
+        if let Some(mkt) = self.markets.iter().find(|m| m.name == market_name) {
+            if let Some(ref m) = mkt.mode {
+                return m.eq_ignore_ascii_case("paper");
+            }
+        }
+        // Fall through to global mode
+        self.mode == BotMode::Paper
+    }
+
+    pub fn needs_clob_client(&self) -> bool {
+        self.enabled_markets().iter().any(|m| !self.is_market_paper(&m.name))
     }
 
     pub fn signature_type(&self) -> Result<SignatureType> {
         self.infra.signature_type.parse()
     }
 
-    pub fn max_bet_decimal(&self) -> Decimal {
-        Decimal::try_from(self.trading.max_bet_usd).unwrap_or(Decimal::from(5))
+    pub fn bet_size_decimal(&self) -> Decimal {
+        Decimal::try_from(self.bankroll.bet_size_usd).unwrap_or(Decimal::from(5))
     }
 
-    pub fn starting_bankroll_decimal(&self) -> Decimal {
-        Decimal::try_from(self.trading.starting_bankroll).unwrap_or(Decimal::from(500))
+    pub fn bankroll_decimal(&self) -> Decimal {
+        Decimal::try_from(self.bankroll.total).unwrap_or(Decimal::from(500))
     }
 
     pub fn daily_loss_limit_decimal(&self) -> Decimal {
-        Decimal::try_from(self.trading.daily_loss_limit_usd).unwrap_or(Decimal::from(25))
+        Decimal::try_from(self.bankroll.daily_loss_limit_usd).unwrap_or(Decimal::from(50))
     }
 
     pub fn db_path(&self) -> &Path {
@@ -157,52 +325,53 @@ impl AppConfig {
     }
 
     pub fn telegram_enabled(&self) -> bool {
-        self.logging.telegram_enabled
+        self.telegram.enabled
             && self.telegram_bot_token.is_some()
             && self.telegram_chat_id.is_some()
     }
+}
 
-    pub fn watch_start_s(&self) -> u64 {
-        self.pricing.entry_start_s + 2
-    }
-
-    /// Max entry price for a given delta, using delta_scaling tiers.
+impl MarketConfig {
+    /// Max entry price allowed for a given delta, using per-market delta tiers.
     pub fn max_price_for_delta(&self, delta_pct: f64) -> f64 {
-        let mut ceiling = self.pricing.max_entry_price;
-        for tier in &self.pricing.delta_scaling.tiers {
+        let mut ceiling = self.max_entry_price;
+        for tier in &self.delta_tiers {
             if delta_pct >= tier[0] {
                 ceiling = tier[1];
             }
         }
-        ceiling.min(self.pricing.max_entry_price)
+        ceiling.min(self.max_entry_price)
+    }
+
+    /// Seconds before close at which we start watching (entry_start_s + buffer).
+    pub fn watch_start_s(&self) -> u64 {
+        self.entry_start_s + 2
     }
 }
 
-fn validate_pricing(cfg: &PricingConfig) -> Result<()> {
-    if cfg.entry_start_s < 5 || cfg.entry_start_s > 60 {
-        bail!("entry_start_s must be 5..=60, got {}", cfg.entry_start_s);
+// ─── Validation ──────────────────────────────────────────────────────────────
+
+fn validate_markets(markets: &[MarketConfig]) -> Result<()> {
+    if markets.is_empty() {
+        bail!("At least one [[markets]] entry is required");
     }
-    if cfg.entry_cutoff_s >= cfg.entry_start_s {
-        bail!("entry_cutoff_s ({}) must be < entry_start_s ({})", cfg.entry_cutoff_s, cfg.entry_start_s);
-    }
-    if cfg.min_entry_price >= cfg.max_entry_price {
-        bail!("min_entry_price ({}) must be < max_entry_price ({})", cfg.min_entry_price, cfg.max_entry_price);
-    }
-    if cfg.undercut_offset < 0.0 || cfg.undercut_offset > 0.20 {
-        bail!("undercut_offset must be 0..=0.20, got {}", cfg.undercut_offset);
-    }
-    if cfg.tighten_step < 0.005 || cfg.tighten_step > 0.05 {
-        bail!("tighten_step must be 0.005..=0.05, got {}", cfg.tighten_step);
-    }
-    if cfg.min_delta_pct < 0.01 || cfg.min_delta_pct > 1.0 {
-        bail!("min_delta_pct must be 0.01..=1.0, got {}", cfg.min_delta_pct);
-    }
-    if cfg.delta_scaling.tiers.is_empty() {
-        bail!("delta_scaling.tiers must have at least one entry");
-    }
-    for (i, tier) in cfg.delta_scaling.tiers.iter().enumerate() {
-        if tier[0] < 0.01 || tier[1] < 0.50 || tier[1] > 0.99 {
-            bail!("delta_scaling tier {}: invalid values {:?}", i, tier);
+    for (i, m) in markets.iter().enumerate() {
+        if m.name.is_empty() {
+            bail!("Market {i}: name cannot be empty");
+        }
+        if m.window_seconds != 300 && m.window_seconds != 900 {
+            bail!("Market '{}': window_seconds must be 300 or 900", m.name);
+        }
+        if m.delta_tiers.is_empty() {
+            bail!("Market '{}': delta_tiers must have at least one entry", m.name);
+        }
+        for (j, tier) in m.delta_tiers.iter().enumerate() {
+            if tier[0] < 0.01 || tier[1] < 0.50 || tier[1] > 0.99 {
+                bail!("Market '{}' delta_tier {j}: invalid values {:?}", m.name, tier);
+            }
+        }
+        if m.entry_start_s < 5 {
+            bail!("Market '{}': entry_start_s must be >= 5", m.name);
         }
     }
     Ok(())

@@ -2,7 +2,9 @@ use anyhow::Result;
 use rust_decimal::Decimal;
 use tracing::{debug, error};
 
-use crate::signal::TradeDecision;
+use crate::config::TelegramConfig;
+use crate::db::MarketDayStats;
+use crate::scanner::MarketOpportunity;
 use crate::types::{BotMode, Direction, TradeRecord};
 
 pub struct TelegramNotifier {
@@ -10,6 +12,10 @@ pub struct TelegramNotifier {
     bot_token: String,
     chat_id: String,
     enabled: bool,
+    on_trade: bool,
+    on_error: bool,
+    on_daily_summary: bool,
+    verbose_skips: bool,
     mode: BotMode,
 }
 
@@ -17,26 +23,40 @@ impl TelegramNotifier {
     pub fn new(
         bot_token: Option<String>,
         chat_id: Option<String>,
-        enabled: bool,
+        tg_config: &TelegramConfig,
         mode: BotMode,
     ) -> Self {
-        let is_enabled = enabled && bot_token.as_ref().map_or(false, |t| !t.is_empty());
+        let is_enabled = tg_config.enabled
+            && bot_token.as_ref().map_or(false, |t| !t.is_empty())
+            && chat_id.as_ref().map_or(false, |c| !c.is_empty());
         Self {
             client: reqwest::Client::new(),
             bot_token: bot_token.unwrap_or_default(),
             chat_id: chat_id.unwrap_or_default(),
             enabled: is_enabled,
+            on_trade: tg_config.on_trade,
+            on_error: tg_config.on_error,
+            on_daily_summary: tg_config.daily_summary,
+            verbose_skips: tg_config.verbose_skips,
             mode,
         }
     }
 
-    /// Orderbook-aware fill notification.
-    pub async fn send_fill_ob(&self, trade: &TradeRecord, decision: &TradeDecision) -> Result<()> {
-        if !self.enabled {
+    /// Fill notification — gated by `on_trade`.
+    pub async fn send_fill_multi(
+        &self,
+        trade: &TradeRecord,
+        opp: &MarketOpportunity,
+        rank: usize,
+        total_opps: usize,
+        open_positions: usize,
+        max_positions: usize,
+    ) -> Result<()> {
+        if !self.enabled || !self.on_trade {
             return Ok(());
         }
 
-        let mode_tag = self.mode_tag();
+        let mode_tag = self.mode_tag_for(&trade.mode);
         let tighten_info = if trade.tighten_count > 0 {
             format!(" (tightened {}x)", trade.tighten_count)
         } else {
@@ -45,64 +65,56 @@ impl TelegramNotifier {
 
         let msg = format!(
             "📊 FILL {mode_tag}— {}\n\
+             \u{200b}  Window: {}\n\
              \u{200b}  Direction: {}\n\
-             \u{200b}  Book best ask: ${}\n\
-             \u{200b}  Initial post: ${}\n\
-             \u{200b}  Fill price: ${}{}\n\
+             \u{200b}  Edge score: {:.3} (#{} of {} opportunities)\n\
+             \u{200b}  Book ask: ${} → Filled: ${}{}\n\
              \u{200b}  Delta: {}%\n\
-             \u{200b}  Contracts: {}\n\
-             \u{200b}  Bet: ${}",
-            trade.market_slug,
+             \u{200b}  Contracts: {} | Bet: ${}\n\
+             \u{200b}  Open positions: {}/{}",
+            trade.market_name,
+            trade.slug,
             trade.direction,
-            decision.best_ask_at_entry,
-            decision.initial_price,
-            trade.entry_price,
+            opp.edge_score,
+            rank,
+            total_opps,
+            opp.best_ask,
+            trade.final_price,
             tighten_info,
             trade.delta_pct,
-            trade.size,
-            trade.cost_usd,
+            trade.contracts,
+            trade.bet_size_usd,
+            open_positions,
+            max_positions,
         );
 
         self.send_message(&msg).await
     }
 
-    /// Skip notification (for --verbose mode).
-    pub async fn send_skip(&self, slug: &str, reason: &str) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        let mode_tag = self.mode_tag();
-        let msg = format!(
-            "⏭️ SKIP {mode_tag}— {slug}\n\
-             \u{200b}  Reason: {reason}"
-        );
-
-        self.send_message(&msg).await
-    }
-
-    /// Rich settlement notification with orderbook context.
+    /// Settlement notification — gated by `on_trade`.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_settlement(
         &self,
+        market_name: &str,
         slug: &str,
         direction: Direction,
         fill_price: Decimal,
         fill_size: Decimal,
-        btc_open: Decimal,
-        btc_close: Decimal,
+        open_price: Decimal,
+        close_price: Decimal,
         won: bool,
         pnl: Decimal,
         bankroll: Decimal,
         initial_price: Decimal,
         tighten_count: u32,
         best_ask_at_entry: Decimal,
+        mode_str: &str,
     ) -> Result<()> {
-        if !self.enabled {
+        if !self.enabled || !self.on_trade {
             return Ok(());
         }
 
-        let mode_tag = self.mode_tag();
+        let mode_tag = self.mode_tag_for(mode_str);
         let emoji = if won { "✅" } else { "❌" };
         let outcome = if won { "WIN" } else { "LOSS" };
 
@@ -111,9 +123,7 @@ impl TelegramNotifier {
             Direction::Down => "↓ DOWN",
         };
 
-        let btc_moved = if btc_close >= btc_open { "↑ UP" } else { "↓ DOWN" };
         let correct = if won { "✓" } else { "✗" };
-
         let bet_usd = fill_price * fill_size;
         let pnl_sign = if pnl >= Decimal::ZERO { "+" } else { "" };
         let roi_pct = if bet_usd > Decimal::ZERO {
@@ -131,11 +141,12 @@ impl TelegramNotifier {
         };
 
         let msg = format!(
-            "{emoji} {mode_tag}{outcome} — {slug}\n\
+            "{emoji} {mode_tag}{outcome} — {market_name}\n\
+             \u{200b}  Window: {slug}\n\
              \u{200b}  Direction: {dir_arrow} {correct}\n\
              \u{200b}  Book ask: ${best_ask_at_entry} → Post: ${initial_price}{tighten_info}\n\
              \u{200b}  Fill: ${fill_price} × {fill_size} contracts\n\
-             \u{200b}  BTC: ${btc_open:.0} → ${btc_close:.0} ({btc_moved})\n\
+             \u{200b}  Open: ${open_price:.0} → Close: ${close_price:.0}\n\
              \u{200b}  P&amp;L: {pnl_sign}${pnl:.2} ({pnl_sign}{roi_pct}%)\n\
              \u{200b}  Bankroll: ${bankroll:.2}"
         );
@@ -143,107 +154,124 @@ impl TelegramNotifier {
         self.send_message(&msg).await
     }
 
-    /// Legacy fill notification (backward compat).
-    #[allow(dead_code)]
-    pub async fn send_fill(&self, trade: &TradeRecord) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        let mode_tag = self.mode_tag();
-        let msg = format!(
-            "📊 FILL {mode_tag}— Window {}\n\
-             \u{200b}  Direction: {}\n\
-             \u{200b}  Entry: ${}\n\
-             \u{200b}  Delta: {}%\n\
-             \u{200b}  Contracts: {}\n\
-             \u{200b}  Bet: ${}",
-            trade.window_ts,
-            trade.direction,
-            trade.entry_price,
-            trade.delta_pct,
-            trade.size,
-            trade.cost_usd,
-        );
-
-        self.send_message(&msg).await
-    }
-
-    #[allow(dead_code)]
-    pub async fn send_daily_summary(
+    /// Daily summary — gated by `daily_summary`.
+    pub async fn send_daily_summary_multi(
         &self,
-        total: u32,
-        wins: u32,
-        losses: u32,
-        pnl: Decimal,
+        total_windows: u64,
+        total_opps: u32,
+        total_placed: u32,
+        total_fills: u32,
+        total_wins: u32,
+        total_losses: u32,
+        net_pnl: Decimal,
+        bankroll: Decimal,
+        market_stats: &[MarketDayStats],
     ) -> Result<()> {
-        if !self.enabled {
+        if !self.enabled || !self.on_daily_summary {
             return Ok(());
         }
 
-        let mode_tag = self.mode_tag();
-        let win_rate = if total > 0 {
-            format!("{:.1}%", wins as f64 / total as f64 * 100.0)
+        let fill_rate = if total_placed > 0 {
+            format!("{:.0}%", total_fills as f64 / total_placed as f64 * 100.0)
         } else {
             "N/A".to_string()
         };
 
-        let msg = format!(
-            "📊 {mode_tag}Daily Summary\n\
-             \u{200b}  Trades: {total}\n\
-             \u{200b}  Wins: {wins} | Losses: {losses}\n\
-             \u{200b}  Win Rate: {win_rate}\n\
-             \u{200b}  Net P&L: ${pnl}"
+        let win_rate = if total_fills > 0 {
+            format!(
+                "{:.1}%",
+                total_wins as f64 / total_fills as f64 * 100.0
+            )
+        } else {
+            "N/A".to_string()
+        };
+
+        let pnl_sign = if net_pnl >= Decimal::ZERO { "+" } else { "" };
+        let mode_tag = match self.mode {
+            BotMode::Paper => "[PAPER] ",
+            BotMode::Live => "",
+        };
+
+        let mut msg = format!(
+            "📈 {mode_tag}Daily Summary\n\n\
+             \u{200b}  OVERALL:\n\
+             \u{200b}    Windows scanned: {total_windows}\n\
+             \u{200b}    Opportunities found: {total_opps}\n\
+             \u{200b}    Orders placed: {total_placed}\n\
+             \u{200b}    Filled: {total_fills} ({fill_rate} fill rate)\n\
+             \u{200b}    Won: {total_wins} / Lost: {total_losses} ({win_rate} win rate)\n\
+             \u{200b}    Net P&amp;L: {pnl_sign}${net_pnl:.2}\n\
+             \u{200b}    Bankroll: ${bankroll:.2}"
         );
+
+        if !market_stats.is_empty() {
+            msg.push_str("\n\n\u{200b}  BY MARKET:");
+            for stat in market_stats {
+                let stat_pnl_sign = if stat.pnl >= Decimal::ZERO { "+" } else { "" };
+                msg.push_str(&format!(
+                    "\n\u{200b}    {}: {} fills — {}W/{}L — {}${}",
+                    stat.market_name, stat.fills, stat.wins, stat.losses,
+                    stat_pnl_sign, stat.pnl.round_dp(2)
+                ));
+            }
+        }
 
         self.send_message(&msg).await
     }
 
-    pub async fn send_error(&self, error_msg: &str) -> Result<()> {
-        if !self.enabled {
+    /// Skip notification — gated by `verbose_skips`.
+    pub async fn send_skip(&self, market_name: &str, slug: &str, reason: &str) -> Result<()> {
+        if !self.enabled || !self.verbose_skips {
             return Ok(());
         }
+        let mode_tag = self.mode_tag();
+        let msg = format!(
+            "⏭️ SKIP {mode_tag}— {market_name}\n\
+             \u{200b}  Window: {slug}\n\
+             \u{200b}  Reason: {reason}"
+        );
+        self.send_message(&msg).await
+    }
 
+    /// Error notification — gated by `on_error`.
+    pub async fn send_error(&self, error_msg: &str) -> Result<()> {
+        if !self.enabled || !self.on_error {
+            return Ok(());
+        }
         let msg = format!("🚨 {}Error\n{error_msg}", self.mode_tag());
         self.send_message(&msg).await
     }
 
-    pub async fn send_startup(&self, bankroll: Decimal) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        let mode_tag = self.mode_tag();
-        let msg =
-            format!("🚀 {mode_tag}Bot Started (orderbook-aware)\nBankroll: ${bankroll}\nMode: {}", self.mode);
-        self.send_message(&msg).await
-    }
-
-    #[allow(dead_code)]
-    pub async fn send_outcome(
+    /// Startup notification — always sent when telegram is enabled.
+    pub async fn send_startup(
         &self,
-        order_id: &str,
-        outcome: &str,
-        pnl: Decimal,
+        bankroll: Decimal,
+        enabled_markets: &[String],
     ) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
-
         let mode_tag = self.mode_tag();
-        let emoji = match outcome {
-            "WIN" => "✅",
-            "LOSS" => "❌",
-            _ => "⏳",
-        };
-
+        let markets_list = enabled_markets.join(", ");
         let msg = format!(
-            "{emoji} {mode_tag}Trade Result\n\
-             \u{200b}  Order: {order_id}\n\
-             \u{200b}  Outcome: {outcome}\n\
-             \u{200b}  P&L: ${pnl}"
+            "🚀 {mode_tag}Multi-Market Bot Started\n\
+             Bankroll: ${bankroll}\n\
+             Markets: {markets_list}\n\
+             Mode: {}",
+            self.mode
         );
+        self.send_message(&msg).await
+    }
 
+    /// Redemption success notification — gated by `on_trade` (not `on_error`).
+    pub async fn send_redeem_success(&self, market_name: &str, tx_hash: &str) -> Result<()> {
+        if !self.enabled || !self.on_trade {
+            return Ok(());
+        }
+        let msg = format!(
+            "💰 Auto-redeemed — {market_name}\n\
+             \u{200b}  tx: {tx_hash}"
+        );
         self.send_message(&msg).await
     }
 
@@ -251,6 +279,14 @@ impl TelegramNotifier {
         match self.mode {
             BotMode::Paper => "[PAPER] ",
             BotMode::Live => "",
+        }
+    }
+
+    fn mode_tag_for(&self, mode_str: &str) -> &'static str {
+        if mode_str.eq_ignore_ascii_case("paper") {
+            "[PAPER] "
+        } else {
+            ""
         }
     }
 

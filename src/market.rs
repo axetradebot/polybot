@@ -3,9 +3,7 @@ use rust_decimal::Decimal;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-use crate::types::{MarketInfo, WindowInfo};
-
-const WINDOW_SECONDS: u64 = 300;
+use crate::types::MarketInfo;
 
 pub fn epoch_secs() -> u64 {
     SystemTime::now()
@@ -14,41 +12,24 @@ pub fn epoch_secs() -> u64 {
         .as_secs()
 }
 
-pub fn current_window_ts() -> u64 {
+/// Generic window computation for any window size.
+/// Returns (window_ts, seconds_remaining).
+pub fn current_window(window_seconds: u64) -> (u64, u64) {
     let now = epoch_secs();
-    now - (now % WINDOW_SECONDS)
+    let window_ts = now - (now % window_seconds);
+    let seconds_remaining = (window_ts + window_seconds).saturating_sub(now);
+    (window_ts, seconds_remaining)
 }
 
-pub fn seconds_until_close() -> u64 {
-    let now = epoch_secs();
-    let window_ts = now - (now % WINDOW_SECONDS);
-    let close_time = window_ts + WINDOW_SECONDS;
-    close_time.saturating_sub(now)
-}
-
-pub fn seconds_until_next_window() -> u64 {
-    seconds_until_close()
-}
-
-pub fn market_slug(window_ts: u64) -> String {
-    format!("btc-updown-5m-{window_ts}")
-}
-
-pub fn current_window_info() -> WindowInfo {
-    let window_ts = current_window_ts();
-    WindowInfo {
-        window_ts,
-        slug: market_slug(window_ts),
-        seconds_remaining: seconds_until_close(),
-    }
+/// Build a market slug from prefix and window timestamp.
+pub fn build_slug(prefix: &str, window_ts: u64) -> String {
+    format!("{}-{}", prefix, window_ts)
 }
 
 /// Resolve market metadata from Gamma API using the market slug.
-///
-/// Returns token IDs and condition ID needed for order placement.
 pub async fn resolve_market(slug: &str) -> Result<MarketInfo> {
-    use polymarket_client_sdk::gamma::Client as GammaClient;
     use polymarket_client_sdk::gamma::types::request::MarketBySlugRequest;
+    use polymarket_client_sdk::gamma::Client as GammaClient;
 
     let gamma = GammaClient::default();
     let request = MarketBySlugRequest::builder().slug(slug).build();
@@ -75,7 +56,7 @@ pub async fn resolve_market(slug: &str) -> Result<MarketInfo> {
     let neg_risk = market.neg_risk.unwrap_or(false);
     let tick_size = market
         .order_price_min_tick_size
-        .unwrap_or_else(|| Decimal::new(1, 2)); // default 0.01
+        .unwrap_or_else(|| Decimal::new(1, 2));
 
     let info = MarketInfo {
         condition_id,
@@ -109,6 +90,7 @@ pub async fn resolve_market_with_retry(slug: &str, max_retries: u32) -> Result<M
                         attempt = attempt + 1,
                         max_retries,
                         error = %e,
+                        slug = %slug,
                         "Market not yet available, retrying..."
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

@@ -3,7 +3,7 @@ name = "polymarket-btc-bot"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Polymarket 5-minute BTC Up/Down maker bot"
+description = "Multi-market Polymarket Up/Down maker bot with edge-ranked order routing"
 
 [[bin]]
 name = "polymarket-btc-bot"

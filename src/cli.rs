@@ -1,7 +1,10 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "polymarket-btc-bot", about = "Polymarket 5-minute BTC maker bot")]
+#[command(
+    name = "polymarket-btc-bot",
+    about = "Multi-market Polymarket Up/Down maker bot with edge-ranked order routing"
+)]
 pub struct Cli {
     /// Trading mode: paper | live (overrides BOT_MODE env var)
     #[arg(long)]
@@ -11,19 +14,27 @@ pub struct Cli {
     #[arg(long, default_value = "config.toml")]
     pub config: String,
 
-    /// Override max entry price
+    /// Only run specific markets (comma-separated names, e.g. "BTC 5-min,ETH 5-min")
     #[arg(long)]
-    pub max_entry: Option<f64>,
+    pub markets: Option<String>,
 
-    /// Override undercut offset
+    /// Disable specific markets at runtime (comma-separated)
     #[arg(long)]
-    pub undercut: Option<f64>,
+    pub disable_market: Option<String>,
 
-    /// Override minimum delta percentage
+    /// Override max concurrent positions
     #[arg(long)]
-    pub min_delta: Option<f64>,
+    pub max_positions: Option<usize>,
 
-    /// Send skip notifications to Telegram
+    /// Override bet size in USD
+    #[arg(long)]
+    pub bet_size: Option<f64>,
+
+    /// Run specific markets in paper mode while others run live (comma-separated)
+    #[arg(long)]
+    pub paper_markets: Option<String>,
+
+    /// Send skip/verbose notifications to Telegram
     #[arg(long)]
     pub verbose: bool,
 }

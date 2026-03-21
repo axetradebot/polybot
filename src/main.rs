@@ -4,9 +4,10 @@ mod db;
 mod feeds;
 mod market;
 mod orderbook;
-mod orders;
+mod positions;
 mod redeem;
 mod risk;
+mod scanner;
 mod signal;
 mod state;
 mod telegram;
@@ -17,6 +18,7 @@ use chrono::Utc;
 use clap::Parser;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,25 +27,13 @@ use tracing::{error, info, warn};
 use crate::cli::Cli;
 use crate::config::AppConfig;
 use crate::db::TradeDb;
+use crate::feeds::PriceFeeds;
+use crate::positions::{Position, PositionTracker};
 use crate::risk::RiskManager;
-use crate::signal::{SignalEngine, TradeDecision};
+use crate::scanner::MarketOpportunity;
 use crate::state::{new_shared_state, SharedState};
 use crate::telegram::TelegramNotifier;
-use crate::types::{BotMode, Direction, MarketInfo, TradeOutcome, TradeRecord};
-
-struct PendingSettle {
-    slug: String,
-    order_id: String,
-    direction: Direction,
-    fill_price: Decimal,
-    fill_size: Decimal,
-    btc_open_price: Decimal,
-    condition_id: String,
-    neg_risk: bool,
-    initial_price: Decimal,
-    tighten_count: u32,
-    best_ask_at_entry: Decimal,
-}
+use crate::types::{BotMode, Direction, MarketInfo, PositionStatus, TradeOutcome, TradeRecord};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -63,10 +53,13 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| {
-                    format!("{},polymarket_client_sdk=error", config.logging.level).into()
-                }),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                format!(
+                    "{},polymarket_client_sdk=error",
+                    config.general.log_level
+                )
+                .into()
+            }),
         )
         .with_target(false)
         .with_thread_ids(true)
@@ -74,16 +67,24 @@ async fn main() -> Result<()> {
         .with_writer(std::sync::Mutex::new(log_file))
         .init();
 
-    info!(
-        mode = %config.mode,
-        bankroll = %config.trading.starting_bankroll,
-        max_bet = %config.trading.max_bet_usd,
-        min_delta = %config.pricing.min_delta_pct,
-        max_entry = %config.pricing.max_entry_price,
-        "Polymarket BTC Maker Bot starting (orderbook-aware)"
-    );
+    let enabled = config.enabled_markets();
+    let market_names: Vec<String> = enabled.iter().map(|m| m.name.clone()).collect();
+    let symbols = config.binance_symbols();
 
-    let state = new_shared_state(config.starting_bankroll_decimal());
+    info!(
+        global_mode = %config.mode,
+        bankroll = %config.bankroll.total,
+        symbols = ?symbols,
+        "Multi-market scanner bot starting"
+    );
+    for mkt in &enabled {
+        let effective = if config.is_market_paper(&mkt.name) { "paper" } else { "live" };
+        info!(market = %mkt.name, mode = effective, "Market enabled");
+    }
+
+    let state = new_shared_state(config.bankroll_decimal());
+    let price_feeds = PriceFeeds::new();
+    let positions = PositionTracker::new();
 
     let db = Arc::new(
         TradeDb::open(config.db_path()).context("Failed to open trade database")?,
@@ -92,243 +93,74 @@ async fn main() -> Result<()> {
     let telegram = Arc::new(TelegramNotifier::new(
         config.telegram_bot_token.clone(),
         config.telegram_chat_id.clone(),
-        config.telegram_enabled(),
+        &config.telegram,
         config.mode,
     ));
 
-    telegram
-        .send_startup(config.starting_bankroll_decimal())
-        .await
-        .ok();
+    telegram.send_startup(config.bankroll_decimal(), &market_names).await.ok();
 
-    let signal_engine = SignalEngine::new(&config);
     let risk_manager = RiskManager::new(&config);
-    let verbose = cli.verbose;
+    let verbose = cli.verbose || config.telegram.verbose_skips;
 
-    // Spawn Binance price feed
-    let binance_state = state.clone();
-    let binance_url = config.infra.binance_ws_url.clone();
-    tokio::spawn(async move {
-        if let Err(e) = feeds::binance::run_binance_feed(binance_state, &binance_url).await {
-            error!(error = %e, "Binance feed fatal error");
-        }
-    });
+    // Spawn Binance combined price feed
+    price_feeds.spawn_binance_feed(symbols.clone(), &config.infra.binance_ws_base);
 
-    // Wait for initial BTC price
-    info!("Waiting for initial BTC price from Binance...");
+    // Wait for at least one price to arrive
+    info!("Waiting for initial price data from Binance...");
     loop {
-        if state.read().await.has_fresh_price() {
-            let price = state.read().await.btc_price;
-            info!(price = %price, "Initial BTC price received");
+        let mut any_fresh = false;
+        for sym in &symbols {
+            if price_feeds.has_fresh_price(sym).await {
+                any_fresh = true;
+                break;
+            }
+        }
+        if any_fresh {
+            for sym in &symbols {
+                if let Some(p) = price_feeds.get_price(sym).await {
+                    info!(symbol = %sym, price = %p, "Initial price received");
+                }
+            }
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    match config.mode {
-        BotMode::Paper => {
-            info!("[PAPER] Running in paper trading mode");
-            run_paper_loop(state, &config, &signal_engine, &risk_manager, &db, &telegram, verbose).await
-        }
-        BotMode::Live => {
-            info!("Initializing live CLOB connection...");
-            let result =
-                run_live_mode(state, &config, &signal_engine, &risk_manager, &db, &telegram, verbose)
-                    .await;
-            if let Err(ref e) = result {
-                let msg = format!("LIVE MODE CRASHED: {e}");
-                error!("{}", msg);
-                telegram.send_error(&msg).await.ok();
-            }
-            result
-        }
+    // Run the main scanner loop
+    let result = run_scanner_loop(
+        &config,
+        &price_feeds,
+        &positions,
+        state.clone(),
+        &db,
+        &telegram,
+        &risk_manager,
+        verbose,
+    )
+    .await;
+
+    if let Err(ref e) = result {
+        let msg = format!("Scanner loop crashed: {e}");
+        error!("{}", msg);
+        telegram.send_error(&msg).await.ok();
     }
+
+    result
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Paper trading loop
+// Main scanner loop
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn run_paper_loop(
-    state: SharedState,
+async fn run_scanner_loop(
     config: &AppConfig,
-    signal_engine: &SignalEngine,
-    risk_manager: &RiskManager,
+    price_feeds: &PriceFeeds,
+    positions: &PositionTracker,
+    state: SharedState,
     db: &Arc<TradeDb>,
     telegram: &Arc<TelegramNotifier>,
-    verbose: bool,
-) -> Result<()> {
-    let watch_start = config.watch_start_s();
-    let mode = config.mode;
-    let mut last_window_ts: u64 = 0;
-    let mut last_pending_settle: Option<PendingSettle> = None;
-
-    loop {
-        state.write().await.reset_daily_if_needed();
-
-        let window = market::current_window_info();
-        let secs_left = window.seconds_remaining;
-
-        if window.window_ts != last_window_ts {
-            let btc_now = state.read().await.btc_price;
-            {
-                let mut st = state.write().await;
-                st.current_window_ts = window.window_ts;
-                st.window_open_price = btc_now;
-                st.window_open_captured = true;
-                st.current_market = None;
-            }
-
-            info!(
-                window_ts = window.window_ts,
-                slug = %window.slug,
-                open_price = %btc_now,
-                "[PAPER] New window started"
-            );
-
-            if let Some(ps) = last_pending_settle.take() {
-                let db2 = db.clone();
-                let tg2 = telegram.clone();
-                let st2 = state.clone();
-                let rpc = config.infra.polygon_rpc_url.clone();
-                let pk = config.private_key.clone();
-                let do_redeem = config.infra.auto_redeem;
-                tokio::spawn(async move {
-                    settle_trade(ps, mode, db2, tg2, st2, &rpc, &pk, do_redeem).await.ok();
-                });
-            }
-
-            last_window_ts = window.window_ts;
-        }
-
-        if secs_left > watch_start + 1 {
-            let sleep_secs = secs_left - watch_start - 1;
-            info!(sleep_secs, "[PAPER] Waiting for entry window");
-            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
-            continue;
-        }
-
-        if secs_left < 2 {
-            tokio::time::sleep(Duration::from_secs(secs_left + 1)).await;
-            continue;
-        }
-
-        let market_info = match resolve_market_for_window(&state, &window.slug, secs_left).await {
-            Some(m) => m,
-            None => {
-                tokio::time::sleep(Duration::from_secs(secs_left + 1)).await;
-                continue;
-            }
-        };
-
-        {
-            let st = state.read().await;
-            if let Err(veto) = risk_manager.check(&st) {
-                warn!(reason = %veto, "[PAPER] Risk vetoed");
-                tokio::time::sleep(Duration::from_secs(secs_left + 1)).await;
-                continue;
-            }
-        }
-
-        let btc_open_price = state.read().await.window_open_price;
-        let max_bet = risk_manager.position_size(&*state.read().await);
-
-        // Fetch orderbook (paper mode uses real orderbook for realistic pricing)
-        let token_id = {
-            let st = state.read().await;
-            let (dir, _) = signal::compute_delta(st.btc_price, st.window_open_price);
-            match dir {
-                Direction::Up => market_info.up_token_id.clone(),
-                Direction::Down => market_info.down_token_id.clone(),
-            }
-        };
-
-        let ob = match orderbook::fetch_orderbook(&config.infra.polymarket_clob_url, &token_id).await {
-            Ok(ob) => ob,
-            Err(e) => {
-                warn!(error = %e, "[PAPER] Orderbook fetch failed, skipping window");
-                let remaining = market::seconds_until_close();
-                tokio::time::sleep(Duration::from_secs(remaining + 2)).await;
-                continue;
-            }
-        };
-
-        let decision = {
-            let st = state.read().await;
-            signal_engine.evaluate_trade(&st, &market_info, &ob, config, max_bet)
-        };
-
-        let decision = match decision {
-            Some(d) => d,
-            None => {
-                let st = state.read().await;
-                let (_, delta) = signal::compute_delta(st.btc_price, st.window_open_price);
-                let msg = format!(
-                    "[PAPER] Skip — delta {}%, best_ask ${}, min_delta {}%",
-                    delta, ob.best_ask, config.pricing.min_delta_pct
-                );
-                info!("{}", msg);
-                if verbose { telegram.send_error(&msg).await.ok(); }
-                let remaining = market::seconds_until_close();
-                tokio::time::sleep(Duration::from_secs(remaining + 2)).await;
-                continue;
-            }
-        };
-
-        // Paper: simulate fill at initial price (optimistic)
-        let order_id = format!(
-            "paper-ob-{}-{}",
-            decision.direction,
-            chrono::Utc::now().timestamp_millis()
-        );
-
-        let secs = market::seconds_until_close();
-        let trade = build_trade_record_from_decision(
-            &order_id, &decision, secs, config, true, 0,
-        );
-        if let Err(e) = db.insert_trade(&trade) {
-            error!(error = %e, "Failed to log paper fill");
-        }
-        telegram.send_fill_ob(&trade, &decision).await.ok();
-
-        info!(
-            direction = %decision.direction,
-            price = %decision.initial_price,
-            best_ask = %ob.best_ask,
-            "[PAPER] FILLED (simulated)"
-        );
-
-        last_pending_settle = Some(PendingSettle {
-            slug: window.slug.clone(),
-            order_id,
-            direction: decision.direction,
-            fill_price: decision.initial_price,
-            fill_size: decision.contracts,
-            btc_open_price,
-            condition_id: market_info.condition_id.clone(),
-            neg_risk: market_info.neg_risk,
-            initial_price: decision.initial_price,
-            tighten_count: 0,
-            best_ask_at_entry: decision.best_ask_at_entry,
-        });
-
-        let remaining = market::seconds_until_close();
-        tokio::time::sleep(Duration::from_secs(remaining + 2)).await;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Live trading loop
-// ─────────────────────────────────────────────────────────────────────────────
-
-async fn run_live_mode(
-    state: SharedState,
-    config: &AppConfig,
-    signal_engine: &SignalEngine,
     risk_manager: &RiskManager,
-    db: &Arc<TradeDb>,
-    telegram: &Arc<TelegramNotifier>,
-    verbose: bool,
+    _verbose: bool,
 ) -> Result<()> {
     use polymarket_client_sdk::auth::{LocalSigner, Signer as _};
     use polymarket_client_sdk::clob::types::SignatureType;
@@ -336,578 +168,548 @@ async fn run_live_mode(
     use polymarket_client_sdk::types::U256;
     use polymarket_client_sdk::POLYGON;
 
-    let signer = match LocalSigner::from_str(&config.private_key) {
-        Ok(s) => s.with_chain_id(Some(POLYGON)),
-        Err(e) => {
-            let msg = format!("Invalid private key: {e}");
-            error!("{}", msg);
-            telegram.send_error(&msg).await.ok();
-            anyhow::bail!(msg);
+    // ── CLOB client setup (only if any market is live) ──
+
+    let (client, signer) = if config.needs_clob_client() {
+        let s = match LocalSigner::from_str(&config.private_key) {
+            Ok(s) => s.with_chain_id(Some(POLYGON)),
+            Err(e) => {
+                let msg = format!("Invalid private key: {e}");
+                error!("{}", msg);
+                telegram.send_error(&msg).await.ok();
+                anyhow::bail!(msg);
+            }
+        };
+
+        info!("Authenticating with CLOB...");
+        let mut builder = Client::new(&config.infra.polymarket_clob_url, Config::default())?
+            .authentication_builder(&s);
+
+        match config.signature_type()? {
+            crate::types::SignatureType::GnosisSafe => {
+                builder = builder.signature_type(SignatureType::GnosisSafe);
+            }
+            crate::types::SignatureType::Proxy => {
+                builder = builder.signature_type(SignatureType::Proxy);
+            }
+            crate::types::SignatureType::Eoa => {}
         }
+
+        let c = match builder.authenticate().await {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("CLOB authentication FAILED: {e}");
+                error!("{}", msg);
+                telegram.send_error(&msg).await.ok();
+                anyhow::bail!(msg);
+            }
+        };
+
+        info!("CLOB client authenticated");
+        (Some(c), Some(s))
+    } else {
+        info!("Pure paper mode — no CLOB client needed");
+        (None, None)
     };
 
-    info!("Signer created, authenticating with CLOB...");
+    // ── Macros for CLOB operations ──
 
-    let mut builder = Client::new(&config.infra.polymarket_clob_url, Config::default())?
-        .authentication_builder(&signer);
-
-    match config.signature_type()? {
-        crate::types::SignatureType::GnosisSafe => {
-            builder = builder.signature_type(SignatureType::GnosisSafe);
-        }
-        crate::types::SignatureType::Proxy => {
-            builder = builder.signature_type(SignatureType::Proxy);
-        }
-        crate::types::SignatureType::Eoa => {}
+    macro_rules! post_order {
+        ($price:expr, $size:expr, $token_id_u256:expr) => {{
+            use polymarket_client_sdk::clob::types::Side;
+            let client = client.as_ref().unwrap();
+            let signer = signer.as_ref().unwrap();
+            let order = client
+                .limit_order()
+                .token_id($token_id_u256)
+                .size($size)
+                .price($price)
+                .side(Side::Buy)
+                .build()
+                .await;
+            match order {
+                Ok(o) => match client.sign(signer, o).await {
+                    Ok(s) => match client.post_order(s).await {
+                        Ok(r) => Ok(r.order_id.clone()),
+                        Err(e) => Err(anyhow::anyhow!("post: {e}")),
+                    },
+                    Err(e) => Err(anyhow::anyhow!("sign: {e}")),
+                },
+                Err(e) => Err(anyhow::anyhow!("build: {e}")),
+            }
+        }};
     }
 
-    let client = match builder.authenticate().await {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!("CLOB authentication FAILED: {e}");
-            error!("{}", msg);
-            telegram.send_error(&msg).await.ok();
-            anyhow::bail!(msg);
-        }
-    };
+    macro_rules! poll_fills {
+        () => {{
+            let client = client.as_ref().unwrap();
+            let mut fills: Vec<(String, Decimal, Decimal)> = Vec::new();
+            if let Ok(Ok(page)) = tokio::time::timeout(
+                Duration::from_secs(3),
+                client.orders(&Default::default(), None),
+            )
+            .await
+            {
+                for o in &page.data {
+                    if o.size_matched > Decimal::ZERO {
+                        fills.push((o.id.clone(), o.price, o.size_matched));
+                    }
+                }
+            }
+            fills
+        }};
+    }
 
-    info!("CLOB client authenticated, entering live trading loop (orderbook-aware)");
+    // ── State tracking ──
 
-    let watch_start = config.watch_start_s();
-    let mode = config.mode;
+    let mut last_window_ts: HashMap<String, u64> = HashMap::new();
+    let mut token_cache: HashMap<String, MarketInfo> = HashMap::new();
+    let scan_interval = Duration::from_millis(config.scanner.scan_interval_ms);
     let adjust_ms = config.pricing.adjust_interval_ms;
     let tighten_step = Decimal::try_from(config.pricing.tighten_step).unwrap_or(dec!(0.01));
     let entry_cutoff_s = config.pricing.entry_cutoff_s;
     let clob_url = config.infra.polymarket_clob_url.clone();
 
-    let mut last_window_ts: u64 = 0;
-    let mut last_pending_settle: Option<PendingSettle> = None;
+    info!(
+        scan_interval_ms = config.scanner.scan_interval_ms,
+        max_concurrent = config.bankroll.max_concurrent_positions,
+        max_per_market = config.bankroll.max_per_market,
+        "Entering scanner loop"
+    );
 
     loop {
+        let cycle_start = tokio::time::Instant::now();
+
+        // ── Daily reset ──
         state.write().await.reset_daily_if_needed();
 
-        let window = market::current_window_info();
-        let secs_left = window.seconds_remaining;
+        // ── Phase 1: Window management ──
+        for mkt in config.enabled_markets() {
+            let (window_ts, secs_rem) = market::current_window(mkt.window_seconds);
+            let prev_ts = last_window_ts.get(&mkt.name).copied();
 
-        if window.window_ts != last_window_ts {
-            let btc_now = state.read().await.btc_price;
-            {
-                let mut st = state.write().await;
-                st.current_window_ts = window.window_ts;
-                st.window_open_price = btc_now;
-                st.window_open_captured = true;
-                st.current_market = None;
-            }
-
-            info!(
-                window_ts = window.window_ts,
-                slug = %window.slug,
-                open_price = %btc_now,
-                "New window started"
-            );
-
-            if let Some(ps) = last_pending_settle.take() {
-                let db2 = db.clone();
-                let tg2 = telegram.clone();
-                let st2 = state.clone();
-                let rpc = config.infra.polygon_rpc_url.clone();
-                let pk = config.private_key.clone();
-                let do_redeem = config.infra.auto_redeem;
-                tokio::spawn(async move {
-                    settle_trade(ps, mode, db2, tg2, st2, &rpc, &pk, do_redeem).await.ok();
-                });
-            }
-
-            last_window_ts = window.window_ts;
-        }
-
-        if secs_left > watch_start + 1 {
-            let sleep_secs = secs_left - watch_start - 1;
-            info!(sleep_secs, window = %window.slug, "Waiting for entry window");
-            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
-            continue;
-        }
-
-        if secs_left < 2 {
-            tokio::time::sleep(Duration::from_secs(secs_left + 1)).await;
-            continue;
-        }
-
-        let market_info = match resolve_market_for_window(&state, &window.slug, secs_left).await {
-            Some(m) => m,
-            None => {
-                tokio::time::sleep(Duration::from_secs(secs_left + 1)).await;
-                continue;
-            }
-        };
-
-        {
-            let st = state.read().await;
-            if let Err(veto) = risk_manager.check(&st) {
-                warn!(reason = %veto, "Risk vetoed");
-                tokio::time::sleep(Duration::from_secs(secs_left + 1)).await;
-                continue;
-            }
-        }
-
-        let max_bet = risk_manager.position_size(&*state.read().await);
-
-        // Determine which token to check orderbook for
-        let token_id_str = {
-            let st = state.read().await;
-            let (dir, _) = signal::compute_delta(st.btc_price, st.window_open_price);
-            match dir {
-                Direction::Up => market_info.up_token_id.clone(),
-                Direction::Down => market_info.down_token_id.clone(),
-            }
-        };
-
-        // Fetch orderbook
-        let ob = match orderbook::fetch_orderbook(&clob_url, &token_id_str).await {
-            Ok(ob) => ob,
-            Err(e) => {
-                let msg = format!("Orderbook fetch failed: {e}");
-                warn!("{}", msg);
-                telegram.send_error(&msg).await.ok();
-                let remaining = market::seconds_until_close();
-                tokio::time::sleep(Duration::from_secs(remaining + 2)).await;
-                continue;
-            }
-        };
-
-        // Evaluate trade decision
-        let decision = {
-            let st = state.read().await;
-            signal_engine.evaluate_trade(&st, &market_info, &ob, config, max_bet)
-        };
-
-        let decision = match decision {
-            Some(d) => {
-                let msg = format!(
-                    "Trade starting: {} delta={}% best_ask=${} initial=${} ceiling=${}",
-                    d.direction, d.delta_pct, d.best_ask_at_entry, d.initial_price, d.max_price
-                );
-                info!("{}", msg);
-                telegram.send_error(&msg).await.ok();
-                d
-            }
-            None => {
-                let st = state.read().await;
-                let (_, delta) = signal::compute_delta(st.btc_price, st.window_open_price);
-                let delta_f64: f64 = delta.try_into().unwrap_or(0.0);
-                let ceiling = config.max_price_for_delta(delta_f64);
-                let reason = if delta < Decimal::try_from(config.pricing.min_delta_pct).unwrap_or_default() {
-                    format!("Low delta: {}% (need {}%)", delta, config.pricing.min_delta_pct)
-                } else {
-                    format!(
-                        "Book too expensive (best ask ${}, ceiling ${:.2} for {:.2}% delta)",
-                        ob.best_ask, ceiling, delta
-                    )
-                };
-                info!("Skip — {}", reason);
-                if verbose {
-                    telegram.send_skip(&window.slug, &reason).await.ok();
+            if prev_ts != Some(window_ts) {
+                // New window detected
+                if let Some(price) = price_feeds.get_price(&mkt.binance_symbol).await {
+                    price_feeds
+                        .set_window_open(&mkt.slug_prefix, window_ts, price)
+                        .await;
+                    info!(
+                        market = %mkt.name,
+                        window_ts,
+                        open_price = %price,
+                        secs_remaining = secs_rem,
+                        "New window started"
+                    );
                 }
 
-                // Log skip to DB
-                let skip_trade = TradeRecord {
-                    id: None,
-                    timestamp: Utc::now(),
-                    window_ts: window.window_ts,
-                    market_slug: window.slug.clone(),
-                    direction: "NONE".to_string(),
-                    token_id: token_id_str.clone(),
-                    order_id: format!("skip-{}", window.window_ts),
-                    tier_name: "ob_aware".to_string(),
-                    entry_price: Decimal::ZERO,
-                    size: Decimal::ZERO,
-                    cost_usd: Decimal::ZERO,
-                    outcome: "SKIPPED".to_string(),
-                    pnl: Decimal::ZERO,
-                    btc_open_price: st.window_open_price,
-                    btc_close_price: Decimal::ZERO,
-                    delta_pct: delta,
-                    seconds_at_entry: Decimal::from(secs_left),
-                    mode: config.mode.to_string(),
-                    filled: false,
-                    initial_price: Decimal::ZERO,
-                    tighten_count: 0,
-                    best_ask_at_entry: ob.best_ask,
-                    skip_reason: Some(reason),
-                };
-                let _ = db.insert_trade(&skip_trade);
-
-                let remaining = market::seconds_until_close();
-                tokio::time::sleep(Duration::from_secs(remaining + 2)).await;
-                continue;
-            }
-        };
-
-        // ── Orderbook-aware tighten loop ──
-
-        let token_id_u256 = match U256::from_str(&decision.token_id) {
-            Ok(id) => id,
-            Err(e) => {
-                let msg = format!("Invalid token ID: {e}");
-                error!("{}", msg);
-                telegram.send_error(&msg).await.ok();
-                let remaining = market::seconds_until_close();
-                tokio::time::sleep(Duration::from_secs(remaining + 2)).await;
-                continue;
-            }
-        };
-
-        let btc_open_price = state.read().await.window_open_price;
-        let mut current_price = decision.initial_price;
-        let max_price = decision.max_price;
-        let mut active_order_id: Option<String> = None;
-        let mut tighten_count: u32 = 0;
-        let mut filled = false;
-
-        // ── Inline order helpers (avoids SDK generic type issues) ──
-
-        macro_rules! post_order {
-            ($price:expr, $size:expr) => {{
-                use polymarket_client_sdk::clob::types::Side;
-                let order = client
-                    .limit_order()
-                    .token_id(token_id_u256)
-                    .size($size)
-                    .price($price)
-                    .side(Side::Buy)
-                    .build()
-                    .await;
-                match order {
-                    Ok(o) => match client.sign(&signer, o).await {
-                        Ok(s) => match client.post_order(s).await {
-                            Ok(r) => Ok(r.order_id.clone()),
-                            Err(e) => Err(anyhow::anyhow!("post: {e}")),
-                        },
-                        Err(e) => Err(anyhow::anyhow!("sign: {e}")),
-                    },
-                    Err(e) => Err(anyhow::anyhow!("build: {e}")),
-                }
-            }};
-        }
-
-        macro_rules! poll_fill {
-            ($oid:expr) => {{
-                let mut result: Option<(Decimal, Decimal)> = None;
-                let oid_str: &str = $oid;
-                if let Ok(Ok(page)) = tokio::time::timeout(
-                    Duration::from_secs(3),
-                    client.orders(&Default::default(), None),
-                ).await {
-                    for o in &page.data {
-                        if o.id == oid_str && o.size_matched > Decimal::ZERO {
-                            result = Some((o.size_matched, o.price));
-                            break;
-                        }
+                // Resolve tokens for this window (best-effort)
+                let slug = market::build_slug(&mkt.slug_prefix, window_ts);
+                let slug_clone = slug.clone();
+                // We do a quick single attempt; scanner will skip if not yet resolved
+                match market::resolve_market(&slug_clone).await {
+                    Ok(info) => {
+                        token_cache.insert(slug, info);
+                    }
+                    Err(e) => {
+                        warn!(market = %mkt.name, slug = %slug_clone, error = %e, "Token resolve failed (will retry)");
                     }
                 }
-                result
-            }};
-        }
 
-        // Place initial order
-        let contracts = (max_bet / current_price)
-            .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::ToZero);
-
-        match post_order!(current_price, contracts) {
-            Ok(oid) => {
-                info!(order_id = %oid, price = %current_price, "Initial order posted");
-                active_order_id = Some(oid);
-            }
-            Err(e) => {
-                warn!(error = ?e, price = %current_price, "Failed to place initial order");
-            }
-        }
-
-        // Adjustment loop
-        loop {
-            let secs = market::seconds_until_close();
-            if secs < entry_cutoff_s {
-                info!(secs_left = secs, "Hit entry cutoff, stopping");
-                break;
-            }
-
-            let poll_deadline = tokio::time::Instant::now() + Duration::from_millis(adjust_ms);
-            while tokio::time::Instant::now() < poll_deadline {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-
-                if let Some(ref oid) = active_order_id {
-                    if let Some((matched, price)) = poll_fill!(oid) {
-                        info!(order_id = %oid, matched = %matched, price = %price, "FILLED!");
-                        telegram.send_error(&format!(
-                            "FILLED! price=${} contracts={} tightens={}",
-                            price, matched, tighten_count
-                        )).await.ok();
-
-                        let mut trade = build_trade_record_from_decision(
-                            oid, &decision, secs, config, true, tighten_count,
-                        );
-                        trade.entry_price = price;
-                        trade.size = matched;
-                        trade.cost_usd = matched * price;
-                        telegram.send_fill_ob(&trade, &decision).await.ok();
-                        if let Err(e) = db.insert_trade(&trade) {
-                            error!(error = %e, "Failed to log live fill");
+                last_window_ts.insert(mkt.name.clone(), window_ts);
+            } else {
+                // Retry token resolution if missing
+                let slug = market::build_slug(&mkt.slug_prefix, window_ts);
+                if !token_cache.contains_key(&slug) && secs_rem > entry_cutoff_s {
+                    match market::resolve_market(&slug).await {
+                        Ok(info) => {
+                            info!(market = %mkt.name, slug = %slug, "Token resolved on retry");
+                            token_cache.insert(slug, info);
                         }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
 
-                        last_pending_settle = Some(PendingSettle {
-                            slug: window.slug.clone(),
-                            order_id: oid.clone(),
-                            direction: decision.direction,
-                            fill_price: price,
-                            fill_size: matched,
-                            btc_open_price,
-                            condition_id: market_info.condition_id.clone(),
-                            neg_risk: market_info.neg_risk,
-                            initial_price: decision.initial_price,
-                            tighten_count,
-                            best_ask_at_entry: decision.best_ask_at_entry,
-                        });
-                        filled = true;
+        // Prune old window data periodically
+        let now_ts = market::epoch_secs();
+        price_feeds.prune_old_window_opens(now_ts, 3600).await;
+        positions.prune_old(7200).await;
+
+        // Clean expired token cache entries
+        token_cache.retain(|slug, _| {
+            slug.rsplit_once('-')
+                .and_then(|(_, ts)| ts.parse::<u64>().ok())
+                .map(|ts| now_ts.saturating_sub(ts) < 3600)
+                .unwrap_or(false)
+        });
+
+        // ── Phase 2: Run edge scanner ──
+        let opportunities =
+            scanner::scan_all_markets(config, price_feeds, &token_cache, positions).await;
+
+        // ── Phase 3: Fire orders at best opportunities ──
+        let mut orders_fired = 0;
+
+        // Check global risk once
+        let global_ok = {
+            let st = state.read().await;
+            risk_manager.check_global(&st).is_ok()
+        };
+
+        if global_ok {
+            for (rank, opp) in opportunities.iter().enumerate() {
+                if orders_fired >= config.scanner.max_orders_per_cycle {
+                    break;
+                }
+
+                // Per-market position limit
+                if let Err(veto) = risk_manager
+                    .check_position_limits(positions, &opp.market_name)
+                    .await
+                {
+                    if matches!(veto, risk::RiskVeto::MaxConcurrentReached) {
                         break;
                     }
+                    continue;
                 }
-            }
 
-            if filled {
-                break;
-            }
+                let is_paper = config.is_market_paper(&opp.market_name);
+                let mode = if is_paper { BotMode::Paper } else { config.mode };
+                let now_inst = tokio::time::Instant::now();
 
-            // Tighten: re-read orderbook, compute new price
-            let fresh_ask = orderbook::refresh_best_ask(&clob_url, &decision.token_id).await;
-            let new_price = {
-                let stepped = current_price + tighten_step;
-                let ask_bound = fresh_ask
-                    .map(|a| a - dec!(0.01))
-                    .unwrap_or(stepped);
-                stepped.min(ask_bound).round_dp(2)
-            };
+                if is_paper {
+                    // Paper: immediate simulated fill at suggested_entry
+                    let order_id = format!(
+                        "paper-{}-{}-{}",
+                        opp.market_name.replace(' ', ""),
+                        opp.direction,
+                        Utc::now().timestamp_millis()
+                    );
 
-            if new_price > max_price {
-                info!(
-                    new_price = %new_price,
-                    ceiling = %max_price,
-                    "Hit price ceiling, stopping"
-                );
-                telegram.send_error(&format!(
-                    "Hit ceiling ${} (ask ${}, delta {}%)",
-                    max_price,
-                    fresh_ask.unwrap_or(Decimal::ZERO),
-                    decision.delta_pct
-                )).await.ok();
-                break;
-            }
+                    let pos = Position {
+                        id: 0,
+                        market_name: opp.market_name.clone(),
+                        asset: opp.asset.clone(),
+                        window_seconds: opp.window_seconds,
+                        window_ts: opp.window_ts,
+                        slug: opp.slug.clone(),
+                        direction: opp.direction,
+                        token_id: opp.token_id.clone(),
+                        condition_id: opp.condition_id.clone(),
+                        neg_risk: opp.neg_risk,
+                        edge_score: opp.edge_score,
+                        delta_pct: Decimal::try_from(opp.delta_pct).unwrap_or_default(),
+                        initial_price: opp.suggested_entry,
+                        current_price: opp.suggested_entry,
+                        max_price: opp.max_entry,
+                        best_ask_at_entry: opp.best_ask,
+                        contracts: opp.contracts,
+                        bet_size_usd: opp.bet_size_usd,
+                        order_id: Some(order_id.clone()),
+                        tighten_count: 0,
+                        last_adjust_at: now_inst,
+                        placed_at: now_inst,
+                        open_price: opp.open_price,
+                        status: PositionStatus::Filled,
+                        fill_price: Some(opp.suggested_entry),
+                        fill_size: Some(opp.contracts),
+                        outcome: None,
+                        pnl: None,
+                        mode,
+                        settlement_started: false,
+                    };
 
-            if new_price <= current_price {
-                continue;
-            }
+                    let pos_id = positions.add(pos).await;
 
-            // Cancel old, place new
-            if active_order_id.is_some() {
-                if let Err(e) = client.cancel_all_orders().await {
-                    warn!(error = %e, "Cancel failed during tighten");
-                }
-                active_order_id = None;
-            }
+                    let trade = build_trade_record(opp, &order_id, mode, true, 0);
+                    if let Err(e) = db.insert_trade(&trade) {
+                        error!(error = %e, "Failed to log paper fill");
+                    }
 
-            let new_contracts = (max_bet / new_price)
-                .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::ToZero);
+                    let open_count = positions.open_count().await;
+                    telegram
+                        .send_fill_multi(
+                            &trade,
+                            opp,
+                            rank + 1,
+                            opportunities.len(),
+                            open_count,
+                            config.bankroll.max_concurrent_positions,
+                        )
+                        .await
+                        .ok();
 
-            match post_order!(new_price, new_contracts) {
-                Ok(oid) => {
-                    tighten_count += 1;
                     info!(
-                        order_id = %oid,
-                        price = %new_price,
-                        tighten = tighten_count,
-                        best_ask = ?fresh_ask,
-                        ceiling = %max_price,
-                        "Tightened order"
+                        market = %opp.market_name,
+                        direction = %opp.direction,
+                        price = %opp.suggested_entry,
+                        edge = opp.edge_score,
+                        pos_id,
+                        "[PAPER] Filled (simulated)"
                     );
-                    active_order_id = Some(oid);
-                    current_price = new_price;
+                } else if client.is_some() {
+                    // Live: place CLOB order
+                    let token_id_u256 = match U256::from_str(&opp.token_id) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            warn!(error = %e, market = %opp.market_name, "Invalid token ID");
+                            continue;
+                        }
+                    };
+
+                    match post_order!(opp.suggested_entry, opp.contracts, token_id_u256) {
+                        Ok(oid) => {
+                            let pos = Position {
+                                id: 0,
+                                market_name: opp.market_name.clone(),
+                                asset: opp.asset.clone(),
+                                window_seconds: opp.window_seconds,
+                                window_ts: opp.window_ts,
+                                slug: opp.slug.clone(),
+                                direction: opp.direction,
+                                token_id: opp.token_id.clone(),
+                                condition_id: opp.condition_id.clone(),
+                                neg_risk: opp.neg_risk,
+                                edge_score: opp.edge_score,
+                                delta_pct: Decimal::try_from(opp.delta_pct).unwrap_or_default(),
+                                initial_price: opp.suggested_entry,
+                                current_price: opp.suggested_entry,
+                                max_price: opp.max_entry,
+                                best_ask_at_entry: opp.best_ask,
+                                contracts: opp.contracts,
+                                bet_size_usd: opp.bet_size_usd,
+                                order_id: Some(oid.clone()),
+                                tighten_count: 0,
+                                last_adjust_at: now_inst,
+                                placed_at: now_inst,
+                                open_price: opp.open_price,
+                                status: PositionStatus::Pending,
+                                fill_price: None,
+                                fill_size: None,
+                                outcome: None,
+                                pnl: None,
+                                mode,
+                                settlement_started: false,
+                            };
+
+                            let pos_id = positions.add(pos).await;
+
+                            info!(
+                                market = %opp.market_name,
+                                order_id = %oid,
+                                price = %opp.suggested_entry,
+                                edge = opp.edge_score,
+                                pos_id,
+                                "Live order posted"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = ?e,
+                                market = %opp.market_name,
+                                price = %opp.suggested_entry,
+                                "Failed to post order"
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!(error = ?e, price = %new_price, "Tighten order failed");
+
+                orders_fired += 1;
+            }
+        }
+
+        // ── Phase 4: Manage pending live positions ──
+        if client.is_some() {
+            let pending = positions.pending_positions().await;
+
+            if !pending.is_empty() {
+                // Batch check all orders for fills
+                let fills = poll_fills!();
+
+                for pos in &pending {
+                    if let Some(ref oid) = pos.order_id {
+                        // Check for fill
+                        if let Some((_, fill_price, fill_size)) =
+                            fills.iter().find(|(id, _, _)| id == oid)
+                        {
+                            positions
+                                .mark_filled(pos.id, *fill_price, *fill_size)
+                                .await;
+
+                            let mut trade = build_trade_record_from_position(pos);
+                            trade.filled = true;
+                            trade.fill_price = Some(*fill_price);
+                            trade.final_price = *fill_price;
+                            trade.contracts = *fill_size;
+                            trade.bet_size_usd = *fill_size * *fill_price;
+                            if let Err(e) = db.insert_trade(&trade) {
+                                error!(error = %e, "Failed to log live fill");
+                            }
+
+                            info!(
+                                market = %pos.market_name,
+                                order_id = %oid,
+                                fill_price = %fill_price,
+                                fill_size = %fill_size,
+                                tightens = pos.tighten_count,
+                                "FILLED!"
+                            );
+                            continue;
+                        }
+
+                        // Check for expiry (past window close)
+                        let now = market::epoch_secs();
+                        if now >= pos.window_ts + pos.window_seconds {
+                            // Cancel the order
+                    if let Some(ref c) = client {
+                        let _ = c.cancel_all_orders().await;
+                    }
+                            positions.mark_expired(pos.id).await;
+
+                            let mut trade = build_trade_record_from_position(pos);
+                            trade.skip_reason = Some("expired".into());
+                            let _ = db.insert_trade(&trade);
+
+                            info!(
+                                market = %pos.market_name,
+                                order_id = %oid,
+                                last_price = %pos.current_price,
+                                tightens = pos.tighten_count,
+                                "Order expired unfilled"
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                // Tighten eligible positions
+                let to_tighten = positions.needs_tighten(adjust_ms).await;
+                for pos in &to_tighten {
+                    let (_, secs_rem) = market::current_window(pos.window_seconds);
+                    if secs_rem < entry_cutoff_s {
+                        continue;
+                    }
+
+                    let fresh_ask =
+                        orderbook::refresh_best_ask(&clob_url, &pos.token_id).await;
+                    let new_price = {
+                        let stepped = pos.current_price + tighten_step;
+                        let ask_bound = fresh_ask
+                            .map(|a| a - dec!(0.01))
+                            .unwrap_or(stepped);
+                        stepped.min(ask_bound).round_dp(2)
+                    };
+
+                    if new_price > pos.max_price || new_price <= pos.current_price {
+                        continue;
+                    }
+
+                    // Cancel old order, place new
+                    if let Some(ref c) = client {
+                        let _ = c.cancel_all_orders().await;
+                    }
+
+                    let token_id_u256 = match U256::from_str(&pos.token_id) {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    };
+
+                    let new_contracts = (risk_manager.bet_size() / new_price)
+                        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::ToZero);
+
+                    match post_order!(new_price, new_contracts, token_id_u256) {
+                        Ok(oid) => {
+                            positions
+                                .update_tighten(pos.id, oid.clone(), new_price)
+                                .await;
+                            info!(
+                                market = %pos.market_name,
+                                order_id = %oid,
+                                price = %new_price,
+                                tighten = pos.tighten_count + 1,
+                                "Tightened order"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = ?e, market = %pos.market_name, "Tighten order failed");
+                        }
+                    }
                 }
             }
         }
 
-        // Post-loop: if not filled, wait for window close and do final check
-        if !filled {
-            if let Some(ref oid) = active_order_id {
-                let close_ts = window.close_ts();
-                let now = chrono::Utc::now().timestamp() as u64;
-                if now < close_ts {
-                    let wait = close_ts.saturating_sub(now) + 1;
-                    info!(wait_secs = wait, "Waiting for window close with last order");
-                    tokio::time::sleep(Duration::from_secs(wait)).await;
-                }
+        // ── Phase 5: Settlement ──
+        let to_settle = positions.filled_past_close().await;
+        for pos in &to_settle {
+            positions.mark_settlement_started(pos.id).await;
 
-                if let Some((matched, price)) = poll_fill!(oid) {
-                    info!(order_id = %oid, matched = %matched, "Filled at window close!");
-                    telegram.send_error(&format!(
-                        "FILLED at close! price=${} contracts={}", price, matched
-                    )).await.ok();
+            let pos_clone = pos.clone();
+            let db2 = db.clone();
+            let tg2 = telegram.clone();
+            let st2 = state.clone();
+            let pt2 = positions.clone();
+            let rpc = config.infra.polygon_rpc_url.clone();
+            let pk = config.private_key.clone();
+            let do_redeem = config.infra.auto_redeem;
 
-                    let mut trade = build_trade_record_from_decision(
-                        oid, &decision, 0, config, true, tighten_count,
-                    );
-                    trade.entry_price = price;
-                    trade.size = matched;
-                    trade.cost_usd = matched * price;
-                    telegram.send_fill_ob(&trade, &decision).await.ok();
-                    if let Err(e) = db.insert_trade(&trade) {
-                        error!(error = %e, "Failed to log close fill");
-                    }
-
-                    last_pending_settle = Some(PendingSettle {
-                        slug: window.slug.clone(),
-                        order_id: oid.clone(),
-                        direction: decision.direction,
-                        fill_price: price,
-                        fill_size: matched,
-                        btc_open_price,
-                        condition_id: market_info.condition_id.clone(),
-                        neg_risk: market_info.neg_risk,
-                        initial_price: decision.initial_price,
-                        tighten_count,
-                        best_ask_at_entry: decision.best_ask_at_entry,
-                    });
-                    filled = true;
-                }
-
-                if !filled {
-                    info!(order_id = %oid, last_price = %current_price, "Order expired unfilled");
-                    telegram.send_error(&format!(
-                        "Expired unfilled (last ${}, {} tightens, best_ask ${})",
-                        current_price, tighten_count, decision.best_ask_at_entry
-                    )).await.ok();
-
-                    if let Err(e) = client.cancel_all_orders().await {
-                        warn!(error = %e, "Cancel failed at window close");
-                    }
-
-                    let mut trade = build_trade_record_from_decision(
-                        oid, &decision, 0, config, false, tighten_count,
-                    );
-                    trade.entry_price = current_price;
-                    trade.skip_reason = Some("expired".to_string());
-                    if let Err(e) = db.insert_trade(&trade) {
-                        error!(error = %e, "Failed to log expired order");
-                    }
-                }
-            } else {
-                info!("No orders placed this window");
-            }
+            tokio::spawn(async move {
+                settle_position(pos_clone, db2, tg2, st2, pt2, &rpc, &pk, do_redeem)
+                    .await
+                    .ok();
+            });
         }
 
-        let remaining = market::seconds_until_close();
-        tokio::time::sleep(Duration::from_secs(remaining + 2)).await;
+        // ── Sleep until next scan ──
+        let elapsed = cycle_start.elapsed();
+        if elapsed < scan_interval {
+            tokio::time::sleep(scan_interval - elapsed).await;
+        }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helpers
+// Settlement
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn resolve_market_for_window(
-    state: &SharedState,
-    slug: &str,
-    secs_left: u64,
-) -> Option<MarketInfo> {
-    if let Some(m) = state.read().await.current_market.clone() {
-        return Some(m);
-    }
-
-    match market::resolve_market_with_retry(slug, 3).await {
-        Ok(m) if m.accepting_orders => {
-            state.write().await.current_market = Some(m.clone());
-            Some(m)
-        }
-        Ok(_) => {
-            warn!("Market not accepting orders");
-            None
-        }
-        Err(e) => {
-            warn!(error = %e, secs_left, "Failed to resolve market");
-            None
-        }
-    }
-}
-
-fn build_trade_record_from_decision(
-    order_id: &str,
-    decision: &TradeDecision,
-    secs_at_entry: u64,
-    config: &AppConfig,
-    filled: bool,
-    tighten_count: u32,
-) -> TradeRecord {
-    let price = decision.initial_price;
-    let size = decision.contracts;
-    TradeRecord {
-        id: None,
-        timestamp: Utc::now(),
-        window_ts: 0,
-        market_slug: String::new(),
-        direction: decision.direction.to_string(),
-        token_id: decision.token_id.clone(),
-        order_id: order_id.to_string(),
-        tier_name: "ob_aware".to_string(),
-        entry_price: price,
-        size,
-        cost_usd: size * price,
-        outcome: TradeOutcome::Pending.to_string(),
-        pnl: Decimal::ZERO,
-        btc_open_price: Decimal::ZERO,
-        btc_close_price: Decimal::ZERO,
-        delta_pct: decision.delta_pct,
-        seconds_at_entry: Decimal::from(secs_at_entry),
-        mode: config.mode.to_string(),
-        filled,
-        initial_price: decision.initial_price,
-        tighten_count,
-        best_ask_at_entry: decision.best_ask_at_entry,
-        skip_reason: None,
-    }
-}
-
-async fn settle_trade(
-    ps: PendingSettle,
-    mode: BotMode,
+async fn settle_position(
+    pos: Position,
     db: Arc<TradeDb>,
     telegram: Arc<TelegramNotifier>,
     state: SharedState,
+    positions: PositionTracker,
     polygon_rpc_url: &str,
     private_key: &str,
     auto_redeem: bool,
 ) -> Result<()> {
     tokio::time::sleep(Duration::from_secs(25)).await;
 
-    let btc_close = state.read().await.btc_price;
-    let our_bet_is_up = ps.direction == Direction::Up;
+    let fill_price = pos.fill_price.unwrap_or(pos.current_price);
+    let fill_size = pos.fill_size.unwrap_or(pos.contracts);
+    let our_bet_is_up = pos.direction == Direction::Up;
 
-    let (won, outcome_source) = match mode {
+    let (won, _outcome_source) = match pos.mode {
         BotMode::Paper => {
-            let up_won = btc_close > ps.btc_open_price;
-            let won = redeem::did_we_win(our_bet_is_up, up_won);
-            (won, "btc-price")
-        }
-        BotMode::Live => {
+            // Use asset price movement for settlement
+            let close_price = {
+                // For paper, we use a short delay then consider
+                // direction based on position data.
+                // In practice, the actual close price would be fetched from feeds.
+                // For simplicity, use BTC-equivalent logic.
+                fill_price // Placeholder: actual settlement uses Gamma API
+            };
+            let _ = close_price;
+            // Use Gamma API settlement for paper mode too
             let mut resolved: Option<bool> = None;
-            for attempt in 0..20 {
-                match redeem::check_settlement(&ps.slug).await {
+            for attempt in 0..10 {
+                match redeem::check_settlement(&pos.slug).await {
                     Ok(Some(up_won)) => {
                         resolved = Some(redeem::did_we_win(our_bet_is_up, up_won));
                         break;
                     }
                     Ok(None) => {
-                        info!(attempt, slug = %ps.slug, "Settlement pending, retrying...");
+                        info!(attempt, slug = %pos.slug, market = %pos.market_name, "Settlement pending...");
                         tokio::time::sleep(Duration::from_secs(30)).await;
                     }
                     Err(e) => {
@@ -917,23 +719,66 @@ async fn settle_trade(
                 }
             }
             let won = resolved.unwrap_or_else(|| {
-                warn!(slug = %ps.slug, "Using BTC price fallback for settlement");
-                redeem::did_we_win(our_bet_is_up, btc_close > ps.btc_open_price)
+                warn!(slug = %pos.slug, "Settlement unresolved, defaulting to loss");
+                false
             });
-            (won, if resolved.is_some() { "gamma-api" } else { "btc-fallback" })
+            (won, "gamma-api")
+        }
+        BotMode::Live => {
+            let mut resolved: Option<bool> = None;
+            for attempt in 0..20 {
+                match redeem::check_settlement(&pos.slug).await {
+                    Ok(Some(up_won)) => {
+                        resolved = Some(redeem::did_we_win(our_bet_is_up, up_won));
+                        break;
+                    }
+                    Ok(None) => {
+                        info!(attempt, slug = %pos.slug, market = %pos.market_name, "Settlement pending...");
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, attempt, "Settlement check error");
+                        tokio::time::sleep(Duration::from_secs(15)).await;
+                    }
+                }
+            }
+            let won = resolved.unwrap_or_else(|| {
+                warn!(slug = %pos.slug, "Using fallback for settlement");
+                false
+            });
+            (
+                won,
+                if resolved.is_some() {
+                    "gamma-api"
+                } else {
+                    "fallback"
+                },
+            )
         }
     };
 
     let pnl = if won {
-        ps.fill_size * (Decimal::ONE - ps.fill_price)
+        fill_size * (Decimal::ONE - fill_price)
     } else {
-        -(ps.fill_size * ps.fill_price)
+        -(fill_size * fill_price)
     };
 
-    let outcome = if won { TradeOutcome::Win } else { TradeOutcome::Loss };
+    let outcome = if won {
+        TradeOutcome::Win
+    } else {
+        TradeOutcome::Loss
+    };
 
-    db.update_outcome(&ps.order_id, &outcome.to_string(), pnl, btc_close)?;
+    // Update position tracker
+    positions.mark_settled(pos.id, outcome, pnl).await;
 
+    // Update DB
+    if let Some(ref oid) = pos.order_id {
+        let close_price = Decimal::ZERO; // Could fetch actual close if needed
+        db.update_outcome(oid, &outcome.to_string(), pnl, close_price)?;
+    }
+
+    // Update global state
     let bankroll = {
         let mut st = state.write().await;
         if won {
@@ -945,53 +790,144 @@ async fn settle_trade(
     };
 
     info!(
-        slug = %ps.slug,
-        direction = %ps.direction,
-        btc_open = %ps.btc_open_price,
-        btc_close = %btc_close,
+        market = %pos.market_name,
+        slug = %pos.slug,
+        direction = %pos.direction,
         outcome = %outcome,
         pnl = %pnl,
         bankroll = %bankroll,
-        tightens = ps.tighten_count,
-        source = outcome_source,
+        tightens = pos.tighten_count,
+        edge = pos.edge_score,
         "Trade settled"
     );
 
-    telegram.send_settlement(
-        &ps.slug,
-        ps.direction,
-        ps.fill_price,
-        ps.fill_size,
-        ps.btc_open_price,
-        btc_close,
-        won,
-        pnl,
-        bankroll,
-        ps.initial_price,
-        ps.tighten_count,
-        ps.best_ask_at_entry,
-    ).await.ok();
+    telegram
+        .send_settlement(
+            &pos.market_name,
+            &pos.slug,
+            pos.direction,
+            fill_price,
+            fill_size,
+            pos.open_price,
+            Decimal::ZERO,
+            won,
+            pnl,
+            bankroll,
+            pos.initial_price,
+            pos.tighten_count,
+            pos.best_ask_at_entry,
+            &pos.mode.to_string(),
+        )
+        .await
+        .ok();
 
-    if won && auto_redeem && mode == BotMode::Live && !ps.condition_id.is_empty() {
-        info!(slug = %ps.slug, "Attempting auto-redeem of winning position...");
-        match redeem::auto_redeem(
-            polygon_rpc_url,
-            private_key,
-            &ps.condition_id,
-            ps.neg_risk,
-        ).await {
+    // Auto-redeem winning live positions
+    if won
+        && auto_redeem
+        && pos.mode == BotMode::Live
+        && !pos.condition_id.is_empty()
+    {
+        info!(
+            market = %pos.market_name,
+            slug = %pos.slug,
+            "Attempting auto-redeem..."
+        );
+        match redeem::auto_redeem(polygon_rpc_url, private_key, &pos.condition_id, pos.neg_risk)
+            .await
+        {
             Ok(tx_hash) => {
-                let msg = format!("Auto-redeemed! tx: {}", tx_hash);
-                info!("{}", msg);
-                telegram.send_error(&msg).await.ok();
+                info!(tx = %tx_hash, "Auto-redeemed successfully");
+                telegram
+                    .send_redeem_success(&pos.market_name, &tx_hash)
+                    .await
+                    .ok();
             }
             Err(e) => {
-                let msg = format!("Auto-redeem failed: {e:#}");
-                warn!("{}", msg);
-                telegram.send_error(&msg).await.ok();
+                warn!(error = %e, "Auto-redeem failed");
+                telegram
+                    .send_error(&format!(
+                        "Auto-redeem failed for {}: {e:#}",
+                        pos.market_name
+                    ))
+                    .await
+                    .ok();
             }
         }
     }
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn build_trade_record(
+    opp: &MarketOpportunity,
+    order_id: &str,
+    mode: BotMode,
+    filled: bool,
+    tighten_count: u32,
+) -> TradeRecord {
+    TradeRecord {
+        id: None,
+        timestamp: Utc::now(),
+        market_name: opp.market_name.clone(),
+        asset: opp.asset.clone(),
+        window_seconds: opp.window_seconds,
+        window_ts: opp.window_ts,
+        slug: opp.slug.clone(),
+        mode: mode.to_string(),
+        direction: opp.direction.to_string(),
+        token_id: opp.token_id.clone(),
+        order_id: order_id.to_string(),
+        initial_price: opp.suggested_entry,
+        final_price: opp.suggested_entry,
+        tighten_count,
+        best_ask_at_entry: opp.best_ask,
+        filled,
+        fill_price: if filled { Some(opp.suggested_entry) } else { None },
+        outcome: TradeOutcome::Pending.to_string(),
+        pnl: Decimal::ZERO,
+        delta_pct: Decimal::try_from(opp.delta_pct).unwrap_or_default(),
+        edge_score: opp.edge_score,
+        seconds_remaining: opp.seconds_remaining as f64,
+        contracts: opp.contracts,
+        bet_size_usd: opp.bet_size_usd,
+        open_price: opp.open_price,
+        close_price: Decimal::ZERO,
+        skip_reason: None,
+    }
+}
+
+fn build_trade_record_from_position(pos: &Position) -> TradeRecord {
+    TradeRecord {
+        id: None,
+        timestamp: Utc::now(),
+        market_name: pos.market_name.clone(),
+        asset: pos.asset.clone(),
+        window_seconds: pos.window_seconds,
+        window_ts: pos.window_ts,
+        slug: pos.slug.clone(),
+        mode: pos.mode.to_string(),
+        direction: pos.direction.to_string(),
+        token_id: pos.token_id.clone(),
+        order_id: pos.order_id.clone().unwrap_or_default(),
+        initial_price: pos.initial_price,
+        final_price: pos.current_price,
+        tighten_count: pos.tighten_count,
+        best_ask_at_entry: pos.best_ask_at_entry,
+        filled: false,
+        fill_price: None,
+        outcome: TradeOutcome::Pending.to_string(),
+        pnl: Decimal::ZERO,
+        delta_pct: pos.delta_pct,
+        edge_score: pos.edge_score,
+        seconds_remaining: 0.0,
+        contracts: pos.contracts,
+        bet_size_usd: pos.bet_size_usd,
+        open_price: pos.open_price,
+        close_price: Decimal::ZERO,
+        skip_reason: None,
+    }
 }
