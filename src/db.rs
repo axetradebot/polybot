@@ -124,6 +124,25 @@ impl TradeDb {
                 UNIQUE(market_name, window_ts)
             );
 
+            CREATE TABLE IF NOT EXISTS shadow_trades (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp           TEXT NOT NULL DEFAULT (datetime('now')),
+                market_name         TEXT NOT NULL,
+                window_ts           INTEGER NOT NULL,
+                window_seconds      INTEGER NOT NULL,
+                open_price          TEXT NOT NULL,
+                close_price         TEXT,
+                delta_at_entry      REAL NOT NULL,
+                direction_at_entry  TEXT NOT NULL,
+                actual_outcome      TEXT,
+                would_have_won      INTEGER,
+                best_ask_at_entry   TEXT,
+                seconds_before_close INTEGER NOT NULL,
+                was_traded          INTEGER NOT NULL DEFAULT 0,
+                skip_reason         TEXT,
+                UNIQUE(market_name, window_ts)
+            );
+
             CREATE TABLE IF NOT EXISTS active_positions (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 market_name      TEXT NOT NULL,
@@ -202,7 +221,9 @@ impl TradeDb {
              CREATE INDEX IF NOT EXISTS idx_scanlog_window ON scanner_log(window_ts);
              CREATE INDEX IF NOT EXISTS idx_scanlog_market ON scanner_log(market_name);
              CREATE INDEX IF NOT EXISTS idx_scanlog_ts ON scanner_log(timestamp);
-             CREATE INDEX IF NOT EXISTS idx_winsummary_mkt ON window_summary(market_name, window_ts);",
+             CREATE INDEX IF NOT EXISTS idx_winsummary_mkt ON window_summary(market_name, window_ts);
+             CREATE INDEX IF NOT EXISTS idx_shadow_mkt ON shadow_trades(market_name, window_ts);
+             CREATE INDEX IF NOT EXISTS idx_shadow_ts ON shadow_trades(window_ts);",
         )
         .context("Failed to create indexes")?;
 
@@ -551,6 +572,78 @@ impl TradeDb {
                 pnl,
                 skip_reason,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Record a shadow trade for a window (first write wins via INSERT OR IGNORE).
+    pub fn insert_shadow_trade(
+        &self,
+        market_name: &str,
+        window_ts: u64,
+        window_seconds: u64,
+        open_price: &str,
+        delta_at_entry: f64,
+        direction_at_entry: &str,
+        best_ask_at_entry: Option<&str>,
+        seconds_before_close: u64,
+        was_traded: bool,
+        skip_reason: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO shadow_trades (
+                market_name, window_ts, window_seconds, open_price,
+                delta_at_entry, direction_at_entry, best_ask_at_entry,
+                seconds_before_close, was_traded, skip_reason
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                market_name,
+                window_ts as i64,
+                window_seconds as i64,
+                open_price,
+                delta_at_entry,
+                direction_at_entry,
+                best_ask_at_entry,
+                seconds_before_close as i64,
+                was_traded as i32,
+                skip_reason,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Settle a shadow trade with the actual close price and outcome.
+    pub fn settle_shadow_trade(
+        &self,
+        market_name: &str,
+        window_ts: u64,
+        close_price: &str,
+        actual_direction: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE shadow_trades SET
+                close_price = ?1,
+                actual_outcome = ?2,
+                would_have_won = CASE
+                    WHEN ?2 = 'FLAT' THEN 0
+                    WHEN direction_at_entry = ?2 THEN 1
+                    ELSE 0
+                END
+             WHERE market_name = ?3 AND window_ts = ?4 AND close_price IS NULL",
+            params![close_price, actual_direction, market_name, window_ts as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an existing shadow trade as actually traded.
+    pub fn mark_shadow_traded(&self, market_name: &str, window_ts: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE shadow_trades SET was_traded = 1
+             WHERE market_name = ?1 AND window_ts = ?2",
+            params![market_name, window_ts as i64],
         )?;
         Ok(())
     }

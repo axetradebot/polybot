@@ -558,6 +558,7 @@ async fn run_scanner_loop(
     let mut window_traded: HashMap<String, bool> = HashMap::new();
     let mut last_skip_reasons: HashMap<String, String> = HashMap::new();
     let mut skip_notified: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut shadow_recorded: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut window_max_delta: HashMap<String, (f64, String)> = HashMap::new(); // key -> (max_delta, direction)
     let mut last_analytics_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let scan_interval = Duration::from_millis(config.scanner.scan_interval_ms);
@@ -872,6 +873,9 @@ async fn run_scanner_loop(
                 if let Some(old_ts) = prev_ts {
                     let key = format!("{}-{}", mkt.name, old_ts);
                     let traded = window_traded.get(&key).copied().unwrap_or(false);
+                    let old_open = price_feeds.get_window_open(&mkt.slug_prefix, old_ts).await.unwrap_or_default();
+                    let current = price_feeds.get_price(&mkt.binance_symbol).await.unwrap_or(old_open);
+
                     if !traded {
                         let reason = last_skip_reasons
                             .get(&mkt.name)
@@ -879,15 +883,28 @@ async fn run_scanner_loop(
                             .unwrap_or_else(|| "No opportunity found".into());
                         missed_windows.push((mkt.name.clone(), reason.clone()));
 
-                        // Write window_summary for the missed window
-                        let old_open = price_feeds.get_window_open(&mkt.slug_prefix, old_ts).await.unwrap_or_default();
-                        let current = price_feeds.get_price(&mkt.binance_symbol).await.unwrap_or(old_open);
                         let (md, md_dir) = window_max_delta.remove(&key).unwrap_or((0.0, String::new()));
                         let _ = db.upsert_window_summary(
                             &mkt.name, old_ts, &old_open.to_string(), &current.to_string(),
                             md, Some(&md_dir), false, None, None, None, Some(&reason),
                         );
                     }
+
+                    // Settle shadow trade: determine actual BTC direction from open→close
+                    let actual_dir = if current > old_open {
+                        "UP"
+                    } else if current < old_open {
+                        "DOWN"
+                    } else {
+                        "FLAT"
+                    };
+                    if let Err(e) = db.settle_shadow_trade(
+                        &mkt.name, old_ts, &current.to_string(), actual_dir,
+                    ) {
+                        warn!(error = %e, market = %mkt.name, "Failed to settle shadow trade");
+                    }
+                    shadow_recorded.remove(&format!("{}-{}", mkt.name, old_ts));
+
                     window_traded.remove(&key);
                 }
                 // Clear skip reason and skip notifications for fresh window
@@ -1136,6 +1153,35 @@ async fn run_scanner_loop(
             }
         }
 
+        // ── Record shadow trades for every evaluated window ──
+        for eval in &scan_result.evaluations {
+            if let (Some(ref dir), Some(delta)) = (&eval.direction, eval.delta_pct) {
+                let shadow_key = format!("{}-{}", eval.market_name, eval.window_ts);
+                if !shadow_recorded.contains(&shadow_key) {
+                    let mkt_cfg = config.markets.iter().find(|m| m.name == eval.market_name);
+                    let ws = mkt_cfg.map(|m| m.window_seconds).unwrap_or(300);
+                    let open_str = eval.open_price.map(|d| d.to_string()).unwrap_or_default();
+                    let best_ask_str = eval.best_ask.map(|d| d.to_string());
+                    let skip = if eval.result != "OPPORTUNITY" {
+                        eval.detail.as_deref().or(Some(eval.result.as_str()))
+                    } else {
+                        None
+                    };
+                    if let Err(e) = db.insert_shadow_trade(
+                        &eval.market_name, eval.window_ts, ws,
+                        &open_str, delta, dir,
+                        best_ask_str.as_deref(),
+                        eval.secs_remaining,
+                        false,
+                        skip,
+                    ) {
+                        warn!(error = %e, market = %eval.market_name, "Failed to record shadow trade");
+                    }
+                    shadow_recorded.insert(shadow_key);
+                }
+            }
+        }
+
         // ── Phase 3: Fire orders at best opportunities ──
         let mut orders_fired = 0;
 
@@ -1377,6 +1423,7 @@ async fn run_scanner_loop(
                 orders_fired += 1;
                 let traded_key = format!("{}-{}", opp.market_name, opp.window_ts);
                 window_traded.insert(traded_key.clone(), true);
+                let _ = db.mark_shadow_traded(&opp.market_name, opp.window_ts);
 
                 // Write window_summary for the traded window
                 let (md, md_dir) = window_max_delta.get(&traded_key).cloned().unwrap_or((opp.delta_pct, opp.direction.to_string()));
