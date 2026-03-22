@@ -56,6 +56,76 @@ impl TelegramNotifier {
         }
     }
 
+    /// Order submission notification — sent when an order is posted to CLOB.
+    pub async fn send_order_submitted(
+        &self,
+        market_name: &str,
+        slug: &str,
+        direction: &str,
+        price: Decimal,
+        contracts: Decimal,
+        secs_before_close: u64,
+        pipeline_ms: u128,
+        order_id: &str,
+    ) -> Result<()> {
+        if !self.enabled || !self.on_trade {
+            return Ok(());
+        }
+        let bet_usd = price * contracts;
+        let msg = format!(
+            "\u{1F4E4} ORDER PLACED \u{2014} {market_name}\n\
+             \u{200b}  Window: {slug}\n\
+             \u{200b}  Direction: {direction} | ${price} \u{00D7} {contracts} = ${bet_usd:.2}\n\
+             \u{200b}  \u{23F1} Confirmed T-{secs_before_close}s | Pipeline {pipeline_ms}ms\n\
+             \u{200b}  Order: {order_id}",
+        );
+        self.send_message(&msg).await
+    }
+
+    /// Order failure notification — sent when CLOB rejects or order pipeline fails.
+    pub async fn send_order_failed(
+        &self,
+        market_name: &str,
+        slug: &str,
+        direction: &str,
+        price: Decimal,
+        secs_before_close: u64,
+        error: &str,
+    ) -> Result<()> {
+        if !self.enabled || !self.on_error {
+            return Ok(());
+        }
+        let msg = format!(
+            "\u{274C} ORDER FAILED \u{2014} {market_name}\n\
+             \u{200b}  Window: {slug}\n\
+             \u{200b}  Direction: {direction} | Price: ${price}\n\
+             \u{200b}  \u{23F1} T-{secs_before_close}s remaining\n\
+             \u{200b}  Error: {error}",
+        );
+        self.send_message(&msg).await
+    }
+
+    /// Scanner skip notification — sent for important skips like "no asks".
+    pub async fn send_scanner_skip(
+        &self,
+        market_name: &str,
+        slug: &str,
+        direction: &str,
+        secs_remaining: u64,
+        reason: &str,
+    ) -> Result<()> {
+        if !self.enabled || !self.on_error {
+            return Ok(());
+        }
+        let msg = format!(
+            "\u{26A0}\u{FE0F} SKIP \u{2014} {market_name}\n\
+             \u{200b}  Window: {slug}\n\
+             \u{200b}  Direction: {direction} | T-{secs_remaining}s\n\
+             \u{200b}  Reason: {reason}",
+        );
+        self.send_message(&msg).await
+    }
+
     /// Fill notification — gated by `on_trade`.
     pub async fn send_fill_multi(
         &self,

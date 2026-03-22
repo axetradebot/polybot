@@ -557,6 +557,7 @@ async fn run_scanner_loop(
     let mut token_cache: HashMap<String, MarketInfo> = HashMap::new();
     let mut window_traded: HashMap<String, bool> = HashMap::new();
     let mut last_skip_reasons: HashMap<String, String> = HashMap::new();
+    let mut skip_notified: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut window_max_delta: HashMap<String, (f64, String)> = HashMap::new(); // key -> (max_delta, direction)
     let mut last_analytics_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let scan_interval = Duration::from_millis(config.scanner.scan_interval_ms);
@@ -889,8 +890,9 @@ async fn run_scanner_loop(
                     }
                     window_traded.remove(&key);
                 }
-                // Clear skip reason for fresh window
+                // Clear skip reason and skip notifications for fresh window
                 last_skip_reasons.remove(&mkt.name);
+                skip_notified.retain(|k| !k.starts_with(&mkt.name));
 
                 // New window detected
                 if let Some(price) = price_feeds.get_price(&mkt.binance_symbol).await {
@@ -1095,6 +1097,27 @@ async fn run_scanner_loop(
         // Update last skip reasons for window-miss reporting
         for (name, reason) in &scan_result.skip_reasons {
             last_skip_reasons.insert(name.clone(), reason.clone());
+        }
+
+        // Send Telegram alerts for critical scanner skips (once per window per market)
+        for eval in &scan_result.evaluations {
+            let is_critical = matches!(
+                eval.result.as_str(),
+                "SKIP_ORDERBOOK" | "SKIP_SETTLED" | "SKIP_SANITY"
+            );
+            if is_critical {
+                let skip_key = format!("{}-{}-{}", eval.market_name, eval.window_ts, eval.result);
+                if !skip_notified.contains(&skip_key) {
+                    skip_notified.insert(skip_key);
+                    telegram.send_scanner_skip(
+                        &eval.market_name,
+                        &format!("window_ts={}", eval.window_ts),
+                        eval.direction.as_deref().unwrap_or("?"),
+                        eval.secs_remaining,
+                        eval.detail.as_deref().unwrap_or(&eval.result),
+                    ).await.ok();
+                }
+            }
         }
 
         // Log scanner evaluations to DB
@@ -1326,16 +1349,27 @@ async fn run_scanner_loop(
                                 secs_before_close = secs_after_post,
                                 "ORDER CONFIRMED by CLOB"
                             );
+
+                            telegram.send_order_submitted(
+                                &opp.market_name, &opp.slug, &opp.direction.to_string(),
+                                opp.suggested_entry, opp.contracts,
+                                secs_after_post, pipeline_elapsed_ms, &oid,
+                            ).await.ok();
                         }
                         Err(e) => {
+                            let fail_secs = window_end_epoch.saturating_sub(market::epoch_secs());
                             warn!(
                                 error = ?e,
                                 market = %opp.market_name,
                                 price = %opp.suggested_entry,
                                 utc = %Utc::now().format("%H:%M:%S%.3f"),
-                                secs_before_close = window_end_epoch.saturating_sub(market::epoch_secs()),
+                                secs_before_close = fail_secs,
                                 "Failed to post order"
                             );
+                            telegram.send_order_failed(
+                                &opp.market_name, &opp.slug, &opp.direction.to_string(),
+                                opp.suggested_entry, fail_secs, &format!("{e}"),
+                            ).await.ok();
                         }
                     }
                 }
