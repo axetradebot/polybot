@@ -115,6 +115,46 @@ pub async fn fetch_orderbook(clob_url: &str, token_id: &str) -> Result<Orderbook
     })
 }
 
+/// Like `fetch_orderbook` but returns Ok even when there are no asks.
+/// Used for the comparison/other token where empty asks is informational, not an error.
+pub async fn fetch_orderbook_lenient(clob_url: &str, token_id: &str) -> Result<OrderbookState> {
+    let url = format!("{}/book?token_id={}", clob_url, token_id);
+
+    let resp: BookResponse = http_client()
+        .get(&url)
+        .send()
+        .await
+        .context("orderbook HTTP request failed")?
+        .json()
+        .await
+        .context("failed to parse orderbook JSON")?;
+
+    let best_ask = resp
+        .asks
+        .iter()
+        .filter_map(|l| l.price.parse::<Decimal>().ok())
+        .min()
+        .unwrap_or(Decimal::ONE);
+
+    let best_bid = resp
+        .bids
+        .iter()
+        .filter_map(|l| l.price.parse::<Decimal>().ok())
+        .max()
+        .unwrap_or(Decimal::ZERO);
+
+    let spread = best_ask - best_bid;
+    let mid_price = (best_ask + best_bid) / Decimal::from(2);
+
+    Ok(OrderbookState {
+        best_bid,
+        best_ask,
+        spread,
+        depth_at_ask: Decimal::ZERO,
+        mid_price,
+    })
+}
+
 /// Re-fetch just the best ask for tightening. Returns None on error
 /// instead of failing the whole loop.
 pub async fn refresh_best_ask(clob_url: &str, token_id: &str) -> Option<Decimal> {

@@ -1,6 +1,6 @@
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
 use crate::feeds::PriceFeeds;
@@ -9,6 +9,8 @@ use crate::orderbook;
 use crate::positions::PositionTracker;
 use crate::signal;
 use crate::types::{Direction, MarketInfo};
+
+const SANITY_MIN_ASK: &str = "0.30";
 
 /// A scored opportunity found by the scanner.
 #[derive(Debug, Clone)]
@@ -245,23 +247,43 @@ pub async fn scan_all_markets(
             Direction::Up => market_info.up_token_id.clone(),
             Direction::Down => market_info.down_token_id.clone(),
         };
+        let other_token_id = match direction {
+            Direction::Up => market_info.down_token_id.clone(),
+            Direction::Down => market_info.up_token_id.clone(),
+        };
 
-        info!(
-            market = %mkt.name,
-            slug = %slug,
-            direction = %direction,
-            token_id = %token_id,
-            up_token = %market_info.up_token_id,
-            down_token = %market_info.down_token_id,
-            "Fetching orderbook for selected token"
+        // Fetch BOTH tokens' orderbooks for full visibility
+        let clob = &config.infra.polymarket_clob_url;
+        let (our_result, other_result) = tokio::join!(
+            orderbook::fetch_orderbook(clob, &token_id),
+            orderbook::fetch_orderbook_lenient(clob, &other_token_id),
         );
 
-        let ob = match orderbook::fetch_orderbook(&config.infra.polymarket_clob_url, &token_id).await {
+        // Log both tokens so we can always see the full picture
+        let other_label = match direction { Direction::Up => "DOWN", Direction::Down => "UP" };
+        let our_label = match direction { Direction::Up => "UP", Direction::Down => "DOWN" };
+        if let Ok(ref other_ob) = other_result {
+            info!(
+                market = %mkt.name,
+                slug = %slug,
+                direction = %direction,
+                our_token_label = our_label,
+                other_token_label = other_label,
+                our_token_id = %token_id,
+                other_token_id = %other_token_id,
+                our_best_ask = %our_result.as_ref().map(|o| o.best_ask).unwrap_or(Decimal::ZERO),
+                our_best_bid = %our_result.as_ref().map(|o| o.best_bid).unwrap_or(Decimal::ZERO),
+                other_best_ask = %other_ob.best_ask,
+                other_best_bid = %other_ob.best_bid,
+                "Orderbook comparison: BOTH tokens"
+            );
+        }
+
+        let ob = match our_result {
             Ok(ob) => ob,
             Err(e) => {
-                // Run diagnostic: check BOTH tokens to detect swapped IDs
                 orderbook::diagnose_both_tokens(
-                    &config.infra.polymarket_clob_url,
+                    clob,
                     &market_info.up_token_id,
                     &market_info.down_token_id,
                     &direction.to_string(),
@@ -282,6 +304,38 @@ pub async fn scan_all_markets(
             }
         };
 
+        // SANITY CHECK: If our token's best_ask is below $0.30, the market strongly
+        // disagrees with our signal. This means either:
+        //   a) The token mapping is inverted (we're looking at the wrong token), or
+        //   b) Our delta signal is catastrophically wrong.
+        // Either way, DO NOT trade.
+        let sanity_floor: Decimal = SANITY_MIN_ASK.parse().unwrap();
+        if ob.best_ask < sanity_floor {
+            let detail = format!(
+                "SANITY FAIL: {direction} signal but {our_label} token ask=${:.2} < ${sanity_floor} — market disagrees, skipping",
+                ob.best_ask
+            );
+            warn!(
+                market = %mkt.name,
+                slug = %slug,
+                direction = %direction,
+                best_ask = %ob.best_ask,
+                delta = delta_f64,
+                "{detail}"
+            );
+            skip_reasons.insert(mkt.name.clone(), detail.clone());
+            evaluations.push(ScanEvaluation {
+                market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
+                direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
+                open_price: Some(open_price), current_price: Some(current_price),
+                best_ask: Some(ob.best_ask), best_bid: Some(ob.best_bid), spread: Some(ob.spread),
+                depth_at_ask: Some(ob.depth_at_ask), suggested_entry: None,
+                max_entry: None, edge_score: None,
+                result: "SKIP_SANITY".into(), detail: Some(detail),
+            });
+            continue;
+        }
+
         let undercut = Decimal::try_from(mkt.effective_undercut_offset(config.pricing.undercut_offset)).unwrap_or(dec!(0.03));
         let taker_threshold = config.pricing.taker_delta_threshold;
         let is_taker = taker_threshold > 0.0 && delta_f64 >= taker_threshold;
@@ -290,8 +344,16 @@ pub async fn scan_all_markets(
         } else {
             (ob.best_ask - undercut).round_dp(2)
         };
+        // Never post above the best ask — that would overpay
+        if suggested_entry > ob.best_ask {
+            suggested_entry = ob.best_ask;
+        }
         if suggested_entry < min_entry {
             suggested_entry = min_entry;
+        }
+        // Final guard: if min_entry pushed us above best_ask, cap at best_ask
+        if suggested_entry > ob.best_ask {
+            suggested_entry = ob.best_ask;
         }
 
         let max_entry = Decimal::try_from(mkt.max_price_for_delta(delta_f64)).unwrap_or(dec!(0.85));

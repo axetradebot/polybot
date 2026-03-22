@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::market::epoch_secs;
+use crate::market::{epoch_secs, verify_tokens_from_clob};
 use crate::types::MarketInfo;
 
 #[derive(Debug, Clone)]
@@ -44,14 +44,16 @@ pub struct HourlyDiscovery {
     cache: Arc<RwLock<Option<CacheEntry>>>,
     client: reqwest::Client,
     cache_duration: std::time::Duration,
+    clob_url: String,
 }
 
 impl HourlyDiscovery {
-    pub fn new() -> Self {
+    pub fn new(clob_url: &str) -> Self {
         Self {
             cache: Arc::new(RwLock::new(None)),
             client: reqwest::Client::new(),
             cache_duration: std::time::Duration::from_secs(600),
+            clob_url: clob_url.to_string(),
         }
     }
 
@@ -173,8 +175,20 @@ impl HourlyDiscovery {
                 })
                 .unwrap_or(Decimal::new(1, 2));
 
-            // Determine correct UP/DOWN mapping using outcome labels from the tokens array
-            let (up_token_id, down_token_id) = resolve_up_down_tokens(mkt, &token_ids, &event_slug);
+            // Primary: use CLOB API for authoritative token-outcome mapping.
+            // Fallback: resolve from Gamma outcomes/tokens array.
+            let (up_token_id, down_token_id) = if !condition_id.is_empty() {
+                if let Some((clob_up, clob_down)) =
+                    verify_tokens_from_clob(&self.clob_url, &condition_id, &event_slug).await
+                {
+                    (clob_up, clob_down)
+                } else {
+                    warn!(slug = %event_slug, "CLOB verification unavailable for hourly market, using Gamma fallback");
+                    resolve_up_down_tokens(mkt, &token_ids, &event_slug)
+                }
+            } else {
+                resolve_up_down_tokens(mkt, &token_ids, &event_slug)
+            };
 
             result.push(HourlyMarket {
                 event_slug,

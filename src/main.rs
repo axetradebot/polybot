@@ -184,7 +184,7 @@ async fn run_diagnostics(config: &AppConfig) -> Result<()> {
         // Resolve tokens
         if mkt.is_hourly() {
             println!("  Market type: HOURLY");
-            let discovery = hourly_discovery::HourlyDiscovery::new();
+            let discovery = hourly_discovery::HourlyDiscovery::new(clob_url);
             match discovery.get_current_market(&mkt.slug_prefix).await {
                 Ok(Some(hm)) => {
                     println!("  Hourly slug: {}", hm.event_slug);
@@ -202,7 +202,7 @@ async fn run_diagnostics(config: &AppConfig) -> Result<()> {
             println!("  Market type: {}min", mkt.window_seconds / 60);
             println!("  Slug:        {slug}");
 
-            match market::resolve_market(&slug).await {
+            match market::resolve_market(&slug, clob_url).await {
                 Ok(info) => {
                     println!("  Accepting:   {}", info.accepting_orders);
                     println!("  UP  token:   {}", info.up_token_id);
@@ -533,7 +533,7 @@ async fn run_scanner_loop(
     let clob_url = config.infra.polymarket_clob_url.clone();
 
     // Hourly market discovery
-    let hourly_discovery = hourly_discovery::HourlyDiscovery::new();
+    let hourly_discovery = hourly_discovery::HourlyDiscovery::new(&clob_url);
     let mut hourly_slug_map: HashMap<String, String> = HashMap::new();
 
     info!(
@@ -893,7 +893,7 @@ async fn run_scanner_loop(
                 } else {
                     let slug = market::build_slug(&mkt.slug_prefix, window_ts);
                     let slug_clone = slug.clone();
-                    match market::resolve_market(&slug_clone).await {
+                    match market::resolve_market(&slug_clone, &clob_url).await {
                         Ok(info) => {
                             token_cache.insert(slug, info);
                         }
@@ -943,7 +943,7 @@ async fn run_scanner_loop(
                 } else {
                     let slug = market::build_slug(&mkt.slug_prefix, window_ts);
                     if !token_cache.contains_key(&slug) && secs_rem > entry_cutoff_s {
-                        match market::resolve_market(&slug).await {
+                        match market::resolve_market(&slug, &clob_url).await {
                             Ok(info) => {
                                 info!(market = %mkt.name, slug = %slug, "Token resolved on retry");
                                 token_cache.insert(slug, info);
