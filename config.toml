@@ -222,7 +222,7 @@ verbose_skips = false
 [infrastructure]
 binance_ws_base = "wss://stream.binance.com:9443/ws"
 polymarket_clob_url = "https://clob.polymarket.com"
-polygon_rpc_url = "https://polygon.llamarpc.com"
+polygon_rpc_url = "https://polygon-rpc.com"
 polygon_chain_id = 137
 signature_type = "GnosisSafe"
 db_path = "./trades.db"
