@@ -255,50 +255,88 @@ pub async fn scan_all_markets(
             orderbook::fetch_orderbook_lenient(clob, token_b_id),
         );
 
-        // Settled market detection: if BOTH tokens have best_ask > $0.95, skip.
+        // Check which tokens have real orderbook data (not defaults)
+        let a_has_asks = ob_a.as_ref().ok().map_or(false, |a| a.best_ask < Decimal::ONE);
+        let b_has_asks = ob_b.as_ref().ok().map_or(false, |b| b.best_ask < Decimal::ONE);
+
+        // Settled market detection:
+        //   Case 1: BOTH tokens have best_ask > $0.95
+        //   Case 2: One token has no asks AND the other is < $0.05 (one-sided settlement)
         let settled_threshold = Decimal::new(95, 2);
-        if let (Ok(ref a), Ok(ref b)) = (&ob_a, &ob_b) {
-            if a.best_ask > settled_threshold && b.best_ask > settled_threshold {
-                let detail = format!(
-                    "Market settled: both asks > $0.95 (A={}, B={})",
-                    a.best_ask, b.best_ask
-                );
-                warn!(market = %mkt.name, slug = %slug, ask_a = %a.best_ask, ask_b = %b.best_ask, "Skip: market appears SETTLED");
-                skip_reasons.insert(mkt.name.clone(), detail.clone());
-                evaluations.push(ScanEvaluation {
-                    market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
-                    direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
-                    open_price: Some(open_price), current_price: Some(current_price),
-                    best_ask: Some(a.best_ask), best_bid: Some(a.best_bid),
-                    spread: Some(a.spread), depth_at_ask: Some(a.depth_at_ask),
-                    suggested_entry: None, max_entry: None, edge_score: None,
-                    result: "SKIP_SETTLED".into(), detail: Some(detail),
-                });
-                continue;
+        let penny_threshold = Decimal::new(5, 2);
+        let is_settled = match (&ob_a, &ob_b) {
+            (Ok(a), Ok(b)) => {
+                let both_high = a.best_ask > settled_threshold && b.best_ask > settled_threshold;
+                let one_sided = (!a_has_asks && b.best_ask < penny_threshold)
+                    || (!b_has_asks && a.best_ask < penny_threshold);
+                both_high || one_sided
             }
+            _ => false,
+        };
+        if is_settled {
+            let detail = if let (Ok(a), Ok(b)) = (&ob_a, &ob_b) {
+                format!(
+                    "Market settled: A(ask={} has_asks={}) B(ask={} has_asks={})",
+                    a.best_ask, a_has_asks, b.best_ask, b_has_asks
+                )
+            } else {
+                "Market settled".to_string()
+            };
+            warn!(market = %mkt.name, slug = %slug, "Skip: market appears SETTLED");
+            skip_reasons.insert(mkt.name.clone(), detail.clone());
+            evaluations.push(ScanEvaluation {
+                market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
+                direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
+                open_price: Some(open_price), current_price: Some(current_price),
+                best_ask: ob_a.as_ref().ok().map(|a| a.best_ask),
+                best_bid: ob_a.as_ref().ok().map(|a| a.best_bid),
+                spread: ob_a.as_ref().ok().map(|a| a.spread),
+                depth_at_ask: ob_a.as_ref().ok().map(|a| a.depth_at_ask),
+                suggested_entry: None, max_entry: None, edge_score: None,
+                result: "SKIP_SETTLED".into(), detail: Some(detail),
+            });
+            continue;
         }
 
         // Determine which token to buy using mid-price comparison.
-        // Higher mid-price = the token the market believes will win.
-        // We always buy the higher-priced token (it matches our directional signal).
+        // Only use real mid-prices (ignore tokens with no asks — their $1.00 default
+        // creates a fake mid of $0.50 that tricks the comparison).
         let (token_id, _other_token_id, our_ob, other_ob) = {
-            let mid_a = ob_a.as_ref().ok().map(|a| (a.best_bid + a.best_ask) / Decimal::from(2));
-            let mid_b = ob_b.as_ref().ok().map(|b| (b.best_bid + b.best_ask) / Decimal::from(2));
+            let real_mid = |ob_result: &Result<crate::orderbook::OrderbookState, _>, has_asks: bool| -> Option<Decimal> {
+                if !has_asks { return None; }
+                ob_result.as_ref().ok().map(|ob| (ob.best_bid + ob.best_ask) / Decimal::from(2))
+            };
+            let mid_a = real_mid(&ob_a, a_has_asks);
+            let mid_b = real_mid(&ob_b, b_has_asks);
 
             let swap = match (mid_a, mid_b) {
                 (Some(ma), Some(mb)) => {
                     info!(
-                        market = %mkt.name,
-                        slug = %slug,
-                        direction = %direction,
-                        mid_a = %ma,
-                        mid_b = %mb,
+                        market = %mkt.name, slug = %slug, direction = %direction,
+                        mid_a = %ma, mid_b = %mb,
                         selected = if ma >= mb { "A" } else { "B" },
-                        "Price-based token detection"
+                        "Price-based token detection (both have asks)"
                     );
                     ma < mb
                 }
-                _ => false,
+                (None, Some(mb)) => {
+                    info!(
+                        market = %mkt.name, slug = %slug, direction = %direction,
+                        mid_b = %mb, "Only token B has asks — selecting B"
+                    );
+                    true
+                }
+                (Some(ma), None) => {
+                    info!(
+                        market = %mkt.name, slug = %slug, direction = %direction,
+                        mid_a = %ma, "Only token A has asks — selecting A"
+                    );
+                    false
+                }
+                (None, None) => {
+                    info!(market = %mkt.name, slug = %slug, "Neither token has asks");
+                    false
+                }
             };
 
             if swap {
@@ -308,18 +346,21 @@ pub async fn scan_all_markets(
             }
         };
 
-        // Validate our token has real asks (lenient fetch defaults best_ask to $1.00 when empty)
+        // Validate our token has real asks
         let ob = match our_ob {
             Ok(ob) if ob.best_ask < Decimal::ONE => ob,
             Ok(_) | Err(_) => {
                 let detail = match &other_ob {
-                    Ok(other) => format!(
-                        "No asks on selected token; other: ask=${:.2} bid=${:.2}",
+                    Ok(other) if other.best_ask < Decimal::ONE => format!(
+                        "No tradeable asks: selected token empty, other ask=${:.2} bid=${:.2} (market likely settled)",
                         other.best_ask, other.best_bid
                     ),
-                    Err(_) => "Both orderbook fetches failed".to_string(),
+                    _ => format!(
+                        "Neither token has tradeable asks (a_has={}, b_has={})",
+                        a_has_asks, b_has_asks
+                    ),
                 };
-                info!(market = %mkt.name, slug = %slug, "Skip: selected token has no asks");
+                info!(market = %mkt.name, slug = %slug, secs_rem = secs_rem, "Skip: no tradeable asks");
                 skip_reasons.insert(mkt.name.clone(), format!("Orderbook: {detail}"));
                 evaluations.push(ScanEvaluation {
                     market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
