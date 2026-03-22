@@ -259,28 +259,22 @@ pub async fn scan_all_markets(
         let a_has_asks = ob_a.as_ref().ok().map_or(false, |a| a.best_ask < Decimal::ONE);
         let b_has_asks = ob_b.as_ref().ok().map_or(false, |b| b.best_ask < Decimal::ONE);
 
-        // Settled market detection:
-        //   Case 1: BOTH tokens have best_ask > $0.95
-        //   Case 2: One token has no asks AND has bids > $0.80 (real settlement signal,
-        //           not just an empty orderbook) AND the other is < $0.05
+        // Settled market detection: ONLY flag when BOTH tokens have asks > $0.95.
+        // One-sided patterns (one token empty, other at pennies) are handled
+        // downstream by the sanity floor ($0.30) and "no tradeable asks" checks,
+        // which enter watching mode and keep polling instead of giving up.
         let settled_threshold = Decimal::new(95, 2);
-        let penny_threshold = Decimal::new(5, 2);
-        let bid_settlement_threshold = Decimal::new(80, 2);
         let is_settled = match (&ob_a, &ob_b) {
             (Ok(a), Ok(b)) => {
-                let both_high = a.best_ask > settled_threshold && b.best_ask > settled_threshold;
-                let one_sided =
-                    (!a_has_asks && a.best_bid > bid_settlement_threshold && b.best_ask < penny_threshold)
-                    || (!b_has_asks && b.best_bid > bid_settlement_threshold && a.best_ask < penny_threshold);
-                both_high || one_sided
+                a.best_ask > settled_threshold && b.best_ask > settled_threshold
             }
             _ => false,
         };
         if is_settled {
             let detail = if let (Ok(a), Ok(b)) = (&ob_a, &ob_b) {
                 format!(
-                    "Market settled: A(ask={} has_asks={}) B(ask={} has_asks={})",
-                    a.best_ask, a_has_asks, b.best_ask, b_has_asks
+                    "Both asks > $0.95: A(ask={} bid={}) B(ask={} bid={})",
+                    a.best_ask, a.best_bid, b.best_ask, b.best_bid
                 )
             } else {
                 "Market settled".to_string()

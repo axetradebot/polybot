@@ -559,6 +559,7 @@ async fn run_scanner_loop(
     let mut last_skip_reasons: HashMap<String, String> = HashMap::new();
     let mut skip_notified: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut shadow_recorded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut watching_markets: HashMap<String, u64> = HashMap::new(); // "market-window_ts" -> secs_remaining when watching started
     let mut window_max_delta: HashMap<String, (f64, String)> = HashMap::new(); // key -> (max_delta, direction)
     let mut last_analytics_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let scan_interval = Duration::from_millis(config.scanner.scan_interval_ms);
@@ -876,11 +877,19 @@ async fn run_scanner_loop(
                     let old_open = price_feeds.get_window_open(&mkt.slug_prefix, old_ts).await.unwrap_or_default();
                     let current = price_feeds.get_price(&mkt.binance_symbol).await.unwrap_or(old_open);
 
+                    let watch_key = format!("{}-{}", mkt.name, old_ts);
+                    let was_watching = watching_markets.remove(&watch_key);
+
                     if !traded {
-                        let reason = last_skip_reasons
+                        let base_reason = last_skip_reasons
                             .get(&mkt.name)
                             .cloned()
                             .unwrap_or_else(|| "No opportunity found".into());
+                        let reason = if let Some(started_secs) = was_watching {
+                            format!("Watched ~{}s — {}", started_secs, base_reason)
+                        } else {
+                            base_reason
+                        };
                         missed_windows.push((mkt.name.clone(), reason.clone()));
 
                         let (md, md_dir) = window_max_delta.remove(&key).unwrap_or((0.0, String::new()));
@@ -1116,23 +1125,27 @@ async fn run_scanner_loop(
             last_skip_reasons.insert(name.clone(), reason.clone());
         }
 
-        // Send Telegram alerts for critical scanner skips (once per window per market)
+        // Recoverable orderbook conditions → enter "watching" mode instead of
+        // sending a premature SKIP alert. The scanner already re-polls every
+        // scan_interval_ms; this just changes how results are reported.
         for eval in &scan_result.evaluations {
-            let is_critical = matches!(
+            let is_recoverable = matches!(
                 eval.result.as_str(),
-                "SKIP_ORDERBOOK" | "SKIP_SETTLED" | "SKIP_SANITY"
+                "SKIP_ORDERBOOK" | "SKIP_SETTLED" | "SKIP_SANITY" | "SKIP_PRICE" | "SKIP_EDGE"
             );
-            if is_critical {
-                let skip_key = format!("{}-{}-{}", eval.market_name, eval.window_ts, eval.result);
-                if !skip_notified.contains(&skip_key) {
-                    skip_notified.insert(skip_key);
-                    telegram.send_scanner_skip(
-                        &eval.market_name,
-                        &format!("window_ts={}", eval.window_ts),
-                        eval.direction.as_deref().unwrap_or("?"),
-                        eval.secs_remaining,
-                        eval.detail.as_deref().unwrap_or(&eval.result),
-                    ).await.ok();
+            if is_recoverable {
+                if let Some(ref dir) = eval.direction {
+                    let watch_key = format!("{}-{}", eval.market_name, eval.window_ts);
+                    if !watching_markets.contains_key(&watch_key) {
+                        watching_markets.insert(watch_key, eval.secs_remaining);
+                        telegram.send_watching(
+                            &eval.market_name,
+                            dir,
+                            eval.delta_pct.unwrap_or(0.0),
+                            eval.secs_remaining,
+                            eval.detail.as_deref().unwrap_or(&eval.result),
+                        ).await.ok();
+                    }
                 }
             }
         }
@@ -1195,6 +1208,19 @@ async fn run_scanner_loop(
             for (rank, opp) in opportunities.iter().enumerate() {
                 if orders_fired >= config.scanner.max_orders_per_cycle {
                     break;
+                }
+
+                // If this market was being watched, the orderbook just improved
+                let watch_key = format!("{}-{}", opp.market_name, opp.window_ts);
+                if let Some(started_secs) = watching_markets.remove(&watch_key) {
+                    info!(
+                        market = %opp.market_name,
+                        direction = %opp.direction,
+                        delta = opp.delta_pct,
+                        best_ask = %opp.best_ask,
+                        watched_for = %format!("~{}s", started_secs.saturating_sub(opp.seconds_remaining)),
+                        "Watching -> orderbook appeared! Placing order"
+                    );
                 }
 
                 // Per-market position limit

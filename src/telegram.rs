@@ -126,6 +126,28 @@ impl TelegramNotifier {
         self.send_message(&msg).await
     }
 
+    /// Watching notification — sent when the bot has a delta signal but is waiting
+    /// for a tradeable orderbook. Replaces the premature SKIP alert.
+    pub async fn send_watching(
+        &self,
+        market_name: &str,
+        direction: &str,
+        delta: f64,
+        secs_remaining: u64,
+        initial_reason: &str,
+    ) -> Result<()> {
+        if !self.enabled || !self.on_trade {
+            return Ok(());
+        }
+        let msg = format!(
+            "\u{1F440} WATCHING \u{2014} {market_name}\n\
+             \u{200b}  {direction} {delta:.4}% | T-{secs_remaining}s\n\
+             \u{200b}  {initial_reason}\n\
+             \u{200b}  Polling for tradeable asks until cutoff\u{2026}",
+        );
+        self.send_message(&msg).await
+    }
+
     /// Fill notification — gated by `on_trade`.
     pub async fn send_fill_multi(
         &self,
