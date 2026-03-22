@@ -1,6 +1,6 @@
 [general]
 mode = "live"
-log_level = "info"
+log_level = "debug"
 
 [bankroll]
 total = 239
@@ -49,9 +49,9 @@ entry_start_s = 20
 min_delta_pct = 0.06
 max_entry_price = 0.90
 delta_tiers = [
-    [0.06, 0.82],
-    [0.10, 0.85],
-    [0.15, 0.88],
+    [0.06, 0.80],
+    [0.10, 0.83],
+    [0.15, 0.86],
     [0.25, 0.90],
 ]
 
@@ -65,10 +65,10 @@ slug_prefix = "btc-updown-15m"
 binance_symbol = "btcusdt"
 chainlink_symbol = "btc/usd"
 entry_start_s = 30
-min_delta_pct = 0.06
+min_delta_pct = 0.05
 max_entry_price = 0.90
 delta_tiers = [
-    [0.06, 0.82],
+    [0.05, 0.80],
     [0.10, 0.85],
     [0.15, 0.88],
     [0.25, 0.90],
@@ -192,7 +192,7 @@ delta_tiers = [
 name = "BTC Hourly"
 asset = "BTC"
 market_type = "hourly"
-mode = "paper"
+mode = "live"
 enabled = true
 window_seconds = 3600
 slug_prefix = "bitcoin-up-or-down"
@@ -201,7 +201,7 @@ resolution_source = "binance"
 entry_start_s = 300
 entry_cutoff_s = 30
 min_delta_pct = 0.05
-max_entry_price = 0.88
+max_entry_price = 0.90
 undercut_offset = 0.01
 tighten_step = 0.01
 adjust_interval_ms = 5000

@@ -246,9 +246,28 @@ pub async fn scan_all_markets(
             Direction::Down => market_info.down_token_id.clone(),
         };
 
+        info!(
+            market = %mkt.name,
+            slug = %slug,
+            direction = %direction,
+            token_id = %token_id,
+            up_token = %market_info.up_token_id,
+            down_token = %market_info.down_token_id,
+            "Fetching orderbook for selected token"
+        );
+
         let ob = match orderbook::fetch_orderbook(&config.infra.polymarket_clob_url, &token_id).await {
             Ok(ob) => ob,
             Err(e) => {
+                // Run diagnostic: check BOTH tokens to detect swapped IDs
+                orderbook::diagnose_both_tokens(
+                    &config.infra.polymarket_clob_url,
+                    &market_info.up_token_id,
+                    &market_info.down_token_id,
+                    &direction.to_string(),
+                    &slug,
+                ).await;
+
                 info!(market = %mkt.name, error = %e, "Skip: orderbook fetch failed");
                 skip_reasons.insert(mkt.name.clone(), format!("Orderbook fetch failed: {e}"));
                 evaluations.push(ScanEvaluation {

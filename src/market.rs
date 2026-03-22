@@ -58,25 +58,65 @@ pub async fn resolve_market(slug: &str) -> Result<MarketInfo> {
         .order_price_min_tick_size
         .unwrap_or_else(|| Decimal::new(1, 2));
 
+    // Determine correct UP/DOWN mapping using the outcomes field.
+    // The outcomes array (e.g. ["Up","Down"] or ["Down","Up"]) corresponds
+    // positionally to clob_token_ids. Without checking, we'd assume [0]=Up
+    // which is WRONG if Polymarket returns ["Down","Up"].
+    let (up_idx, down_idx) = determine_token_indices(market.outcomes.as_ref());
+
+    let up_token_id = token_ids[up_idx].to_string();
+    let down_token_id = token_ids[down_idx].to_string();
+
+    info!(
+        slug = %slug,
+        outcomes = ?market.outcomes,
+        up_idx,
+        down_idx,
+        up_token = %up_token_id,
+        down_token = %down_token_id,
+        accepting = accepting,
+        "Resolved market (outcome-aware token mapping)"
+    );
+
     let info = MarketInfo {
         condition_id,
-        up_token_id: token_ids[0].to_string(),
-        down_token_id: token_ids[1].to_string(),
+        up_token_id,
+        down_token_id,
         slug: slug.to_string(),
         accepting_orders: accepting,
         neg_risk,
         tick_size,
     };
 
-    info!(
-        slug = %slug,
-        up_token = %info.up_token_id,
-        down_token = %info.down_token_id,
-        accepting = accepting,
-        "Resolved market"
-    );
-
     Ok(info)
+}
+
+/// Determine the correct array indices for UP and DOWN tokens from the outcomes list.
+/// Returns (up_index, down_index). Falls back to (0, 1) if outcomes are missing or unrecognized.
+fn determine_token_indices(outcomes: Option<&Vec<String>>) -> (usize, usize) {
+    if let Some(outcomes) = outcomes {
+        let up_pos = outcomes.iter().position(|o| {
+            let lower = o.to_lowercase();
+            lower == "up" || lower == "yes"
+        });
+        let down_pos = outcomes.iter().position(|o| {
+            let lower = o.to_lowercase();
+            lower == "down" || lower == "no"
+        });
+        match (up_pos, down_pos) {
+            (Some(u), Some(d)) => {
+                info!(up_idx = u, down_idx = d, outcomes = ?outcomes, "Token index mapping from outcomes");
+                (u, d)
+            }
+            _ => {
+                warn!(outcomes = ?outcomes, "Could not match Up/Down in outcomes, falling back to [0]=Up [1]=Down");
+                (0, 1)
+            }
+        }
+    } else {
+        warn!("No outcomes field from Gamma API — assuming [0]=Up [1]=Down");
+        (0, 1)
+    }
 }
 
 /// Resolve market with retries for when the market hasn't been created yet.

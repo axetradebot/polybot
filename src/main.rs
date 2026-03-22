@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::cli::Cli;
 use crate::config::AppConfig;
@@ -67,6 +67,11 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .with_writer(std::sync::Mutex::new(log_file))
         .init();
+
+    // ── Diagnostic mode ──
+    if cli.diagnose {
+        return run_diagnostics(&config).await;
+    }
 
     let enabled = config.enabled_markets();
     let symbols = config.binance_symbols();
@@ -156,6 +161,131 @@ async fn main() -> Result<()> {
     }
 
     result
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Diagnostic mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn run_diagnostics(config: &AppConfig) -> Result<()> {
+    let clob_url = &config.infra.polymarket_clob_url;
+
+    println!("\n{}", "=".repeat(70));
+    println!("  POLYBOT ORDERBOOK DIAGNOSTIC");
+    println!("{}\n", "=".repeat(70));
+
+    for mkt in config.enabled_markets() {
+        println!("\n--- Market: {} ({}s windows, slug_prefix={}) ---",
+            mkt.name, mkt.window_seconds, mkt.slug_prefix);
+
+        let (window_ts, secs_rem) = market::current_window(mkt.window_seconds);
+        println!("  Current window: ts={window_ts}, {secs_rem}s remaining");
+
+        // Resolve tokens
+        if mkt.is_hourly() {
+            println!("  Market type: HOURLY");
+            let discovery = hourly_discovery::HourlyDiscovery::new();
+            match discovery.get_current_market(&mkt.slug_prefix).await {
+                Ok(Some(hm)) => {
+                    println!("  Hourly slug: {}", hm.event_slug);
+                    println!("  End time:    {}", hm.end_time);
+                    println!("  Accepting:   {}", hm.accepting_orders);
+                    println!("  UP  token:   {}", hm.up_token_id);
+                    println!("  DOWN token:  {}", hm.down_token_id);
+                    test_orderbook(clob_url, &hm.up_token_id, &hm.down_token_id, &hm.event_slug).await;
+                }
+                Ok(None) => println!("  ERROR: No active hourly market found!"),
+                Err(e) => println!("  ERROR: Hourly discovery failed: {e}"),
+            }
+        } else {
+            let slug = market::build_slug(&mkt.slug_prefix, window_ts);
+            println!("  Market type: {}min", mkt.window_seconds / 60);
+            println!("  Slug:        {slug}");
+
+            match market::resolve_market(&slug).await {
+                Ok(info) => {
+                    println!("  Accepting:   {}", info.accepting_orders);
+                    println!("  UP  token:   {}", info.up_token_id);
+                    println!("  DOWN token:  {}", info.down_token_id);
+                    test_orderbook(clob_url, &info.up_token_id, &info.down_token_id, &slug).await;
+                }
+                Err(e) => {
+                    println!("  ERROR: Token resolution failed: {e}");
+                    println!("  This could mean the market for this window hasn't been created yet.");
+                    println!("  Try again in a few seconds after the window starts.");
+                }
+            }
+        }
+    }
+
+    println!("\n{}", "=".repeat(70));
+    println!("  DIAGNOSTIC COMPLETE");
+    println!("{}\n", "=".repeat(70));
+    println!("If one token has asks and the other doesn't, that's normal.");
+    println!("If BOTH tokens have 0 asks, the market may be settled or not yet live.");
+    println!("If the token the bot selected has 0 asks but the OTHER has asks,");
+    println!("the UP/DOWN mapping was wrong — the fix above should resolve this.\n");
+
+    Ok(())
+}
+
+async fn test_orderbook(clob_url: &str, up_token: &str, down_token: &str, slug: &str) {
+    println!("\n  Testing UP token orderbook...");
+    let up_url = format!("{}/book?token_id={}", clob_url, up_token);
+    println!("    URL: {up_url}");
+    match reqwest::Client::new()
+        .get(&up_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.text().await {
+            Ok(body) => {
+                let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let asks = parsed["asks"].as_array().map(|a| a.len()).unwrap_or(0);
+                let bids = parsed["bids"].as_array().map(|b| b.len()).unwrap_or(0);
+                let top_ask = parsed["asks"][0]["price"].as_str().unwrap_or("none");
+                let top_bid = parsed["bids"][0]["price"].as_str().unwrap_or("none");
+                println!("    UP token: {asks} asks, {bids} bids | top_ask={top_ask} top_bid={top_bid}");
+                if asks == 0 {
+                    println!("    ⚠ UP token has NO ASKS");
+                }
+            }
+            Err(e) => println!("    ERROR reading response: {e}"),
+        },
+        Err(e) => println!("    ERROR fetching: {e}"),
+    }
+
+    println!("  Testing DOWN token orderbook...");
+    let down_url = format!("{}/book?token_id={}", clob_url, down_token);
+    println!("    URL: {down_url}");
+    match reqwest::Client::new()
+        .get(&down_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.text().await {
+            Ok(body) => {
+                let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let asks = parsed["asks"].as_array().map(|a| a.len()).unwrap_or(0);
+                let bids = parsed["bids"].as_array().map(|b| b.len()).unwrap_or(0);
+                let top_ask = parsed["asks"][0]["price"].as_str().unwrap_or("none");
+                let top_bid = parsed["bids"][0]["price"].as_str().unwrap_or("none");
+                println!("    DOWN token: {asks} asks, {bids} bids | top_ask={top_ask} top_bid={top_bid}");
+                if asks == 0 {
+                    println!("    ⚠ DOWN token has NO ASKS");
+                }
+            }
+            Err(e) => println!("    ERROR reading response: {e}"),
+        },
+        Err(e) => println!("    ERROR fetching: {e}"),
+    }
+
+    println!("\n  Slug for manual verification: {slug}");
+    println!("  curl test commands:");
+    println!("    curl -s \"{clob_url}/book?token_id={up_token}\" | python3 -m json.tool");
+    println!("    curl -s \"{clob_url}/book?token_id={down_token}\" | python3 -m json.tool");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -284,11 +414,13 @@ async fn run_scanner_loop(
 
     macro_rules! poll_fills {
         () => {{
+            use polymarket_client_sdk::clob::types::OrderStatusType;
+
             let client = client.as_ref().unwrap();
             let mut fills: Vec<(String, Decimal, Decimal)> = Vec::new();
             let mut seen_ids = std::collections::HashSet::new();
 
-            // Method 1: Query each pending order by ID to check size_matched.
+            // Method 1: Query each pending order by ID — require status==Matched.
             let pending = positions.pending_positions().await;
             for pos in &pending {
                 if let Some(ref oid) = pos.order_id {
@@ -302,16 +434,40 @@ async fn run_scanner_loop(
                     .await
                     {
                         for o in &page.data {
-                            if o.id == *oid && o.size_matched > Decimal::ZERO {
+                            let is_matched = o.status == OrderStatusType::Matched;
+                            let has_size = o.size_matched > Decimal::ZERO;
+                            debug!(
+                                order_id = %o.id,
+                                status = ?o.status,
+                                size_matched = %o.size_matched,
+                                original_size = %o.original_size,
+                                price = %o.price,
+                                "poll_fills: order query result"
+                            );
+                            if o.id == *oid && is_matched && has_size {
+                                info!(
+                                    order_id = %o.id,
+                                    status = ?o.status,
+                                    size_matched = %o.size_matched,
+                                    price = %o.price,
+                                    "poll_fills: confirmed fill via orders endpoint"
+                                );
                                 fills.push((o.id.clone(), o.price, o.size_matched));
                                 seen_ids.insert(o.id.clone());
+                            } else if o.id == *oid && has_size && !is_matched {
+                                warn!(
+                                    order_id = %o.id,
+                                    status = ?o.status,
+                                    size_matched = %o.size_matched,
+                                    "poll_fills: size_matched>0 but status is NOT Matched — ignoring (false fill)"
+                                );
                             }
                         }
                     }
                 }
             }
 
-            // Method 2: Query recent trades as backup (catches fills the orders endpoint missed).
+            // Method 2: Query recent trades — check both taker_order_id and maker_orders.
             if let Ok(Ok(page)) = tokio::time::timeout(
                 Duration::from_secs(3),
                 client.trades(
@@ -322,8 +478,17 @@ async fn run_scanner_loop(
             .await
             {
                 for t in &page.data {
+                    // Check if we were the taker
                     if !seen_ids.contains(&t.taker_order_id) && t.size > Decimal::ZERO {
                         fills.push((t.taker_order_id.clone(), t.price, t.size));
+                        seen_ids.insert(t.taker_order_id.clone());
+                    }
+                    // Check if we were the maker (our order_id appears in maker_orders)
+                    for mo in &t.maker_orders {
+                        if !seen_ids.contains(&mo.order_id) && mo.matched_amount > Decimal::ZERO {
+                            fills.push((mo.order_id.clone(), mo.price, mo.matched_amount));
+                            seen_ids.insert(mo.order_id.clone());
+                        }
                     }
                 }
             }
@@ -1165,7 +1330,26 @@ async fn run_scanner_loop(
 
                     // Cancel old order, place new
                     if let Some(ref c) = client {
-                        let _ = c.cancel_all_orders().await;
+                        match c.cancel_all_orders().await {
+                            Ok(resp) => {
+                                if !resp.not_canceled.is_empty() {
+                                    warn!(
+                                        not_canceled = ?resp.not_canceled,
+                                        market = %pos.market_name,
+                                        "Some orders could not be canceled (may already be matched)"
+                                    );
+                                }
+                                debug!(
+                                    canceled = resp.canceled.len(),
+                                    not_canceled = resp.not_canceled.len(),
+                                    market = %pos.market_name,
+                                    "Cancel result during tighten"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(error = ?e, market = %pos.market_name, "cancel_all_orders failed during tighten");
+                            }
+                        }
                     }
 
                     let token_id_u256 = match U256::from_str(&pos.token_id) {

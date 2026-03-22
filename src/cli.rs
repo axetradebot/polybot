@@ -37,4 +37,8 @@ pub struct Cli {
     /// Send skip/verbose notifications to Telegram
     #[arg(long)]
     pub verbose: bool,
+
+    /// Run diagnostic mode: resolve current market tokens and test orderbook for each enabled market, then exit.
+    #[arg(long)]
+    pub diagnose: bool,
 }

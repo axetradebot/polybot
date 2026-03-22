@@ -173,11 +173,14 @@ impl HourlyDiscovery {
                 })
                 .unwrap_or(Decimal::new(1, 2));
 
+            // Determine correct UP/DOWN mapping using outcome labels from the tokens array
+            let (up_token_id, down_token_id) = resolve_up_down_tokens(mkt, &token_ids, &event_slug);
+
             result.push(HourlyMarket {
                 event_slug,
                 condition_id,
-                up_token_id: token_ids[0].clone(),
-                down_token_id: token_ids[1].clone(),
+                up_token_id,
+                down_token_id,
                 end_time,
                 accepting_orders: accepting,
                 neg_risk,
@@ -247,4 +250,95 @@ fn parse_clob_token_ids(market: &serde_json::Value) -> Vec<String> {
     }
 
     vec![]
+}
+
+/// Resolve which token ID is UP and which is DOWN by checking the `outcomes`
+/// field or the `tokens[].outcome` labels from the Gamma API.
+/// This prevents the bug where blindly assuming [0]=Up, [1]=Down gets it wrong.
+fn resolve_up_down_tokens(
+    market: &serde_json::Value,
+    fallback_ids: &[String],
+    slug: &str,
+) -> (String, String) {
+    // Strategy 1: Check the `tokens` array which has per-token `outcome` labels
+    if let Some(tokens) = market["tokens"].as_array() {
+        let up = tokens.iter().find(|t| {
+            t["outcome"]
+                .as_str()
+                .map(|o| o.eq_ignore_ascii_case("Up") || o.eq_ignore_ascii_case("Yes"))
+                .unwrap_or(false)
+        });
+        let down = tokens.iter().find(|t| {
+            t["outcome"]
+                .as_str()
+                .map(|o| o.eq_ignore_ascii_case("Down") || o.eq_ignore_ascii_case("No"))
+                .unwrap_or(false)
+        });
+
+        if let (Some(up_tok), Some(down_tok)) = (up, down) {
+            let up_id = up_tok["token_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let down_id = down_tok["token_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !up_id.is_empty() && !down_id.is_empty() {
+                info!(
+                    slug = %slug,
+                    up_token = %up_id,
+                    down_token = %down_id,
+                    up_outcome = up_tok["outcome"].as_str().unwrap_or("?"),
+                    down_outcome = down_tok["outcome"].as_str().unwrap_or("?"),
+                    "Hourly token IDs resolved from outcome labels"
+                );
+                return (up_id, down_id);
+            }
+        }
+    }
+
+    // Strategy 2: Check the `outcomes` field (JSON-encoded string array like "[\"Up\",\"Down\"]")
+    let outcomes: Option<Vec<String>> = market["outcomes"]
+        .as_str()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .or_else(|| {
+            market["outcomes"].as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+        });
+
+    if let Some(ref oc) = outcomes {
+        let up_pos = oc.iter().position(|o| {
+            o.eq_ignore_ascii_case("Up") || o.eq_ignore_ascii_case("Yes")
+        });
+        let down_pos = oc.iter().position(|o| {
+            o.eq_ignore_ascii_case("Down") || o.eq_ignore_ascii_case("No")
+        });
+        if let (Some(u), Some(d)) = (up_pos, down_pos) {
+            if u < fallback_ids.len() && d < fallback_ids.len() {
+                info!(
+                    slug = %slug,
+                    outcomes = ?oc,
+                    up_idx = u,
+                    down_idx = d,
+                    up_token = %fallback_ids[u],
+                    down_token = %fallback_ids[d],
+                    "Hourly token IDs resolved from outcomes field"
+                );
+                return (fallback_ids[u].clone(), fallback_ids[d].clone());
+            }
+        }
+    }
+
+    // Fallback: assume [0]=Up, [1]=Down (may be wrong!)
+    warn!(
+        slug = %slug,
+        token_0 = %fallback_ids[0],
+        token_1 = %fallback_ids[1],
+        "Could not determine Up/Down from outcomes — ASSUMING [0]=Up [1]=Down (may be wrong!)"
+    );
+    (fallback_ids[0].clone(), fallback_ids[1].clone())
 }

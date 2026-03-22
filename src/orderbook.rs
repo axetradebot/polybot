@@ -42,6 +42,8 @@ fn http_client() -> &'static reqwest::Client {
 pub async fn fetch_orderbook(clob_url: &str, token_id: &str) -> Result<OrderbookState> {
     let url = format!("{}/book?token_id={}", clob_url, token_id);
 
+    debug!(url = %url, token_id = %token_id, "Fetching orderbook");
+
     let resp: BookResponse = http_client()
         .get(&url)
         .send()
@@ -51,8 +53,21 @@ pub async fn fetch_orderbook(clob_url: &str, token_id: &str) -> Result<Orderbook
         .await
         .context("failed to parse orderbook JSON")?;
 
+    debug!(
+        token_id = %token_id,
+        ask_count = resp.asks.len(),
+        bid_count = resp.bids.len(),
+        "Orderbook response received"
+    );
+
     if resp.asks.is_empty() {
-        anyhow::bail!("orderbook has no asks");
+        warn!(
+            token_id = %token_id,
+            bid_count = resp.bids.len(),
+            url = %url,
+            "Orderbook has NO ASKS — token may be stale/settled or wrong UP/DOWN mapping"
+        );
+        anyhow::bail!("orderbook has no asks (token_id={}, bids={})", token_id, resp.bids.len());
     }
 
     let best_ask = resp
@@ -109,5 +124,96 @@ pub async fn refresh_best_ask(clob_url: &str, token_id: &str) -> Option<Decimal>
             warn!(error = %e, "Failed to refresh orderbook");
             None
         }
+    }
+}
+
+/// Diagnostic: fetch orderbooks for BOTH tokens and report which has asks.
+/// Use this when the primary token returns empty asks to diagnose token ID swaps.
+pub async fn diagnose_both_tokens(
+    clob_url: &str,
+    up_token: &str,
+    down_token: &str,
+    selected_direction: &str,
+    slug: &str,
+) {
+    let up_url = format!("{}/book?token_id={}", clob_url, up_token);
+    let down_url = format!("{}/book?token_id={}", clob_url, down_token);
+
+    let (up_result, down_result) = tokio::join!(
+        http_client().get(&up_url).send(),
+        http_client().get(&down_url).send(),
+    );
+
+    let up_asks = match up_result {
+        Ok(resp) => match resp.json::<BookResponse>().await {
+            Ok(book) => {
+                let top_ask = book.asks.first().map(|a| a.price.as_str()).unwrap_or("none");
+                let top_bid = book.bids.first().map(|b| b.price.as_str()).unwrap_or("none");
+                warn!(
+                    slug = %slug,
+                    token = "UP",
+                    token_id = %up_token,
+                    asks = book.asks.len(),
+                    bids = book.bids.len(),
+                    top_ask,
+                    top_bid,
+                    "DIAGNOSTIC: UP token orderbook"
+                );
+                book.asks.len()
+            }
+            Err(e) => {
+                warn!(error = %e, token = "UP", "DIAGNOSTIC: failed to parse UP orderbook");
+                0
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, token = "UP", "DIAGNOSTIC: failed to fetch UP orderbook");
+            0
+        }
+    };
+
+    let down_asks = match down_result {
+        Ok(resp) => match resp.json::<BookResponse>().await {
+            Ok(book) => {
+                let top_ask = book.asks.first().map(|a| a.price.as_str()).unwrap_or("none");
+                let top_bid = book.bids.first().map(|b| b.price.as_str()).unwrap_or("none");
+                warn!(
+                    slug = %slug,
+                    token = "DOWN",
+                    token_id = %down_token,
+                    asks = book.asks.len(),
+                    bids = book.bids.len(),
+                    top_ask,
+                    top_bid,
+                    "DIAGNOSTIC: DOWN token orderbook"
+                );
+                book.asks.len()
+            }
+            Err(e) => {
+                warn!(error = %e, token = "DOWN", "DIAGNOSTIC: failed to parse DOWN orderbook");
+                0
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, token = "DOWN", "DIAGNOSTIC: failed to fetch DOWN orderbook");
+            0
+        }
+    };
+
+    if up_asks == 0 && down_asks == 0 {
+        warn!(
+            slug = %slug,
+            "DIAGNOSTIC: BOTH tokens have empty asks! Market may be settled or not yet live."
+        );
+    } else if (selected_direction == "UP" && up_asks == 0 && down_asks > 0)
+        || (selected_direction == "DOWN" && down_asks == 0 && up_asks > 0)
+    {
+        warn!(
+            slug = %slug,
+            selected_direction,
+            up_asks,
+            down_asks,
+            "DIAGNOSTIC: TOKEN IDS MAY BE SWAPPED! The OTHER token has asks but selected one doesn't."
+        );
     }
 }
