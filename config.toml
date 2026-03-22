@@ -37,7 +37,7 @@ max_orders_per_cycle = 3
 # ============================================================
 
 [[markets]]
-name = "BTC 5-min"
+name = "BTC 5-min"1
 asset = "BTC"
 mode = "live"
 enabled = true
