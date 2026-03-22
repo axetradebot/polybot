@@ -61,13 +61,20 @@ pub async fn fetch_orderbook(clob_url: &str, token_id: &str) -> Result<Orderbook
     );
 
     if resp.asks.is_empty() {
+        let top_bids: Vec<String> = resp.bids.iter().take(3)
+            .map(|b| format!("{}@{}", b.size, b.price))
+            .collect();
         warn!(
             token_id = %token_id,
             bid_count = resp.bids.len(),
+            top_bids = ?top_bids,
             url = %url,
             "Orderbook has NO ASKS — token may be stale/settled or wrong UP/DOWN mapping"
         );
-        anyhow::bail!("orderbook has no asks (token_id={}, bids={})", token_id, resp.bids.len());
+        anyhow::bail!(
+            "orderbook has no asks (token_id={}, bids={}, top_bids={:?})",
+            token_id, resp.bids.len(), top_bids
+        );
     }
 
     let best_ask = resp

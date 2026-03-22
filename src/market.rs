@@ -62,15 +62,28 @@ pub async fn verify_tokens_from_clob(
     let resp = match http_client().get(&url).send().await {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, slug = %slug, "CLOB market verification failed (HTTP)");
+            warn!(error = %e, slug = %slug, url = %url, "CLOB market verification failed (HTTP)");
             return None;
         }
     };
 
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        warn!(
+            slug = %slug,
+            status = %status,
+            url = %url,
+            body_preview = %&body[..body.len().min(200)],
+            "CLOB market verification: non-200 response"
+        );
+        return None;
+    }
+
     let market: ClobMarketResponse = match resp.json().await {
         Ok(m) => m,
         Err(e) => {
-            warn!(error = %e, slug = %slug, "CLOB market verification failed (parse)");
+            warn!(error = %e, slug = %slug, url = %url, "CLOB market verification failed (parse)");
             return None;
         }
     };

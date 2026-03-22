@@ -290,15 +290,33 @@ pub async fn scan_all_markets(
                     &slug,
                 ).await;
 
-                info!(market = %mkt.name, error = %e, "Skip: orderbook fetch failed");
-                skip_reasons.insert(mkt.name.clone(), format!("Orderbook fetch failed: {e}"));
+                let other_info = match &other_result {
+                    Ok(other_ob) => format!(
+                        " OTHER({other_label}): ask=${:.2} bid=${:.2}",
+                        other_ob.best_ask, other_ob.best_bid
+                    ),
+                    Err(_) => " OTHER: fetch failed".to_string(),
+                };
+                let swap_hint = match &other_result {
+                    Ok(other_ob) if other_ob.best_ask > Decimal::ZERO
+                        && other_ob.best_ask < Decimal::ONE
+                        && other_ob.best_ask > Decimal::new(30, 2) =>
+                    {
+                        " ⚠️ TOKENS MAY BE SWAPPED (other token has reasonable asks)"
+                    }
+                    _ => "",
+                };
+                let detail = format!("{e}{other_info}{swap_hint}");
+
+                info!(market = %mkt.name, error = %e, other_info = %other_info, "Skip: orderbook fetch failed");
+                skip_reasons.insert(mkt.name.clone(), format!("Orderbook fetch failed: {detail}"));
                 evaluations.push(ScanEvaluation {
                     market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
                     direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
                     open_price: Some(open_price), current_price: Some(current_price),
                     best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
                     suggested_entry: None, max_entry: None, edge_score: None,
-                    result: "SKIP_ORDERBOOK".into(), detail: Some(format!("{e}")),
+                    result: "SKIP_ORDERBOOK".into(), detail: Some(detail),
                 });
                 continue;
             }
