@@ -76,11 +76,15 @@ async fn main() -> Result<()> {
     let enabled = config.enabled_markets();
     let symbols = config.binance_symbols();
 
+    let boot_utc = Utc::now();
+    let boot_epoch = market::epoch_secs();
     info!(
         global_mode = %config.mode,
         bankroll = %config.bankroll.total,
         symbols = ?symbols,
-        "Multi-market scanner bot starting"
+        system_utc = %boot_utc.format("%Y-%m-%d %H:%M:%S%.3f UTC"),
+        system_epoch = boot_epoch,
+        "Multi-market scanner bot starting (clock source: OS SystemTime)"
     );
     for mkt in &enabled {
         let effective = if config.is_market_paper(&mkt.name) { "paper" } else { "live" };
@@ -391,6 +395,7 @@ async fn run_scanner_loop(
             use polymarket_client_sdk::clob::types::Side;
             let client = client.as_ref().unwrap();
             let signer = signer.as_ref().unwrap();
+            let t0 = std::time::Instant::now();
             let order = client
                 .limit_order()
                 .token_id($token_id_u256)
@@ -399,15 +404,43 @@ async fn run_scanner_loop(
                 .side(Side::Buy)
                 .build()
                 .await;
+            let build_ms = t0.elapsed().as_millis();
             match order {
-                Ok(o) => match client.sign(signer, o).await {
-                    Ok(s) => match client.post_order(s).await {
-                        Ok(r) => Ok(r.order_id.clone()),
-                        Err(e) => Err(anyhow::anyhow!("post: {e}")),
-                    },
-                    Err(e) => Err(anyhow::anyhow!("sign: {e}")),
-                },
-                Err(e) => Err(anyhow::anyhow!("build: {e}")),
+                Ok(o) => {
+                    let t1 = std::time::Instant::now();
+                    match client.sign(signer, o).await {
+                        Ok(s) => {
+                            let sign_ms = t1.elapsed().as_millis();
+                            let t2 = std::time::Instant::now();
+                            match client.post_order(s).await {
+                                Ok(r) => {
+                                    let post_ms = t2.elapsed().as_millis();
+                                    info!(
+                                        build_ms = build_ms,
+                                        sign_ms = sign_ms,
+                                        post_ms = post_ms,
+                                        total_ms = t0.elapsed().as_millis(),
+                                        order_id = %r.order_id,
+                                        "CLOB order pipeline timing"
+                                    );
+                                    Ok(r.order_id.clone())
+                                }
+                                Err(e) => {
+                                    warn!(build_ms = build_ms, sign_ms = sign_ms, post_ms = t2.elapsed().as_millis(), "CLOB post failed");
+                                    Err(anyhow::anyhow!("post: {e}"))
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(build_ms = build_ms, sign_ms = t1.elapsed().as_millis(), "CLOB sign failed");
+                            Err(anyhow::anyhow!("sign: {e}"))
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(build_ms = build_ms, "CLOB order build failed");
+                    Err(anyhow::anyhow!("build: {e}"))
+                }
             }
         }};
     }
@@ -1201,8 +1234,26 @@ async fn run_scanner_loop(
                         }
                     };
 
+                    let order_submit_utc = Utc::now();
+                    let order_submit_epoch = market::epoch_secs();
+                    let window_end_epoch = opp.window_ts + opp.window_seconds;
+                    let secs_before_close = window_end_epoch.saturating_sub(order_submit_epoch);
+                    info!(
+                        market = %opp.market_name,
+                        utc = %order_submit_utc.format("%H:%M:%S%.3f"),
+                        epoch = order_submit_epoch,
+                        window_end = window_end_epoch,
+                        secs_before_close = secs_before_close,
+                        price = %opp.suggested_entry,
+                        contracts = %opp.contracts,
+                        direction = %opp.direction,
+                        "SUBMITTING order to CLOB"
+                    );
+
                     match post_order!(opp.suggested_entry, opp.contracts, token_id_u256) {
                         Ok(oid) => {
+                            let posted_epoch = market::epoch_secs();
+                            let secs_after_post = window_end_epoch.saturating_sub(posted_epoch);
                             let db_id = db.save_position(
                                 &opp.market_name, &opp.asset, opp.window_seconds, opp.window_ts,
                                 &opp.slug, &opp.direction.to_string(), &opp.token_id,
@@ -1259,7 +1310,9 @@ async fn run_scanner_loop(
                                 edge = opp.edge_score,
                                 order_type,
                                 pos_id,
-                                "Live order posted"
+                                utc_posted = %Utc::now().format("%H:%M:%S%.3f"),
+                                secs_before_close = secs_after_post,
+                                "ORDER CONFIRMED by CLOB"
                             );
                         }
                         Err(e) => {
@@ -1267,6 +1320,8 @@ async fn run_scanner_loop(
                                 error = ?e,
                                 market = %opp.market_name,
                                 price = %opp.suggested_entry,
+                                utc = %Utc::now().format("%H:%M:%S%.3f"),
+                                secs_before_close = window_end_epoch.saturating_sub(market::epoch_secs()),
                                 "Failed to post order"
                             );
                         }
