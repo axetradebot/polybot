@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
-use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
@@ -33,103 +32,11 @@ pub fn next_window_ts(window_seconds: u64) -> u64 {
     current_ts + window_seconds
 }
 
-#[derive(Deserialize)]
-struct ClobMarketResponse {
-    #[serde(default)]
-    tokens: Vec<ClobToken>,
-}
-
-#[derive(Deserialize)]
-struct ClobToken {
-    token_id: String,
-    outcome: String,
-}
-
-static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-
-fn http_client() -> &'static reqwest::Client {
-    HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .expect("failed to build HTTP client")
-    })
-}
-
-/// Fetch the authoritative token-to-outcome mapping from the CLOB API.
-/// The CLOB `markets/{condition_id}` endpoint returns `tokens[].{token_id, outcome}`
-/// which pairs each token with its outcome label directly — no index alignment guessing.
-pub async fn verify_tokens_from_clob(
-    clob_url: &str,
-    condition_id: &str,
-    slug: &str,
-) -> Option<(String, String)> {
-    let url = format!("{}/markets/{}", clob_url, condition_id);
-    let resp = match http_client().get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(error = %e, slug = %slug, url = %url, "CLOB market verification failed (HTTP)");
-            return None;
-        }
-    };
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        warn!(
-            slug = %slug,
-            status = %status,
-            url = %url,
-            body_preview = %&body[..body.len().min(200)],
-            "CLOB market verification: non-200 response"
-        );
-        return None;
-    }
-
-    let market: ClobMarketResponse = match resp.json().await {
-        Ok(m) => m,
-        Err(e) => {
-            warn!(error = %e, slug = %slug, url = %url, "CLOB market verification failed (parse)");
-            return None;
-        }
-    };
-
-    let up_token = market.tokens.iter().find(|t| {
-        let o = t.outcome.to_lowercase();
-        o == "up" || o == "yes"
-    });
-    let down_token = market.tokens.iter().find(|t| {
-        let o = t.outcome.to_lowercase();
-        o == "down" || o == "no"
-    });
-
-    match (up_token, down_token) {
-        (Some(u), Some(d)) => {
-            info!(
-                slug = %slug,
-                clob_up_token = %u.token_id,
-                clob_up_outcome = %u.outcome,
-                clob_down_token = %d.token_id,
-                clob_down_outcome = %d.outcome,
-                "CLOB verification: authoritative token mapping"
-            );
-            Some((u.token_id.clone(), d.token_id.clone()))
-        }
-        _ => {
-            warn!(
-                slug = %slug,
-                token_count = market.tokens.len(),
-                outcomes = ?market.tokens.iter().map(|t| &t.outcome).collect::<Vec<_>>(),
-                "CLOB verification: could not find Up/Down outcomes"
-            );
-            None
-        }
-    }
-}
-
-/// Resolve market metadata from Gamma API using the market slug,
-/// then verify token mapping from the CLOB API as the authoritative source.
-pub async fn resolve_market(slug: &str, clob_url: &str) -> Result<MarketInfo> {
+/// Resolve market metadata from Gamma API using the market slug.
+/// Token IDs are stored as (token_a, token_b) without attempting to label
+/// which is UP/DOWN — the scanner determines that at runtime via orderbook
+/// mid-price comparison.
+pub async fn resolve_market(slug: &str, _clob_url: &str) -> Result<MarketInfo> {
     use polymarket_client_sdk::gamma::types::request::MarketBySlugRequest;
     use polymarket_client_sdk::gamma::Client as GammaClient;
 
@@ -160,37 +67,18 @@ pub async fn resolve_market(slug: &str, clob_url: &str) -> Result<MarketInfo> {
         .order_price_min_tick_size
         .unwrap_or_else(|| Decimal::new(1, 2));
 
-    // Primary: use the CLOB API for authoritative token-outcome mapping.
-    // The CLOB response pairs each token_id with its outcome label directly.
-    let (up_token_id, down_token_id) = if !condition_id.is_empty() {
-        if let Some((clob_up, clob_down)) =
-            verify_tokens_from_clob(clob_url, &condition_id, slug).await
-        {
-            (clob_up, clob_down)
-        } else {
-            warn!(slug = %slug, "CLOB verification unavailable, falling back to Gamma outcomes");
-            let (up_idx, down_idx) = determine_token_indices(market.outcomes.as_ref());
-            (token_ids[up_idx].to_string(), token_ids[down_idx].to_string())
-        }
-    } else {
-        warn!(slug = %slug, "No condition_id from Gamma, using Gamma outcomes for token mapping");
-        let (up_idx, down_idx) = determine_token_indices(market.outcomes.as_ref());
-        (token_ids[up_idx].to_string(), token_ids[down_idx].to_string())
-    };
-
     info!(
         slug = %slug,
-        gamma_outcomes = ?market.outcomes,
-        up_token = %up_token_id,
-        down_token = %down_token_id,
+        token_a = %token_ids[0],
+        token_b = %token_ids[1],
         accepting = accepting,
-        "Resolved market (CLOB-verified token mapping)"
+        "Resolved market tokens (price-based detection at scan time)"
     );
 
     let info = MarketInfo {
         condition_id,
-        up_token_id,
-        down_token_id,
+        up_token_id: token_ids[0].to_string(),
+        down_token_id: token_ids[1].to_string(),
         slug: slug.to_string(),
         accepting_orders: accepting,
         neg_risk,
@@ -198,34 +86,6 @@ pub async fn resolve_market(slug: &str, clob_url: &str) -> Result<MarketInfo> {
     };
 
     Ok(info)
-}
-
-/// Determine the correct array indices for UP and DOWN tokens from the outcomes list.
-/// Returns (up_index, down_index). Falls back to (0, 1) if outcomes are missing or unrecognized.
-fn determine_token_indices(outcomes: Option<&Vec<String>>) -> (usize, usize) {
-    if let Some(outcomes) = outcomes {
-        let up_pos = outcomes.iter().position(|o| {
-            let lower = o.to_lowercase();
-            lower == "up" || lower == "yes"
-        });
-        let down_pos = outcomes.iter().position(|o| {
-            let lower = o.to_lowercase();
-            lower == "down" || lower == "no"
-        });
-        match (up_pos, down_pos) {
-            (Some(u), Some(d)) => {
-                info!(up_idx = u, down_idx = d, outcomes = ?outcomes, "Token index mapping from outcomes");
-                (u, d)
-            }
-            _ => {
-                warn!(outcomes = ?outcomes, "Could not match Up/Down in outcomes, falling back to [0]=Up [1]=Down");
-                (0, 1)
-            }
-        }
-    } else {
-        warn!("No outcomes field from Gamma API — assuming [0]=Up [1]=Down");
-        (0, 1)
-    }
 }
 
 /// Resolve market with retries for when the market hasn't been created yet.

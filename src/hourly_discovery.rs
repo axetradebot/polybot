@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::market::{epoch_secs, verify_tokens_from_clob};
+use crate::market::epoch_secs;
 use crate::types::MarketInfo;
 
 #[derive(Debug, Clone)]
@@ -44,6 +44,7 @@ pub struct HourlyDiscovery {
     cache: Arc<RwLock<Option<CacheEntry>>>,
     client: reqwest::Client,
     cache_duration: std::time::Duration,
+    #[allow(dead_code)]
     clob_url: String,
 }
 
@@ -175,20 +176,9 @@ impl HourlyDiscovery {
                 })
                 .unwrap_or(Decimal::new(1, 2));
 
-            // Primary: use CLOB API for authoritative token-outcome mapping.
-            // Fallback: resolve from Gamma outcomes/tokens array.
-            let (up_token_id, down_token_id) = if !condition_id.is_empty() {
-                if let Some((clob_up, clob_down)) =
-                    verify_tokens_from_clob(&self.clob_url, &condition_id, &event_slug).await
-                {
-                    (clob_up, clob_down)
-                } else {
-                    warn!(slug = %event_slug, "CLOB verification unavailable for hourly market, using Gamma fallback");
-                    resolve_up_down_tokens(mkt, &token_ids, &event_slug)
-                }
-            } else {
-                resolve_up_down_tokens(mkt, &token_ids, &event_slug)
-            };
+            // Store both token IDs without labeling UP/DOWN — the scanner
+            // determines that at runtime via orderbook mid-price comparison.
+            let (up_token_id, down_token_id) = (token_ids[0].clone(), token_ids[1].clone());
 
             result.push(HourlyMarket {
                 event_slug,
@@ -266,93 +256,3 @@ fn parse_clob_token_ids(market: &serde_json::Value) -> Vec<String> {
     vec![]
 }
 
-/// Resolve which token ID is UP and which is DOWN by checking the `outcomes`
-/// field or the `tokens[].outcome` labels from the Gamma API.
-/// This prevents the bug where blindly assuming [0]=Up, [1]=Down gets it wrong.
-fn resolve_up_down_tokens(
-    market: &serde_json::Value,
-    fallback_ids: &[String],
-    slug: &str,
-) -> (String, String) {
-    // Strategy 1: Check the `tokens` array which has per-token `outcome` labels
-    if let Some(tokens) = market["tokens"].as_array() {
-        let up = tokens.iter().find(|t| {
-            t["outcome"]
-                .as_str()
-                .map(|o| o.eq_ignore_ascii_case("Up") || o.eq_ignore_ascii_case("Yes"))
-                .unwrap_or(false)
-        });
-        let down = tokens.iter().find(|t| {
-            t["outcome"]
-                .as_str()
-                .map(|o| o.eq_ignore_ascii_case("Down") || o.eq_ignore_ascii_case("No"))
-                .unwrap_or(false)
-        });
-
-        if let (Some(up_tok), Some(down_tok)) = (up, down) {
-            let up_id = up_tok["token_id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            let down_id = down_tok["token_id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            if !up_id.is_empty() && !down_id.is_empty() {
-                info!(
-                    slug = %slug,
-                    up_token = %up_id,
-                    down_token = %down_id,
-                    up_outcome = up_tok["outcome"].as_str().unwrap_or("?"),
-                    down_outcome = down_tok["outcome"].as_str().unwrap_or("?"),
-                    "Hourly token IDs resolved from outcome labels"
-                );
-                return (up_id, down_id);
-            }
-        }
-    }
-
-    // Strategy 2: Check the `outcomes` field (JSON-encoded string array like "[\"Up\",\"Down\"]")
-    let outcomes: Option<Vec<String>> = market["outcomes"]
-        .as_str()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .or_else(|| {
-            market["outcomes"].as_array().map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-        });
-
-    if let Some(ref oc) = outcomes {
-        let up_pos = oc.iter().position(|o| {
-            o.eq_ignore_ascii_case("Up") || o.eq_ignore_ascii_case("Yes")
-        });
-        let down_pos = oc.iter().position(|o| {
-            o.eq_ignore_ascii_case("Down") || o.eq_ignore_ascii_case("No")
-        });
-        if let (Some(u), Some(d)) = (up_pos, down_pos) {
-            if u < fallback_ids.len() && d < fallback_ids.len() {
-                info!(
-                    slug = %slug,
-                    outcomes = ?oc,
-                    up_idx = u,
-                    down_idx = d,
-                    up_token = %fallback_ids[u],
-                    down_token = %fallback_ids[d],
-                    "Hourly token IDs resolved from outcomes field"
-                );
-                return (fallback_ids[u].clone(), fallback_ids[d].clone());
-            }
-        }
-    }
-
-    // Fallback: assume [0]=Up, [1]=Down (may be wrong!)
-    warn!(
-        slug = %slug,
-        token_0 = %fallback_ids[0],
-        token_1 = %fallback_ids[1],
-        "Could not determine Up/Down from outcomes — ASSUMING [0]=Up [1]=Down (may be wrong!)"
-    );
-    (fallback_ids[0].clone(), fallback_ids[1].clone())
-}

@@ -243,65 +243,34 @@ pub async fn scan_all_markets(
             }
         };
 
-        let token_id = match direction {
-            Direction::Up => market_info.up_token_id.clone(),
-            Direction::Down => market_info.down_token_id.clone(),
-        };
-        let other_token_id = match direction {
-            Direction::Up => market_info.down_token_id.clone(),
-            Direction::Down => market_info.up_token_id.clone(),
-        };
-
-        // Fetch BOTH tokens' orderbooks for full visibility
+        // ── Price-based token detection ──
+        // Fetch BOTH tokens' orderbooks (lenient — need both for price comparison).
+        // The token with the higher mid-price is the one the market thinks will win.
+        // This replaces string-based "Up"/"Down"/"Yes"/"No" label matching entirely.
         let clob = &config.infra.polymarket_clob_url;
-        let (our_result, other_result) = tokio::join!(
-            orderbook::fetch_orderbook(clob, &token_id),
-            orderbook::fetch_orderbook_lenient(clob, &other_token_id),
+        let token_a_id = &market_info.up_token_id;
+        let token_b_id = &market_info.down_token_id;
+        let (ob_a, ob_b) = tokio::join!(
+            orderbook::fetch_orderbook_lenient(clob, token_a_id),
+            orderbook::fetch_orderbook_lenient(clob, token_b_id),
         );
 
-        // Log both tokens so we can always see the full picture
-        let other_label = match direction { Direction::Up => "DOWN", Direction::Down => "UP" };
-        let our_label = match direction { Direction::Up => "UP", Direction::Down => "DOWN" };
-        if let Ok(ref other_ob) = other_result {
-            info!(
-                market = %mkt.name,
-                slug = %slug,
-                direction = %direction,
-                our_token_label = our_label,
-                other_token_label = other_label,
-                our_token_id = %token_id,
-                other_token_id = %other_token_id,
-                our_best_ask = %our_result.as_ref().map(|o| o.best_ask).unwrap_or(Decimal::ZERO),
-                our_best_bid = %our_result.as_ref().map(|o| o.best_bid).unwrap_or(Decimal::ZERO),
-                other_best_ask = %other_ob.best_ask,
-                other_best_bid = %other_ob.best_bid,
-                "Orderbook comparison: BOTH tokens"
-            );
-        }
-
-        // Settled market detection: if BOTH tokens have best_ask > $0.95,
-        // the market is already resolved — skip immediately.
+        // Settled market detection: if BOTH tokens have best_ask > $0.95, skip.
         let settled_threshold = Decimal::new(95, 2);
-        if let (Ok(ref our_ob), Ok(ref other_ob)) = (&our_result, &other_result) {
-            if our_ob.best_ask > settled_threshold && other_ob.best_ask > settled_threshold {
+        if let (Ok(ref a), Ok(ref b)) = (&ob_a, &ob_b) {
+            if a.best_ask > settled_threshold && b.best_ask > settled_threshold {
                 let detail = format!(
-                    "Market settled: both asks > $0.95 (ours={}, other={})",
-                    our_ob.best_ask, other_ob.best_ask
+                    "Market settled: both asks > $0.95 (A={}, B={})",
+                    a.best_ask, b.best_ask
                 );
-                warn!(
-                    market = %mkt.name,
-                    slug = %slug,
-                    our_ask = %our_ob.best_ask,
-                    other_ask = %other_ob.best_ask,
-                    "Skip: market appears SETTLED"
-                );
+                warn!(market = %mkt.name, slug = %slug, ask_a = %a.best_ask, ask_b = %b.best_ask, "Skip: market appears SETTLED");
                 skip_reasons.insert(mkt.name.clone(), detail.clone());
                 evaluations.push(ScanEvaluation {
                     market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
                     direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
                     open_price: Some(open_price), current_price: Some(current_price),
-                    best_ask: Some(our_ob.best_ask), best_bid: Some(our_ob.best_bid),
-                    spread: Some(our_ob.spread), depth_at_ask: Some(our_ob.depth_at_ask),
+                    best_ask: Some(a.best_ask), best_bid: Some(a.best_bid),
+                    spread: Some(a.spread), depth_at_ask: Some(a.depth_at_ask),
                     suggested_entry: None, max_entry: None, edge_score: None,
                     result: "SKIP_SETTLED".into(), detail: Some(detail),
                 });
@@ -309,37 +278,49 @@ pub async fn scan_all_markets(
             }
         }
 
-        let ob = match our_result {
-            Ok(ob) => ob,
-            Err(e) => {
-                orderbook::diagnose_both_tokens(
-                    clob,
-                    &market_info.up_token_id,
-                    &market_info.down_token_id,
-                    &direction.to_string(),
-                    &slug,
-                ).await;
+        // Determine which token to buy using mid-price comparison.
+        // Higher mid-price = the token the market believes will win.
+        // We always buy the higher-priced token (it matches our directional signal).
+        let (token_id, _other_token_id, our_ob, other_ob) = {
+            let mid_a = ob_a.as_ref().ok().map(|a| (a.best_bid + a.best_ask) / Decimal::from(2));
+            let mid_b = ob_b.as_ref().ok().map(|b| (b.best_bid + b.best_ask) / Decimal::from(2));
 
-                let other_info = match &other_result {
-                    Ok(other_ob) => format!(
-                        " OTHER({other_label}): ask=${:.2} bid=${:.2}",
-                        other_ob.best_ask, other_ob.best_bid
+            let swap = match (mid_a, mid_b) {
+                (Some(ma), Some(mb)) => {
+                    info!(
+                        market = %mkt.name,
+                        slug = %slug,
+                        direction = %direction,
+                        mid_a = %ma,
+                        mid_b = %mb,
+                        selected = if ma >= mb { "A" } else { "B" },
+                        "Price-based token detection"
+                    );
+                    ma < mb
+                }
+                _ => false,
+            };
+
+            if swap {
+                (token_b_id.clone(), token_a_id.clone(), ob_b, ob_a)
+            } else {
+                (token_a_id.clone(), token_b_id.clone(), ob_a, ob_b)
+            }
+        };
+
+        // Validate our token has real asks (lenient fetch defaults best_ask to $1.00 when empty)
+        let ob = match our_ob {
+            Ok(ob) if ob.best_ask < Decimal::ONE => ob,
+            Ok(_) | Err(_) => {
+                let detail = match &other_ob {
+                    Ok(other) => format!(
+                        "No asks on selected token; other: ask=${:.2} bid=${:.2}",
+                        other.best_ask, other.best_bid
                     ),
-                    Err(_) => " OTHER: fetch failed".to_string(),
+                    Err(_) => "Both orderbook fetches failed".to_string(),
                 };
-                let swap_hint = match &other_result {
-                    Ok(other_ob) if other_ob.best_ask > Decimal::ZERO
-                        && other_ob.best_ask < Decimal::ONE
-                        && other_ob.best_ask > Decimal::new(30, 2) =>
-                    {
-                        " ⚠️ TOKENS MAY BE SWAPPED (other token has reasonable asks)"
-                    }
-                    _ => "",
-                };
-                let detail = format!("{e}{other_info}{swap_hint}");
-
-                info!(market = %mkt.name, error = %e, other_info = %other_info, "Skip: orderbook fetch failed");
-                skip_reasons.insert(mkt.name.clone(), format!("Orderbook fetch failed: {detail}"));
+                info!(market = %mkt.name, slug = %slug, "Skip: selected token has no asks");
+                skip_reasons.insert(mkt.name.clone(), format!("Orderbook: {detail}"));
                 evaluations.push(ScanEvaluation {
                     market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
                     direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
@@ -352,25 +333,15 @@ pub async fn scan_all_markets(
             }
         };
 
-        // SANITY CHECK: If our token's best_ask is below $0.30, the market strongly
-        // disagrees with our signal. This means either:
-        //   a) The token mapping is inverted (we're looking at the wrong token), or
-        //   b) Our delta signal is catastrophically wrong.
-        // Either way, DO NOT trade.
+        // Sanity: if our token's best_ask is below $0.30, the market strongly
+        // disagrees with our signal — DO NOT trade.
         let sanity_floor: Decimal = SANITY_MIN_ASK.parse().unwrap();
         if ob.best_ask < sanity_floor {
             let detail = format!(
-                "SANITY FAIL: {direction} signal but {our_label} token ask=${:.2} < ${sanity_floor} — market disagrees, skipping",
+                "SANITY FAIL: {direction} signal but selected token ask=${:.2} < ${sanity_floor}",
                 ob.best_ask
             );
-            warn!(
-                market = %mkt.name,
-                slug = %slug,
-                direction = %direction,
-                best_ask = %ob.best_ask,
-                delta = delta_f64,
-                "{detail}"
-            );
+            warn!(market = %mkt.name, slug = %slug, direction = %direction, best_ask = %ob.best_ask, delta = delta_f64, "{detail}");
             skip_reasons.insert(mkt.name.clone(), detail.clone());
             evaluations.push(ScanEvaluation {
                 market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
