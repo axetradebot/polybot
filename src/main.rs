@@ -877,28 +877,40 @@ async fn run_scanner_loop(
                         token_cache.remove(&old_slug);
                     }
                     hourly_discovery.invalidate_cache().await;
-                    match hourly_discovery.get_current_market(&mkt.slug_prefix).await {
-                        Ok(Some(hm)) => {
+                    match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        hourly_discovery.get_current_market(&mkt.slug_prefix),
+                    ).await {
+                        Ok(Ok(Some(hm))) => {
                             info!(market = %mkt.name, slug = %hm.event_slug, end_time = hm.end_time, "Hourly market resolved");
                             token_cache.insert(hm.event_slug.clone(), hm.to_market_info());
                             hourly_slug_map.insert(mkt.name.clone(), hm.event_slug);
                         }
-                        Ok(None) => {
+                        Ok(Ok(None)) => {
                             warn!(market = %mkt.name, "No active hourly market found (will retry)");
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             warn!(market = %mkt.name, error = %e, "Hourly market discovery failed (will retry)");
+                        }
+                        Err(_) => {
+                            warn!(market = %mkt.name, "Hourly market discovery timed out (will retry)");
                         }
                     }
                 } else {
                     let slug = market::build_slug(&mkt.slug_prefix, window_ts);
                     let slug_clone = slug.clone();
-                    match market::resolve_market(&slug_clone, &clob_url).await {
-                        Ok(info) => {
+                    match tokio::time::timeout(
+                        Duration::from_secs(8),
+                        market::resolve_market(&slug_clone, &clob_url),
+                    ).await {
+                        Ok(Ok(info)) => {
                             token_cache.insert(slug, info);
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             warn!(market = %mkt.name, slug = %slug_clone, error = %e, "Token resolve failed (will retry)");
+                        }
+                        Err(_) => {
+                            warn!(market = %mkt.name, slug = %slug_clone, "Token resolve timed out on window start (will retry)");
                         }
                     }
                 }
@@ -930,9 +942,13 @@ async fn run_scanner_loop(
                     let has_token = has_slug
                         && token_cache.contains_key(hourly_slug_map.get(&mkt.name).unwrap());
                     let mkt_cutoff = mkt.effective_entry_cutoff(entry_cutoff_s);
-                    if !has_token && secs_rem > mkt_cutoff {
-                        match hourly_discovery.get_current_market(&mkt.slug_prefix).await {
-                            Ok(Some(hm)) => {
+                    if !has_token && secs_rem > mkt_cutoff && heartbeat_counter % 30 == 0 {
+                        hourly_discovery.invalidate_cache().await;
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            hourly_discovery.get_current_market(&mkt.slug_prefix),
+                        ).await {
+                            Ok(Ok(Some(hm))) => {
                                 info!(market = %mkt.name, slug = %hm.event_slug, "Hourly market resolved on retry");
                                 token_cache.insert(hm.event_slug.clone(), hm.to_market_info());
                                 hourly_slug_map.insert(mkt.name.clone(), hm.event_slug);
@@ -943,12 +959,18 @@ async fn run_scanner_loop(
                 } else {
                     let slug = market::build_slug(&mkt.slug_prefix, window_ts);
                     if !token_cache.contains_key(&slug) && secs_rem > entry_cutoff_s {
-                        match market::resolve_market(&slug, &clob_url).await {
-                            Ok(info) => {
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            market::resolve_market(&slug, &clob_url),
+                        ).await {
+                            Ok(Ok(info)) => {
                                 info!(market = %mkt.name, slug = %slug, "Token resolved on retry");
                                 token_cache.insert(slug, info);
                             }
-                            Err(_) => {}
+                            Ok(Err(_)) => {}
+                            Err(_) => {
+                                debug!(market = %mkt.name, slug = %slug, "Token retry timed out");
+                            }
                         }
                     }
                 }
@@ -965,16 +987,69 @@ async fn run_scanner_loop(
         price_feeds.prune_old_window_opens(now_ts, 3600).await;
         positions.prune_old(7200).await;
 
-        // Clean expired token cache entries (preserve active hourly slugs)
-        token_cache.retain(|slug, _| {
-            if hourly_slug_map.values().any(|s| s == slug) {
-                return true;
+        // Clean expired token cache — only keep current + next window slugs
+        {
+            let mut active_slugs: Vec<String> = Vec::new();
+            for mkt in config.enabled_markets() {
+                if !mkt.is_hourly() {
+                    let (wts, _) = market::current_window(mkt.window_seconds);
+                    active_slugs.push(market::build_slug(&mkt.slug_prefix, wts));
+                    active_slugs.push(market::build_slug(&mkt.slug_prefix, wts + mkt.window_seconds));
+                }
             }
-            slug.rsplit_once('-')
-                .and_then(|(_, ts)| ts.parse::<u64>().ok())
-                .map(|ts| now_ts.saturating_sub(ts) < 3600)
-                .unwrap_or(false)
-        });
+            let before = token_cache.len();
+            token_cache.retain(|slug, _| {
+                hourly_slug_map.values().any(|s| s == slug) || active_slugs.contains(slug)
+            });
+            let evicted = before.saturating_sub(token_cache.len());
+            if evicted > 0 {
+                debug!(evicted, remaining = token_cache.len(), "Pruned stale token cache entries");
+            }
+        }
+
+        // ── Pre-resolve NEXT window tokens (avoid slow resolution during entry) ──
+        for mkt in config.enabled_markets() {
+            let (_, secs_rem) = market::current_window(mkt.window_seconds);
+            let pre_resolve_at = (mkt.entry_start_s * 3).max(60);
+            if secs_rem <= pre_resolve_at {
+                if mkt.is_hourly() {
+                    let has_token = hourly_slug_map.get(&mkt.name)
+                        .map(|s| token_cache.contains_key(s))
+                        .unwrap_or(false);
+                    if !has_token {
+                        hourly_discovery.invalidate_cache().await;
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            hourly_discovery.get_current_market(&mkt.slug_prefix),
+                        ).await {
+                            Ok(Ok(Some(hm))) => {
+                                if !token_cache.contains_key(&hm.event_slug) {
+                                    info!(market = %mkt.name, slug = %hm.event_slug, secs_until_close = secs_rem, "Pre-cached hourly market tokens");
+                                    token_cache.insert(hm.event_slug.clone(), hm.to_market_info());
+                                    hourly_slug_map.insert(mkt.name.clone(), hm.event_slug);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                } else {
+                    let next_ts = market::next_window_ts(mkt.window_seconds);
+                    let next_slug = market::build_slug(&mkt.slug_prefix, next_ts);
+                    if !token_cache.contains_key(&next_slug) {
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            market::resolve_market(&next_slug, &clob_url),
+                        ).await {
+                            Ok(Ok(info)) => {
+                                info!(market = %mkt.name, slug = %next_slug, secs_until_next = secs_rem, "Pre-cached NEXT window tokens");
+                                token_cache.insert(next_slug, info);
+                            }
+                            Ok(Err(_)) | Err(_) => {}
+                        }
+                    }
+                }
+            }
+        }
 
         // ── Phase 2: Run edge scanner ──
         let scan_result =

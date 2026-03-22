@@ -27,6 +27,12 @@ pub fn build_slug(prefix: &str, window_ts: u64) -> String {
     format!("{}-{}", prefix, window_ts)
 }
 
+/// Compute the next window's start timestamp for pre-resolution.
+pub fn next_window_ts(window_seconds: u64) -> u64 {
+    let (current_ts, _) = current_window(window_seconds);
+    current_ts + window_seconds
+}
+
 #[derive(Deserialize)]
 struct ClobMarketResponse {
     #[serde(default)]

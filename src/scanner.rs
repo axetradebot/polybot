@@ -279,6 +279,36 @@ pub async fn scan_all_markets(
             );
         }
 
+        // Settled market detection: if BOTH tokens have best_ask > $0.95,
+        // the market is already resolved — skip immediately.
+        let settled_threshold = Decimal::new(95, 2);
+        if let (Ok(ref our_ob), Ok(ref other_ob)) = (&our_result, &other_result) {
+            if our_ob.best_ask > settled_threshold && other_ob.best_ask > settled_threshold {
+                let detail = format!(
+                    "Market settled: both asks > $0.95 (ours={}, other={})",
+                    our_ob.best_ask, other_ob.best_ask
+                );
+                warn!(
+                    market = %mkt.name,
+                    slug = %slug,
+                    our_ask = %our_ob.best_ask,
+                    other_ask = %other_ob.best_ask,
+                    "Skip: market appears SETTLED"
+                );
+                skip_reasons.insert(mkt.name.clone(), detail.clone());
+                evaluations.push(ScanEvaluation {
+                    market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
+                    direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
+                    open_price: Some(open_price), current_price: Some(current_price),
+                    best_ask: Some(our_ob.best_ask), best_bid: Some(our_ob.best_bid),
+                    spread: Some(our_ob.spread), depth_at_ask: Some(our_ob.depth_at_ask),
+                    suggested_entry: None, max_entry: None, edge_score: None,
+                    result: "SKIP_SETTLED".into(), detail: Some(detail),
+                });
+                continue;
+            }
+        }
+
         let ob = match our_result {
             Ok(ob) => ob,
             Err(e) => {
