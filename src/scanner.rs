@@ -261,14 +261,17 @@ pub async fn scan_all_markets(
 
         // Settled market detection:
         //   Case 1: BOTH tokens have best_ask > $0.95
-        //   Case 2: One token has no asks AND the other is < $0.05 (one-sided settlement)
+        //   Case 2: One token has no asks AND has bids > $0.80 (real settlement signal,
+        //           not just an empty orderbook) AND the other is < $0.05
         let settled_threshold = Decimal::new(95, 2);
         let penny_threshold = Decimal::new(5, 2);
+        let bid_settlement_threshold = Decimal::new(80, 2);
         let is_settled = match (&ob_a, &ob_b) {
             (Ok(a), Ok(b)) => {
                 let both_high = a.best_ask > settled_threshold && b.best_ask > settled_threshold;
-                let one_sided = (!a_has_asks && b.best_ask < penny_threshold)
-                    || (!b_has_asks && a.best_ask < penny_threshold);
+                let one_sided =
+                    (!a_has_asks && a.best_bid > bid_settlement_threshold && b.best_ask < penny_threshold)
+                    || (!b_has_asks && b.best_bid > bid_settlement_threshold && a.best_ask < penny_threshold);
                 both_high || one_sided
             }
             _ => false,
