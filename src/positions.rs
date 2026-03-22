@@ -45,6 +45,9 @@ pub struct Position {
     pub pnl: Option<Decimal>,
     pub mode: BotMode,
     pub settlement_started: bool,
+    pub submit_secs_before_close: Option<u64>,
+    pub confirm_secs_before_close: Option<u64>,
+    pub pipeline_ms: Option<u128>,
 }
 
 /// Thread-safe tracker for all active and recently-settled positions.

@@ -629,6 +629,9 @@ async fn run_scanner_loop(
                     pnl: None,
                     mode,
                     settlement_started: false,
+                    submit_secs_before_close: None,
+                    confirm_secs_before_close: None,
+                    pipeline_ms: None,
                 };
                 let now_epoch = market::epoch_secs();
                 let window_end = pos.window_ts + pos.window_seconds;
@@ -1194,6 +1197,9 @@ async fn run_scanner_loop(
                         pnl: None,
                         mode,
                         settlement_started: false,
+                        submit_secs_before_close: None,
+                        confirm_secs_before_close: None,
+                        pipeline_ms: None,
                     };
 
                     let pos_id = positions.add(pos).await;
@@ -1212,6 +1218,7 @@ async fn run_scanner_loop(
                             opportunities.len(),
                             open_count,
                             config.bankroll.max_concurrent_positions,
+                            None,
                         )
                         .await
                         .ok();
@@ -1250,8 +1257,10 @@ async fn run_scanner_loop(
                         "SUBMITTING order to CLOB"
                     );
 
+                    let pipeline_timer = std::time::Instant::now();
                     match post_order!(opp.suggested_entry, opp.contracts, token_id_u256) {
                         Ok(oid) => {
+                            let pipeline_elapsed_ms = pipeline_timer.elapsed().as_millis();
                             let posted_epoch = market::epoch_secs();
                             let secs_after_post = window_end_epoch.saturating_sub(posted_epoch);
                             let db_id = db.save_position(
@@ -1298,6 +1307,9 @@ async fn run_scanner_loop(
                                 pnl: None,
                                 mode,
                                 settlement_started: false,
+                                submit_secs_before_close: Some(secs_before_close),
+                                confirm_secs_before_close: Some(secs_after_post),
+                                pipeline_ms: Some(pipeline_elapsed_ms),
                             };
 
                             let pos_id = positions.add(pos).await;
@@ -1783,6 +1795,11 @@ async fn handle_live_fill(
             pos.tighten_count,
             open_count,
             config.bankroll.max_concurrent_positions,
+            pos.submit_secs_before_close.map(|s| telegram::OrderTiming {
+                secs_before_submit: s,
+                secs_before_confirm: pos.confirm_secs_before_close.unwrap_or(0),
+                pipeline_ms: pos.pipeline_ms.unwrap_or(0),
+            }).as_ref(),
         )
         .await
         .ok();

@@ -7,6 +7,12 @@ use crate::db::{DailyAnalytics, MarketDayStats};
 use crate::scanner::MarketOpportunity;
 use crate::types::{BotMode, Direction, TradeRecord};
 
+pub struct OrderTiming {
+    pub secs_before_submit: u64,
+    pub secs_before_confirm: u64,
+    pub pipeline_ms: u128,
+}
+
 pub struct MarketSnapshot {
     pub name: String,
     pub is_live: bool,
@@ -59,6 +65,7 @@ impl TelegramNotifier {
         total_opps: usize,
         open_positions: usize,
         max_positions: usize,
+        timing: Option<&OrderTiming>,
     ) -> Result<()> {
         if !self.enabled || !self.on_trade {
             return Ok(());
@@ -71,6 +78,15 @@ impl TelegramNotifier {
             String::new()
         };
 
+        let timing_line = if let Some(t) = timing {
+            format!(
+                "\n\u{200b}  \u{23F1} Submitted T-{}s | Confirmed T-{}s | Pipeline {}ms",
+                t.secs_before_submit, t.secs_before_confirm, t.pipeline_ms
+            )
+        } else {
+            String::new()
+        };
+
         let msg = format!(
             "📊 FILL {mode_tag}— {}\n\
              \u{200b}  Window: {}\n\
@@ -79,7 +95,7 @@ impl TelegramNotifier {
              \u{200b}  Book ask: ${} → Filled: ${}{}\n\
              \u{200b}  Delta: {}%\n\
              \u{200b}  Contracts: {} | Bet: ${}\n\
-             \u{200b}  Open positions: {}/{}",
+             \u{200b}  Open positions: {}/{}{}",
             trade.market_name,
             trade.slug,
             trade.direction,
@@ -94,6 +110,7 @@ impl TelegramNotifier {
             trade.bet_size_usd,
             open_positions,
             max_positions,
+            timing_line,
         );
 
         self.send_message(&msg).await
@@ -101,6 +118,7 @@ impl TelegramNotifier {
 
     /// Simple fill notification from position data — gated by `on_trade`.
     /// Used for live fills detected via order polling.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_fill_from_position(
         &self,
         market_name: &str,
@@ -115,6 +133,7 @@ impl TelegramNotifier {
         tighten_count: u32,
         open_positions: usize,
         max_positions: usize,
+        timing: Option<&OrderTiming>,
     ) -> Result<()> {
         if !self.enabled || !self.on_trade {
             return Ok(());
@@ -128,6 +147,15 @@ impl TelegramNotifier {
         };
         let bet_usd = fill_price * fill_size;
 
+        let timing_line = if let Some(t) = timing {
+            format!(
+                "\n\u{200b}  \u{23F1} Submitted T-{}s | Confirmed T-{}s | Pipeline {}ms",
+                t.secs_before_submit, t.secs_before_confirm, t.pipeline_ms
+            )
+        } else {
+            String::new()
+        };
+
         let msg = format!(
             "📊 FILL {mode_tag}— {market_name}\n\
              \u{200b}  Window: {slug}\n\
@@ -136,7 +164,7 @@ impl TelegramNotifier {
              \u{200b}  Book ask: ${best_ask} → Filled: ${fill_price}{tighten_info}\n\
              \u{200b}  Delta: {delta_pct}%\n\
              \u{200b}  Contracts: {fill_size} | Bet: ${bet_usd:.2}\n\
-             \u{200b}  Open positions: {open_positions}/{max_positions}",
+             \u{200b}  Open positions: {open_positions}/{max_positions}{timing_line}",
         );
 
         self.send_message(&msg).await
