@@ -81,7 +81,7 @@ pub async fn run_shadow_timing(
                 continue;
             }
 
-            let current_price = match price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await {
+            let current_price = match price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
                 Some(p) => p,
                 None => continue,
             };

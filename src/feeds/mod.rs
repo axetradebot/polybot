@@ -98,6 +98,39 @@ impl PriceFeeds {
         None
     }
 
+    /// Get the correct price for a market based on its resolution source.
+    /// Uses Chainlink (with Binance fallback) for chainlink-resolved markets,
+    /// or Binance directly for binance-resolved markets.
+    pub async fn get_market_price(
+        &self,
+        resolution_source: &str,
+        chainlink_sym: &str,
+        binance_sym: &str,
+    ) -> Option<Decimal> {
+        if resolution_source == "binance" {
+            self.get_price(binance_sym).await
+        } else {
+            self.get_price_with_fallback(chainlink_sym).await
+        }
+    }
+
+    /// Check freshness for a market based on its resolution source.
+    pub async fn has_fresh_market_price(
+        &self,
+        resolution_source: &str,
+        chainlink_sym: &str,
+        binance_sym: &str,
+    ) -> bool {
+        if resolution_source == "binance" {
+            let map = self.prices.read().await;
+            map.get(&binance_sym.to_lowercase())
+                .map(|d| (Utc::now() - d.updated_at).num_milliseconds() < 60_000)
+                .unwrap_or(false)
+        } else {
+            self.has_fresh_price(chainlink_sym).await
+        }
+    }
+
     /// Check if we have a reasonably recent price (< 60s old).
     /// Checks Chainlink first, then Binance fallback.
     pub async fn has_fresh_price(&self, symbol: &str) -> bool {

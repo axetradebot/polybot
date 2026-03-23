@@ -92,11 +92,12 @@ async fn main() -> Result<()> {
         binance_fallback = ?binance_symbols,
         system_utc = %boot_utc.format("%Y-%m-%d %H:%M:%S%.3f UTC"),
         system_epoch = boot_epoch,
-        "Multi-market scanner bot starting (price source: Chainlink via Polymarket)"
+        "Multi-market scanner bot starting"
     );
     for mkt in &enabled {
         let effective = if config.is_market_paper(&mkt.name) { "paper" } else { "live" };
-        info!(market = %mkt.name, mode = effective, chainlink = %mkt.chainlink_symbol, "Market enabled");
+        let price_sym = if mkt.resolution_source == "binance" { &mkt.binance_symbol } else { &mkt.chainlink_symbol };
+        info!(market = %mkt.name, mode = effective, source = %mkt.resolution_source, symbol = %price_sym, "Market enabled");
     }
 
     let state = new_shared_state(config.bankroll_decimal());
@@ -128,37 +129,32 @@ async fn main() -> Result<()> {
     // Spawn Binance (FALLBACK) price feed — only activates if Chainlink goes stale
     price_feeds.spawn_binance_feed(binance_symbols.clone(), &config.infra.binance_ws_base);
 
-    // Wait for price data before starting (prefer Chainlink, accept Binance fallback)
-    info!("Waiting for initial price data from Chainlink...");
+    // Wait for price data before starting — per-market resolution source
+    info!("Waiting for initial price data...");
     let price_wait_start = tokio::time::Instant::now();
     loop {
         let mut all_fresh = true;
-        for sym in &chainlink_symbols {
-            if !price_feeds.has_fresh_price(sym).await {
+        for mkt in &enabled {
+            if !price_feeds.has_fresh_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
                 all_fresh = false;
                 break;
             }
         }
         if all_fresh {
-            for sym in &chainlink_symbols {
-                if let Some(p) = price_feeds.get_price(sym).await {
-                    let source = if price_feeds.is_using_fallback(sym).await {
-                        "BINANCE-FALLBACK"
-                    } else {
-                        "chainlink"
-                    };
-                    info!(symbol = %sym, price = %p, source, "Initial price received");
+            for mkt in &enabled {
+                if let Some(p) = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
+                    info!(market = %mkt.name, price = %p, source = %mkt.resolution_source, "Initial price received");
                 }
             }
             break;
         }
         if price_wait_start.elapsed() > Duration::from_secs(30) {
-            warn!("Timed out waiting for all Chainlink prices, starting with available data");
-            for sym in &chainlink_symbols {
-                if let Some(p) = price_feeds.get_price_with_fallback(sym).await {
-                    info!(symbol = %sym, price = %p, "Price available (may be fallback)");
+            warn!("Timed out waiting for prices, starting with available data");
+            for mkt in &enabled {
+                if let Some(p) = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
+                    info!(market = %mkt.name, price = %p, source = %mkt.resolution_source, "Price available");
                 } else {
-                    warn!(symbol = %sym, "No price data yet");
+                    warn!(market = %mkt.name, source = %mkt.resolution_source, "No price data yet");
                 }
             }
             break;
@@ -385,6 +381,79 @@ async fn test_orderbook(clob_url: &str, up_token: &str, down_token: &str, slug: 
     println!("  curl test commands:");
     println!("    curl -s \"{clob_url}/book?token_id={up_token}\" | python3 -m json.tool");
     println!("    curl -s \"{clob_url}/book?token_id={down_token}\" | python3 -m json.tool");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Resolution audit checker — polls Polymarket for actual outcomes
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn run_resolution_audit_checker(db: Arc<TradeDb>) {
+    use polymarket_client_sdk::gamma::Client as GammaClient;
+    use polymarket_client_sdk::gamma::types::request::MarketBySlugRequest;
+
+    let gamma = GammaClient::default();
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+
+        let pending = match db.pending_resolution_audits() {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch pending resolution audits");
+                continue;
+            }
+        };
+
+        if pending.is_empty() {
+            continue;
+        }
+
+        info!(count = pending.len(), "Checking pending resolution audits");
+
+        for (market_name, window_ts, slug) in &pending {
+            let request = MarketBySlugRequest::builder().slug(slug.as_str()).build();
+
+            match gamma.market_by_slug(&request).await {
+                Ok(market) => {
+                    let is_closed = market.closed.unwrap_or(false);
+                    if !is_closed {
+                        continue;
+                    }
+
+                    let outcome_prices = market.outcome_prices.unwrap_or_default();
+                    if outcome_prices.len() < 2 {
+                        warn!(slug = %slug, "Market closed but missing outcome_prices");
+                        continue;
+                    }
+
+                    let poly_resolution = if outcome_prices[0] == rust_decimal::Decimal::ONE {
+                        "UP"
+                    } else if outcome_prices[1] == rust_decimal::Decimal::ONE {
+                        "DOWN"
+                    } else {
+                        warn!(slug = %slug, prices = ?outcome_prices, "Market closed but no clear winner");
+                        continue;
+                    };
+
+                    if let Err(e) = db.update_resolution_audit(market_name, *window_ts, poly_resolution) {
+                        warn!(error = %e, slug = %slug, "Failed to update resolution audit");
+                    } else {
+                        info!(
+                            market = %market_name,
+                            slug = %slug,
+                            poly_resolution,
+                            "Resolution audit updated"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, slug = %slug, "Failed to query Gamma API for audit");
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -688,6 +757,14 @@ async fn run_scanner_loop(
         });
     }
 
+    // Spawn resolution audit checker — polls Polymarket for actual outcomes
+    {
+        let audit_db = db.clone();
+        tokio::spawn(async move {
+            run_resolution_audit_checker(audit_db).await;
+        });
+    }
+
     info!(
         scan_interval_ms = config.scanner.scan_interval_ms,
         max_concurrent = config.bankroll.max_concurrent_positions,
@@ -894,7 +971,10 @@ async fn run_scanner_loop(
     }
 
     let mut heartbeat_counter: u64 = 0;
-    let hb_symbols = config.chainlink_symbols();
+    let hb_markets: Vec<(String, String, String)> = config.enabled_markets().iter().map(|m| {
+        let sym = if m.resolution_source == "binance" { m.binance_symbol.clone() } else { m.chainlink_symbol.clone() };
+        (m.name.clone(), m.resolution_source.clone(), sym)
+    }).collect();
 
     loop {
         let cycle_start = tokio::time::Instant::now();
@@ -912,11 +992,11 @@ async fn run_scanner_loop(
             let st = state.read().await;
             let clob_bal = fetch_clob_balance!();
             let mut price_ages = Vec::new();
-            for sym in &hb_symbols {
+            for (name, _src, sym) in &hb_markets {
                 if let Some(age) = price_feeds.price_age_ms(sym).await {
-                    price_ages.push(format!("{}={}ms", sym, age));
+                    price_ages.push(format!("{}={}ms", name, age));
                 } else {
-                    price_ages.push(format!("{}=NONE", sym));
+                    price_ages.push(format!("{}=NONE", name));
                 }
             }
             info!(
@@ -938,7 +1018,7 @@ async fn run_scanner_loop(
             let hb_clob_bal = fetch_clob_balance!();
             let mut snapshots = Vec::new();
             for mkt in config.enabled_markets() {
-                let current_price = price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await.unwrap_or_default();
+                let current_price = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await.unwrap_or_default();
                 let (window_ts, _) = market::current_window(mkt.window_seconds);
                 let open_price = price_feeds.get_window_open(&mkt.slug_prefix, window_ts).await.unwrap_or(current_price);
                 let delta_pct = if open_price > Decimal::ZERO {
@@ -995,7 +1075,7 @@ async fn run_scanner_loop(
                     let key = format!("{}-{}", mkt.name, old_ts);
                     let traded = window_traded.get(&key).copied().unwrap_or(false);
                     let old_open = price_feeds.get_window_open(&mkt.slug_prefix, old_ts).await.unwrap_or_default();
-                    let current = price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await.unwrap_or(old_open);
+                    let current = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await.unwrap_or(old_open);
 
                     let watch_key = format!("{}-{}", mkt.name, old_ts);
                     let was_watching = watching_markets.remove(&watch_key);
@@ -1028,19 +1108,28 @@ async fn run_scanner_loop(
                         "FLAT"
                     };
 
-                    // Transition logging: compare Chainlink vs Binance at window close
+                    // Transition logging: compare both sources at window close
                     {
+                        let chainlink_price = price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await;
                         let binance_price = price_feeds.get_price(&mkt.binance_symbol).await;
                         let using_fallback = price_feeds.is_using_fallback(&mkt.chainlink_symbol).await;
-                        let binance_dir = binance_price.map(|bp| {
-                            if bp > old_open { "UP" } else if bp < old_open { "DOWN" } else { "FLAT" }
-                        });
-                        let diverged = binance_dir.map(|bd| bd != actual_dir).unwrap_or(false);
+                        let other_dir = |p: Decimal| {
+                            if p > old_open { "UP" } else if p < old_open { "DOWN" } else { "FLAT" }
+                        };
+                        let chainlink_dir = chainlink_price.map(|p| other_dir(p));
+                        let binance_dir = binance_price.map(|p| other_dir(p));
+                        let diverged = match (chainlink_dir, binance_dir) {
+                            (Some(c), Some(b)) => c != b,
+                            _ => false,
+                        };
                         info!(
                             market = %mkt.name,
-                            chainlink_close = %current,
+                            resolution_source = %mkt.resolution_source,
+                            close = %current,
+                            chainlink_close = ?chainlink_price.map(|p| p.to_string()),
                             binance_close = ?binance_price.map(|p| p.to_string()),
-                            chainlink_dir = actual_dir,
+                            direction = actual_dir,
+                            chainlink_dir = ?chainlink_dir,
                             binance_dir = ?binance_dir,
                             open = %old_open,
                             diverged,
@@ -1068,14 +1157,37 @@ async fn run_scanner_loop(
                         warn!(error = %e, market = %mkt.name, "Failed to settle shadow timing");
                     }
 
+                    // Record resolution audit — our prediction vs what Polymarket actually resolves
+                    {
+                        let old_slug = market::build_slug(&mkt.slug_prefix, old_ts);
+                        let source = if mkt.resolution_source == "binance" {
+                            "binance"
+                        } else if price_feeds.is_using_fallback(&mkt.chainlink_symbol).await {
+                            "chainlink_fallback_to_binance"
+                        } else {
+                            "chainlink"
+                        };
+                        if let Err(e) = db.insert_resolution_audit(
+                            &mkt.name,
+                            old_ts,
+                            &old_slug,
+                            &old_open.to_string(),
+                            &current.to_string(),
+                            actual_dir,
+                            source,
+                        ) {
+                            warn!(error = %e, market = %mkt.name, "Failed to insert resolution audit");
+                        }
+                    }
+
                     window_traded.remove(&key);
                 }
                 // Clear skip reason and skip notifications for fresh window
                 last_skip_reasons.remove(&mkt.name);
                 skip_notified.retain(|k| !k.starts_with(&mkt.name));
 
-                // New window detected — capture Chainlink open price
-                if let Some(price) = price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await {
+                // New window detected — capture open price from market's resolution source
+                if let Some(price) = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
                     price_feeds
                         .set_window_open(&mkt.slug_prefix, window_ts, price)
                         .await;
@@ -1141,7 +1253,7 @@ async fn run_scanner_loop(
                     .await
                     .is_some();
                 if !wo_key_exists {
-                    if let Some(price) = price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await {
+                    if let Some(price) = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
                         price_feeds
                             .set_window_open(&mkt.slug_prefix, window_ts, price)
                             .await;

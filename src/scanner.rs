@@ -133,23 +133,23 @@ pub async fn scan_all_markets(
             "In entry window — evaluating"
         );
 
-        let current_price = match price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await {
+        let current_price = match price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
             Some(p) => p,
             None => {
-                info!(market = %mkt.name, "Skip: no price data");
-                skip_reasons.insert(mkt.name.clone(), "No price data from Binance".into());
+                info!(market = %mkt.name, source = %mkt.resolution_source, "Skip: no price data");
+                skip_reasons.insert(mkt.name.clone(), "No price data".into());
                 evaluations.push(ScanEvaluation {
                     market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
                     direction: None, delta_pct: None, open_price: None, current_price: None,
                     best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
                     suggested_entry: None, max_entry: None, edge_score: None,
-                    result: "SKIP_NO_DATA".into(), detail: Some("No price data from Binance".into()),
+                    result: "SKIP_NO_DATA".into(), detail: Some("No price data".into()),
                 });
                 continue;
             }
         };
 
-        if !price_feeds.has_fresh_price(&mkt.chainlink_symbol).await {
+        if !price_feeds.has_fresh_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
             info!(market = %mkt.name, "Skip: stale price data");
             skip_reasons.insert(mkt.name.clone(), "Stale price data".into());
             evaluations.push(ScanEvaluation {

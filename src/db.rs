@@ -165,6 +165,24 @@ impl TradeDb {
                 UNIQUE(window_id, market_name, t_seconds)
             );
 
+            CREATE TABLE IF NOT EXISTS resolution_audit (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_name      TEXT NOT NULL,
+                window_ts        INTEGER NOT NULL,
+                slug             TEXT NOT NULL,
+                our_open         TEXT NOT NULL,
+                our_close        TEXT NOT NULL,
+                our_direction    TEXT NOT NULL,
+                poly_resolution  TEXT,
+                matched          INTEGER,
+                price_source     TEXT NOT NULL DEFAULT 'chainlink',
+                checked_at       TEXT,
+                created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(market_name, window_ts)
+            );
+            CREATE INDEX IF NOT EXISTS idx_resolution_audit_market
+                ON resolution_audit(market_name);
+
             CREATE TABLE IF NOT EXISTS active_positions (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 market_name      TEXT NOT NULL,
@@ -760,6 +778,66 @@ impl TradeDb {
             params![actual_outcome, window_id],
         )?;
         Ok(())
+    }
+
+    pub fn insert_resolution_audit(
+        &self,
+        market_name: &str,
+        window_ts: u64,
+        slug: &str,
+        our_open: &str,
+        our_close: &str,
+        our_direction: &str,
+        price_source: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO resolution_audit
+                (market_name, window_ts, slug, our_open, our_close, our_direction, price_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![market_name, window_ts as i64, slug, our_open, our_close, our_direction, price_source],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_resolution_audit(
+        &self,
+        market_name: &str,
+        window_ts: u64,
+        poly_resolution: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE resolution_audit SET
+                poly_resolution = ?1,
+                matched = CASE WHEN our_direction = ?1 THEN 1 ELSE 0 END,
+                checked_at = datetime('now')
+             WHERE market_name = ?2 AND window_ts = ?3 AND poly_resolution IS NULL",
+            params![poly_resolution, market_name, window_ts as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Get all audit rows where we haven't checked Polymarket's resolution yet.
+    pub fn pending_resolution_audits(&self) -> Result<Vec<(String, u64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT market_name, window_ts, slug FROM resolution_audit
+             WHERE poly_resolution IS NULL
+             ORDER BY window_ts ASC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
     }
 
     pub fn daily_analytics(&self) -> Result<DailyAnalytics> {
