@@ -133,7 +133,7 @@ pub async fn scan_all_markets(
             "In entry window — evaluating"
         );
 
-        let current_price = match price_feeds.get_price(&mkt.binance_symbol).await {
+        let current_price = match price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await {
             Some(p) => p,
             None => {
                 info!(market = %mkt.name, "Skip: no price data");
@@ -149,7 +149,7 @@ pub async fn scan_all_markets(
             }
         };
 
-        if !price_feeds.has_fresh_price(&mkt.binance_symbol).await {
+        if !price_feeds.has_fresh_price(&mkt.chainlink_symbol).await {
             info!(market = %mkt.name, "Skip: stale price data");
             skip_reasons.insert(mkt.name.clone(), "Stale price data".into());
             evaluations.push(ScanEvaluation {

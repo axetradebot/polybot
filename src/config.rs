@@ -185,7 +185,10 @@ pub struct TelegramConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct InfraConfig {
+    #[serde(default = "default_binance_ws")]
     pub binance_ws_base: String,
+    #[serde(default = "default_chainlink_ws")]
+    pub chainlink_ws_url: String,
     pub polymarket_clob_url: String,
     #[serde(default = "default_rpc")]
     pub polygon_rpc_url: String,
@@ -199,6 +202,8 @@ pub struct InfraConfig {
     pub auto_redeem: bool,
 }
 
+fn default_binance_ws() -> String { "wss://stream.binance.com:9443/ws".into() }
+fn default_chainlink_ws() -> String { "wss://ws-subscriptions-clob.polymarket.com/ws/market".into() }
 fn default_rpc() -> String { "https://polygon-rpc.com".into() }
 fn default_chain_id() -> u64 { 137 }
 fn default_sig_type() -> String { "GnosisSafe".into() }
@@ -300,7 +305,7 @@ impl AppConfig {
         self.markets.iter().filter(|m| m.enabled).collect()
     }
 
-    /// Unique Binance symbols across all enabled markets.
+    /// Unique Binance symbols across all enabled markets (used for fallback feed).
     pub fn binance_symbols(&self) -> Vec<String> {
         let mut seen = HashSet::new();
         self.enabled_markets()
@@ -308,6 +313,39 @@ impl AppConfig {
             .filter_map(|m| {
                 if seen.insert(m.binance_symbol.clone()) {
                     Some(m.binance_symbol.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Unique Chainlink symbols across all enabled markets (primary price source).
+    pub fn chainlink_symbols(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        self.enabled_markets()
+            .iter()
+            .filter(|m| !m.chainlink_symbol.is_empty())
+            .filter_map(|m| {
+                if seen.insert(m.chainlink_symbol.clone()) {
+                    Some(m.chainlink_symbol.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Build a mapping from Chainlink symbol → Binance symbol for fallback.
+    pub fn fallback_symbol_map(&self) -> Vec<(String, String)> {
+        let mut seen = HashSet::new();
+        self.enabled_markets()
+            .iter()
+            .filter(|m| !m.chainlink_symbol.is_empty())
+            .filter_map(|m| {
+                let key = m.chainlink_symbol.to_lowercase();
+                if seen.insert(key.clone()) {
+                    Some((key, m.binance_symbol.to_lowercase()))
                 } else {
                     None
                 }

@@ -80,21 +80,23 @@ async fn main() -> Result<()> {
     }
 
     let enabled = config.enabled_markets();
-    let symbols = config.binance_symbols();
+    let chainlink_symbols = config.chainlink_symbols();
+    let binance_symbols = config.binance_symbols();
 
     let boot_utc = Utc::now();
     let boot_epoch = market::epoch_secs();
     info!(
         global_mode = %config.mode,
         bankroll = %config.bankroll.total,
-        symbols = ?symbols,
+        chainlink_symbols = ?chainlink_symbols,
+        binance_fallback = ?binance_symbols,
         system_utc = %boot_utc.format("%Y-%m-%d %H:%M:%S%.3f UTC"),
         system_epoch = boot_epoch,
-        "Multi-market scanner bot starting (clock source: OS SystemTime)"
+        "Multi-market scanner bot starting (price source: Chainlink via Polymarket)"
     );
     for mkt in &enabled {
         let effective = if config.is_market_paper(&mkt.name) { "paper" } else { "live" };
-        info!(market = %mkt.name, mode = effective, "Market enabled");
+        info!(market = %mkt.name, mode = effective, chainlink = %mkt.chainlink_symbol, "Market enabled");
     }
 
     let state = new_shared_state(config.bankroll_decimal());
@@ -115,33 +117,46 @@ async fn main() -> Result<()> {
     let risk_manager = RiskManager::new(&config);
     let verbose = cli.verbose || config.telegram.verbose_skips;
 
-    // Spawn Binance combined price feed
-    price_feeds.spawn_binance_feed(symbols.clone(), &config.infra.binance_ws_base);
+    // Register Chainlink → Binance fallback mappings
+    for (cl_sym, bn_sym) in config.fallback_symbol_map() {
+        price_feeds.register_fallback(&cl_sym, &bn_sym).await;
+    }
 
-    // Wait for ALL symbols to have fresh prices before starting
-    info!("Waiting for initial price data from Binance...");
+    // Spawn Chainlink (PRIMARY) price feed from Polymarket
+    price_feeds.spawn_chainlink_feed(chainlink_symbols.clone(), &config.infra.chainlink_ws_url);
+
+    // Spawn Binance (FALLBACK) price feed — only activates if Chainlink goes stale
+    price_feeds.spawn_binance_feed(binance_symbols.clone(), &config.infra.binance_ws_base);
+
+    // Wait for price data before starting (prefer Chainlink, accept Binance fallback)
+    info!("Waiting for initial price data from Chainlink...");
     let price_wait_start = tokio::time::Instant::now();
     loop {
         let mut all_fresh = true;
-        for sym in &symbols {
+        for sym in &chainlink_symbols {
             if !price_feeds.has_fresh_price(sym).await {
                 all_fresh = false;
                 break;
             }
         }
         if all_fresh {
-            for sym in &symbols {
+            for sym in &chainlink_symbols {
                 if let Some(p) = price_feeds.get_price(sym).await {
-                    info!(symbol = %sym, price = %p, "Initial price received");
+                    let source = if price_feeds.is_using_fallback(sym).await {
+                        "BINANCE-FALLBACK"
+                    } else {
+                        "chainlink"
+                    };
+                    info!(symbol = %sym, price = %p, source, "Initial price received");
                 }
             }
             break;
         }
         if price_wait_start.elapsed() > Duration::from_secs(30) {
-            warn!("Timed out waiting for all prices, starting with available data");
-            for sym in &symbols {
-                if let Some(p) = price_feeds.get_price(sym).await {
-                    info!(symbol = %sym, price = %p, "Price available");
+            warn!("Timed out waiting for all Chainlink prices, starting with available data");
+            for sym in &chainlink_symbols {
+                if let Some(p) = price_feeds.get_price_with_fallback(sym).await {
+                    info!(symbol = %sym, price = %p, "Price available (may be fallback)");
                 } else {
                     warn!(symbol = %sym, "No price data yet");
                 }
@@ -879,7 +894,7 @@ async fn run_scanner_loop(
     }
 
     let mut heartbeat_counter: u64 = 0;
-    let hb_symbols = config.binance_symbols();
+    let hb_symbols = config.chainlink_symbols();
 
     loop {
         let cycle_start = tokio::time::Instant::now();
@@ -923,7 +938,7 @@ async fn run_scanner_loop(
             let hb_clob_bal = fetch_clob_balance!();
             let mut snapshots = Vec::new();
             for mkt in config.enabled_markets() {
-                let current_price = price_feeds.get_price(&mkt.binance_symbol).await.unwrap_or_default();
+                let current_price = price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await.unwrap_or_default();
                 let (window_ts, _) = market::current_window(mkt.window_seconds);
                 let open_price = price_feeds.get_window_open(&mkt.slug_prefix, window_ts).await.unwrap_or(current_price);
                 let delta_pct = if open_price > Decimal::ZERO {
@@ -980,7 +995,7 @@ async fn run_scanner_loop(
                     let key = format!("{}-{}", mkt.name, old_ts);
                     let traded = window_traded.get(&key).copied().unwrap_or(false);
                     let old_open = price_feeds.get_window_open(&mkt.slug_prefix, old_ts).await.unwrap_or_default();
-                    let current = price_feeds.get_price(&mkt.binance_symbol).await.unwrap_or(old_open);
+                    let current = price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await.unwrap_or(old_open);
 
                     let watch_key = format!("{}-{}", mkt.name, old_ts);
                     let was_watching = watching_markets.remove(&watch_key);
@@ -1004,7 +1019,7 @@ async fn run_scanner_loop(
                         );
                     }
 
-                    // Settle shadow trade: determine actual BTC direction from open→close
+                    // Settle shadow trade: determine direction from Chainlink open→close
                     let actual_dir = if current > old_open {
                         "UP"
                     } else if current < old_open {
@@ -1012,6 +1027,28 @@ async fn run_scanner_loop(
                     } else {
                         "FLAT"
                     };
+
+                    // Transition logging: compare Chainlink vs Binance at window close
+                    {
+                        let binance_price = price_feeds.get_price(&mkt.binance_symbol).await;
+                        let using_fallback = price_feeds.is_using_fallback(&mkt.chainlink_symbol).await;
+                        let binance_dir = binance_price.map(|bp| {
+                            if bp > old_open { "UP" } else if bp < old_open { "DOWN" } else { "FLAT" }
+                        });
+                        let diverged = binance_dir.map(|bd| bd != actual_dir).unwrap_or(false);
+                        info!(
+                            market = %mkt.name,
+                            chainlink_close = %current,
+                            binance_close = ?binance_price.map(|p| p.to_string()),
+                            chainlink_dir = actual_dir,
+                            binance_dir = ?binance_dir,
+                            open = %old_open,
+                            diverged,
+                            using_fallback,
+                            "Window close price comparison"
+                        );
+                    }
+
                     if let Err(e) = db.settle_shadow_trade(
                         &mkt.name, old_ts, &current.to_string(), actual_dir,
                     ) {
@@ -1037,8 +1074,8 @@ async fn run_scanner_loop(
                 last_skip_reasons.remove(&mkt.name);
                 skip_notified.retain(|k| !k.starts_with(&mkt.name));
 
-                // New window detected
-                if let Some(price) = price_feeds.get_price(&mkt.binance_symbol).await {
+                // New window detected — capture Chainlink open price
+                if let Some(price) = price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await {
                     price_feeds
                         .set_window_open(&mkt.slug_prefix, window_ts, price)
                         .await;
@@ -1104,7 +1141,7 @@ async fn run_scanner_loop(
                     .await
                     .is_some();
                 if !wo_key_exists {
-                    if let Some(price) = price_feeds.get_price(&mkt.binance_symbol).await {
+                    if let Some(price) = price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await {
                         price_feeds
                             .set_window_open(&mkt.slug_prefix, window_ts, price)
                             .await;

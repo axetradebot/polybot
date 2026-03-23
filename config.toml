@@ -276,7 +276,8 @@ enabled = true
 window_seconds = 3600
 slug_prefix = "bitcoin-up-or-down"
 binance_symbol = "btcusdt"
-resolution_source = "binance"
+chainlink_symbol = "btc/usd"
+resolution_source = "chainlink"
 entry_start_s = 40
 entry_cutoff_s = 5
 min_delta_pct = 0.05
@@ -292,6 +293,7 @@ delta_tiers = [
 ]
 
 [infrastructure]
+chainlink_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 binance_ws_base = "wss://stream.binance.com:9443/ws"
 polymarket_clob_url = "https://clob.polymarket.com"
 polygon_rpc_url = "https://polygon-rpc.com"
