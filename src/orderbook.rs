@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
@@ -171,6 +172,118 @@ pub async fn refresh_best_ask(clob_url: &str, token_id: &str) -> Option<Decimal>
             warn!(error = %e, "Failed to refresh orderbook");
             None
         }
+    }
+}
+
+/// Detailed orderbook snapshot with per-side ask depth for shadow timing analysis.
+#[derive(Debug, Clone)]
+pub struct DetailedOrderbook {
+    pub best_ask: Option<f64>,
+    pub ask_depth: i64,
+    pub total_ask_size: f64,
+}
+
+/// Fetch an orderbook and return detailed ask-side data filtered to tradeable range ($0.30–$0.95).
+pub async fn fetch_orderbook_detailed(clob_url: &str, token_id: &str) -> Result<DetailedOrderbook> {
+    let url = format!("{}/book?token_id={}", clob_url, token_id);
+
+    let resp: BookResponse = http_client()
+        .get(&url)
+        .send()
+        .await
+        .context("orderbook HTTP request failed")?
+        .json()
+        .await
+        .context("failed to parse orderbook JSON")?;
+
+    let tradeable_asks: Vec<(f64, f64)> = resp
+        .asks
+        .iter()
+        .filter_map(|l| {
+            let price: f64 = l.price.parse().ok()?;
+            let size: f64 = l.size.parse().ok()?;
+            if price >= 0.30 && price <= 0.95 {
+                Some((price, size))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let best_ask = tradeable_asks
+        .iter()
+        .map(|(p, _)| *p)
+        .reduce(f64::min);
+    let ask_depth = tradeable_asks.len() as i64;
+    let total_ask_size: f64 = tradeable_asks.iter().map(|(_, s)| s).sum();
+
+    Ok(DetailedOrderbook {
+        best_ask,
+        ask_depth,
+        total_ask_size,
+    })
+}
+
+/// Shared cache for recently-fetched orderbook data, keyed by (token_id, bucket_epoch).
+/// Entries are considered valid for `max_age_ms` after insertion.
+#[derive(Clone)]
+pub struct OrderbookCache {
+    entries: Arc<tokio::sync::RwLock<std::collections::HashMap<String, CacheEntry>>>,
+    max_age_ms: u64,
+}
+
+struct CacheEntry {
+    data: DetailedOrderbook,
+    inserted_at: std::time::Instant,
+}
+
+impl OrderbookCache {
+    pub fn new(max_age_ms: u64) -> Self {
+        Self {
+            entries: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            max_age_ms,
+        }
+    }
+
+    pub async fn get(&self, token_id: &str) -> Option<DetailedOrderbook> {
+        let map = self.entries.read().await;
+        map.get(token_id).and_then(|e| {
+            if e.inserted_at.elapsed().as_millis() as u64 <= self.max_age_ms {
+                Some(e.data.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub async fn put(&self, token_id: &str, data: DetailedOrderbook) {
+        let mut map = self.entries.write().await;
+        map.insert(
+            token_id.to_string(),
+            CacheEntry {
+                data,
+                inserted_at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    pub async fn get_or_fetch(
+        &self,
+        clob_url: &str,
+        token_id: &str,
+    ) -> Result<DetailedOrderbook> {
+        if let Some(cached) = self.get(token_id).await {
+            return Ok(cached);
+        }
+        let data = fetch_orderbook_detailed(clob_url, token_id).await?;
+        self.put(token_id, data.clone()).await;
+        Ok(data)
+    }
+
+    pub async fn prune_stale(&self) {
+        let mut map = self.entries.write().await;
+        let max = self.max_age_ms;
+        map.retain(|_, e| (e.inserted_at.elapsed().as_millis() as u64) <= max * 5);
     }
 }
 

@@ -143,6 +143,28 @@ impl TradeDb {
                 UNIQUE(market_name, window_ts)
             );
 
+            CREATE TABLE IF NOT EXISTS shadow_timing (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                window_id               TEXT NOT NULL,
+                market_name             TEXT NOT NULL,
+                t_seconds               INTEGER NOT NULL,
+                delta_pct               REAL NOT NULL,
+                direction               TEXT NOT NULL,
+                binance_price           REAL NOT NULL,
+                window_open_price       REAL NOT NULL,
+                best_ask_winner         REAL,
+                best_ask_loser          REAL,
+                ask_depth_winner        INTEGER DEFAULT 0,
+                ask_depth_loser         INTEGER DEFAULT 0,
+                total_ask_size_winner   REAL DEFAULT 0.0,
+                could_have_filled       INTEGER DEFAULT 0,
+                hypothetical_entry_price REAL,
+                would_have_won          INTEGER,
+                actual_outcome          TEXT,
+                timestamp               TEXT NOT NULL,
+                UNIQUE(window_id, market_name, t_seconds)
+            );
+
             CREATE TABLE IF NOT EXISTS active_positions (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 market_name      TEXT NOT NULL,
@@ -223,7 +245,10 @@ impl TradeDb {
              CREATE INDEX IF NOT EXISTS idx_scanlog_ts ON scanner_log(timestamp);
              CREATE INDEX IF NOT EXISTS idx_winsummary_mkt ON window_summary(market_name, window_ts);
              CREATE INDEX IF NOT EXISTS idx_shadow_mkt ON shadow_trades(market_name, window_ts);
-             CREATE INDEX IF NOT EXISTS idx_shadow_ts ON shadow_trades(window_ts);",
+             CREATE INDEX IF NOT EXISTS idx_shadow_ts ON shadow_trades(window_ts);
+             CREATE INDEX IF NOT EXISTS idx_shadow_timing_market ON shadow_timing(market_name);
+             CREATE INDEX IF NOT EXISTS idx_shadow_timing_window ON shadow_timing(window_id);
+             CREATE INDEX IF NOT EXISTS idx_shadow_timing_t ON shadow_timing(t_seconds);",
         )
         .context("Failed to create indexes")?;
 
@@ -672,6 +697,67 @@ impl TradeDb {
             "UPDATE shadow_trades SET was_traded = 1
              WHERE market_name = ?1 AND window_ts = ?2",
             params![market_name, window_ts as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Record a shadow timing snapshot for a specific T-second.
+    pub fn insert_shadow_timing(
+        &self,
+        window_id: &str,
+        market_name: &str,
+        t_seconds: u64,
+        delta_pct: f64,
+        direction: &str,
+        binance_price: f64,
+        window_open_price: f64,
+        best_ask_winner: Option<f64>,
+        best_ask_loser: Option<f64>,
+        ask_depth_winner: i64,
+        ask_depth_loser: i64,
+        total_ask_size_winner: f64,
+        could_have_filled: bool,
+        hypothetical_entry_price: Option<f64>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO shadow_timing (
+                window_id, market_name, t_seconds, delta_pct, direction,
+                binance_price, window_open_price,
+                best_ask_winner, best_ask_loser, ask_depth_winner, ask_depth_loser,
+                total_ask_size_winner, could_have_filled, hypothetical_entry_price,
+                would_have_won, actual_outcome, timestamp
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL,?15)",
+            params![
+                window_id,
+                market_name,
+                t_seconds as i64,
+                delta_pct,
+                direction,
+                binance_price,
+                window_open_price,
+                best_ask_winner,
+                best_ask_loser,
+                ask_depth_winner,
+                ask_depth_loser,
+                total_ask_size_winner,
+                could_have_filled as i64,
+                hypothetical_entry_price,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// After a window resolves, update all shadow_timing rows with the actual outcome.
+    pub fn settle_shadow_timing(&self, window_id: &str, actual_outcome: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE shadow_timing SET
+                actual_outcome = ?1,
+                would_have_won = CASE WHEN direction = ?1 THEN 1 ELSE 0 END
+             WHERE window_id = ?2 AND actual_outcome IS NULL",
+            params![actual_outcome, window_id],
         )?;
         Ok(())
     }
