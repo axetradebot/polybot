@@ -298,6 +298,7 @@ pub async fn scan_all_markets(
         // Determine which token to buy using mid-price comparison.
         // Only use real mid-prices (ignore tokens with no asks — their $1.00 default
         // creates a fake mid of $0.50 that tricks the comparison).
+        let sanity_floor: Decimal = SANITY_MIN_ASK.parse().unwrap();
         let (token_id, _other_token_id, our_ob, other_ob) = {
             let real_mid = |ob_result: &Result<crate::orderbook::OrderbookState, _>, has_asks: bool| -> Option<Decimal> {
                 if !has_asks { return None; }
@@ -317,18 +318,36 @@ pub async fn scan_all_markets(
                     ma < mb
                 }
                 (None, Some(mb)) => {
-                    info!(
-                        market = %mkt.name, slug = %slug, direction = %direction,
-                        mid_b = %mb, "Only token B has asks — selecting B"
-                    );
-                    true
+                    if mb < sanity_floor {
+                        info!(
+                            market = %mkt.name, slug = %slug, direction = %direction,
+                            mid_b = %mb,
+                            "Only token B has asks at pennies — loser side. Winning token A book empty, waiting for asks"
+                        );
+                        false // keep A selected; downstream "no tradeable asks" will trigger watching mode
+                    } else {
+                        info!(
+                            market = %mkt.name, slug = %slug, direction = %direction,
+                            mid_b = %mb, "Only token B has asks — selecting B"
+                        );
+                        true
+                    }
                 }
                 (Some(ma), None) => {
-                    info!(
-                        market = %mkt.name, slug = %slug, direction = %direction,
-                        mid_a = %ma, "Only token A has asks — selecting A"
-                    );
-                    false
+                    if ma < sanity_floor {
+                        info!(
+                            market = %mkt.name, slug = %slug, direction = %direction,
+                            mid_a = %ma,
+                            "Only token A has asks at pennies — loser side. Winning token B book empty, waiting for asks"
+                        );
+                        true // swap to B; downstream "no tradeable asks" will trigger watching mode
+                    } else {
+                        info!(
+                            market = %mkt.name, slug = %slug, direction = %direction,
+                            mid_a = %ma, "Only token A has asks — selecting A"
+                        );
+                        false
+                    }
                 }
                 (None, None) => {
                     info!(market = %mkt.name, slug = %slug, "Neither token has asks");
@@ -347,17 +366,31 @@ pub async fn scan_all_markets(
         let ob = match our_ob {
             Ok(ob) if ob.best_ask < Decimal::ONE => ob,
             Ok(_) | Err(_) => {
-                let detail = match &other_ob {
-                    Ok(other) if other.best_ask < Decimal::ONE => format!(
-                        "No tradeable asks: selected token empty, other ask=${:.2} bid=${:.2} (market likely settled)",
-                        other.best_ask, other.best_bid
-                    ),
-                    _ => format!(
-                        "Neither token has tradeable asks (a_has={}, b_has={})",
-                        a_has_asks, b_has_asks
-                    ),
+                let detail = if !a_has_asks && !b_has_asks {
+                    "Neither token has tradeable asks".to_string()
+                } else {
+                    let other_ask = other_ob.as_ref().ok().map(|o| o.best_ask);
+                    let other_bid = other_ob.as_ref().ok().map(|o| o.best_bid);
+                    if let (Some(oa), Some(ob_bid)) = (other_ask, other_bid) {
+                        if oa < sanity_floor {
+                            format!(
+                                "Winning token book empty (waiting for asks). Loser side at ${:.2}",
+                                oa
+                            )
+                        } else {
+                            format!(
+                                "No tradeable asks on selected token, other ask=${:.2} bid=${:.2}",
+                                oa, ob_bid
+                            )
+                        }
+                    } else {
+                        format!(
+                            "No tradeable asks (a_has={}, b_has={})",
+                            a_has_asks, b_has_asks
+                        )
+                    }
                 };
-                info!(market = %mkt.name, slug = %slug, secs_rem = secs_rem, "Skip: no tradeable asks");
+                info!(market = %mkt.name, slug = %slug, secs_rem = secs_rem, "Skip: {detail}");
                 skip_reasons.insert(mkt.name.clone(), format!("Orderbook: {detail}"));
                 evaluations.push(ScanEvaluation {
                     market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
@@ -373,7 +406,6 @@ pub async fn scan_all_markets(
 
         // Sanity: if our token's best_ask is below $0.30, the market strongly
         // disagrees with our signal — DO NOT trade.
-        let sanity_floor: Decimal = SANITY_MIN_ASK.parse().unwrap();
         if ob.best_ask < sanity_floor {
             let detail = format!(
                 "SANITY FAIL: {direction} signal but selected token ask=${:.2} < ${sanity_floor}",

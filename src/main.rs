@@ -1674,9 +1674,9 @@ async fn settle_position(
     telegram: Arc<TelegramNotifier>,
     state: SharedState,
     positions: PositionTracker,
-    polygon_rpc_url: &str,
-    private_key: &str,
-    auto_redeem: bool,
+    _polygon_rpc_url: &str,
+    _private_key: &str,
+    _auto_redeem: bool,
 ) -> Result<()> {
     tokio::time::sleep(Duration::from_secs(25)).await;
 
@@ -1815,40 +1815,6 @@ async fn settle_position(
         )
         .await
         .ok();
-
-    // Auto-redeem winning live positions
-    if won
-        && auto_redeem
-        && pos.mode == BotMode::Live
-        && !pos.condition_id.is_empty()
-    {
-        info!(
-            market = %pos.market_name,
-            slug = %pos.slug,
-            "Attempting auto-redeem..."
-        );
-        match redeem::auto_redeem(polygon_rpc_url, private_key, &pos.condition_id, pos.neg_risk)
-            .await
-        {
-            Ok(tx_hash) => {
-                info!(tx = %tx_hash, "Auto-redeemed successfully");
-                telegram
-                    .send_redeem_success(&pos.market_name, &tx_hash)
-                    .await
-                    .ok();
-            }
-            Err(e) => {
-                warn!(error = %e, "Auto-redeem failed");
-                telegram
-                    .send_error(&format!(
-                        "Auto-redeem failed for {}: {e:#}",
-                        pos.market_name
-                    ))
-                    .await
-                    .ok();
-            }
-        }
-    }
 
     Ok(())
 }
