@@ -2,6 +2,20 @@
 mode = "live"
 log_level = "debug"
 
+[telegram]
+enabled = true
+on_trade = true
+on_error = true
+daily_summary = true
+verbose_skips = false
+on_fill = true
+on_settlement = true
+on_order_placed = false
+on_startup = true
+on_watching = false
+on_window_miss = false
+on_heartbeat = false
+
 [bankroll]
 total = 239
 max_concurrent_positions = 6
@@ -197,6 +211,63 @@ delta_tiers = [
 ]
 
 [[markets]]
+name = "DOGE 5-min"
+asset = "DOGE"
+mode = "live"
+enabled = true
+window_seconds = 300
+slug_prefix = "doge-updown-5m"
+binance_symbol = "dogeusdt"
+chainlink_symbol = "doge/usd"
+entry_start_s = 25
+min_delta_pct = 0.07
+max_entry_price = 0.88
+delta_tiers = [
+    [0.07, 0.78],
+    [0.12, 0.82],
+    [0.18, 0.85],
+    [0.30, 0.88],
+]
+
+[[markets]]
+name = "HYPE 5-min"
+asset = "HYPE"
+mode = "live"
+enabled = true
+window_seconds = 300
+slug_prefix = "hype-updown-5m"
+binance_symbol = "hypeusdt"
+chainlink_symbol = "hype/usd"
+entry_start_s = 25
+min_delta_pct = 0.07
+max_entry_price = 0.88
+delta_tiers = [
+    [0.07, 0.78],
+    [0.12, 0.82],
+    [0.18, 0.85],
+    [0.30, 0.88],
+]
+
+[[markets]]
+name = "BNB 5-min"
+asset = "BNB"
+mode = "live"
+enabled = true
+window_seconds = 300
+slug_prefix = "bnb-updown-5m"
+binance_symbol = "bnbusdt"
+chainlink_symbol = "bnb/usd"
+entry_start_s = 25
+min_delta_pct = 0.07
+max_entry_price = 0.88
+delta_tiers = [
+    [0.07, 0.78],
+    [0.12, 0.82],
+    [0.18, 0.85],
+    [0.30, 0.88],
+]
+
+[[markets]]
 name = "BTC Hourly"
 asset = "BTC"
 market_type = "hourly"
@@ -219,20 +290,6 @@ delta_tiers = [
     [0.20, 0.87],
     [0.35, 0.94],
 ]
-
-[telegram]
-enabled = true
-on_trade = true
-on_error = true
-daily_summary = true
-verbose_skips = false
-on_fill = true
-on_settlement = true
-on_order_placed = false
-on_startup = true
-on_watching = false
-on_window_miss = false
-on_heartbeat = false
 
 [infrastructure]
 binance_ws_base = "wss://stream.binance.com:9443/ws"
