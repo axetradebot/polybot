@@ -203,7 +203,7 @@ pub struct InfraConfig {
 }
 
 fn default_binance_ws() -> String { "wss://stream.binance.com:9443/ws".into() }
-fn default_chainlink_ws() -> String { "wss://ws-subscriptions-clob.polymarket.com/ws/market".into() }
+fn default_chainlink_ws() -> String { "wss://ws-live-data.polymarket.com".into() }
 fn default_rpc() -> String { "https://polygon-rpc.com".into() }
 fn default_chain_id() -> u64 { 137 }
 fn default_sig_type() -> String { "GnosisSafe".into() }

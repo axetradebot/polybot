@@ -22,13 +22,26 @@ struct ChainlinkMessage {
     topic: String,
     #[serde(default, rename = "type")]
     msg_type: String,
-    payload: Option<ChainlinkPayload>,
+    payload: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug)]
-struct ChainlinkPayload {
+struct LivePricePayload {
     symbol: String,
     value: f64,
+}
+
+#[derive(Deserialize, Debug)]
+struct HistoryDataPoint {
+    #[allow(dead_code)]
+    timestamp: u64,
+    value: f64,
+}
+
+#[derive(Deserialize, Debug)]
+struct HistoryPayload {
+    symbol: String,
+    data: Vec<HistoryDataPoint>,
 }
 
 /// Connect to the Polymarket Chainlink price WebSocket and stream prices
@@ -55,7 +68,6 @@ pub async fn run_chainlink_feed(
                 reconnect_count = 0;
                 let (mut write, mut read) = ws_stream.split();
 
-                // Send subscribe message
                 if let Err(e) = write.send(Message::Text(subscribe_msg.clone().into())).await {
                     error!(error = %e, "Failed to send Chainlink subscribe message");
                     continue;
@@ -90,14 +102,18 @@ pub async fn run_chainlink_feed(
                         Ok(Some(Ok(Message::Text(text)))) => {
                             last_msg_at = tokio::time::Instant::now();
 
-                            if text == "PONG" || text.contains("\"type\":\"connection\"") {
+                            let text_str: &str = &text;
+                            if text_str.is_empty()
+                                || text_str == "PONG"
+                                || text_str.contains("\"type\":\"connection\"")
+                            {
                                 continue;
                             }
 
                             CL_MSG_COUNT.fetch_add(1, Ordering::Relaxed);
 
-                            if let Err(e) = handle_chainlink_message(&feeds, &text).await {
-                                warn!(error = %e, "Failed to parse Chainlink message");
+                            if let Err(e) = handle_chainlink_message(&feeds, text_str).await {
+                                warn!(error = %e, text = %&text_str[..text_str.len().min(200)], "Failed to parse Chainlink message");
                             }
                         }
                         Ok(Some(Ok(Message::Ping(data)))) => {
@@ -159,33 +175,85 @@ pub async fn run_chainlink_feed(
 }
 
 fn build_subscribe_message(symbols: &[String]) -> String {
-    let subscriptions: Vec<String> = symbols
-        .iter()
-        .map(|sym| {
-            format!(
-                r#"{{"topic":"crypto_prices_chainlink","type":"*","filters":"{{\"symbol\":\"{}\"}}" }}"#,
-                sym
-            )
-        })
-        .collect();
+    let mut subscriptions: Vec<serde_json::Value> = Vec::new();
 
-    format!(
-        r#"{{"action":"subscribe","subscriptions":[{}]}}"#,
-        subscriptions.join(",")
-    )
+    // Subscribe to crypto_prices_chainlink for each symbol (primary source)
+    for sym in symbols {
+        subscriptions.push(serde_json::json!({
+            "topic": "crypto_prices_chainlink",
+            "type": "*",
+            "filters": format!("{{\"symbol\":\"{}\"}}", sym)
+        }));
+    }
+
+    // Also subscribe to crypto_prices for real-time updates on all symbols.
+    // crypto_prices_chainlink only streams live data for BTC; crypto_prices
+    // provides per-second updates for all symbols via Polymarket's RTDS.
+    subscriptions.push(serde_json::json!({
+        "topic": "crypto_prices",
+        "type": "update",
+        "filters": ""
+    }));
+
+    let msg = serde_json::json!({
+        "action": "subscribe",
+        "subscriptions": subscriptions
+    });
+
+    msg.to_string()
+}
+
+/// Map Binance-style symbol (ethusdt) to Chainlink-style (eth/usd) for storage.
+fn binance_to_chainlink_symbol(sym: &str) -> Option<&'static str> {
+    match sym {
+        "btcusdt" => Some("btc/usd"),
+        "ethusdt" => Some("eth/usd"),
+        "solusdt" => Some("sol/usd"),
+        "xrpusdt" => Some("xrp/usd"),
+        "dogeusdt" => Some("doge/usd"),
+        "bnbusdt" => Some("bnb/usd"),
+        _ => None,
+    }
 }
 
 async fn handle_chainlink_message(feeds: &PriceFeeds, text: &str) -> Result<()> {
     let msg: ChainlinkMessage = serde_json::from_str(text)?;
 
-    if msg.topic != "crypto_prices_chainlink" {
-        return Ok(());
-    }
-
-    if let Some(payload) = msg.payload {
-        let price = Decimal::try_from(payload.value)?;
-        let symbol = payload.symbol.to_lowercase();
-        feeds.set_price(&symbol, price).await;
+    match msg.topic.as_str() {
+        "crypto_prices_chainlink" => {
+            // Authoritative Chainlink oracle price — always overwrite
+            if let Some(payload_val) = msg.payload {
+                let payload: LivePricePayload = serde_json::from_value(payload_val)?;
+                let price = Decimal::try_from(payload.value)?;
+                let symbol = payload.symbol.to_lowercase();
+                feeds.set_price(&symbol, price).await;
+            }
+        }
+        "crypto_prices" => {
+            if let Some(payload_val) = msg.payload {
+                if msg.msg_type == "subscribe" {
+                    // Initial subscribe response with historical data — take the last value
+                    let payload: HistoryPayload = serde_json::from_value(payload_val)?;
+                    if let Some(last) = payload.data.last() {
+                        let price = Decimal::try_from(last.value)?;
+                        let symbol = payload.symbol.to_lowercase();
+                        let store_key = binance_to_chainlink_symbol(&symbol)
+                            .unwrap_or_else(|| { Box::leak(symbol.clone().into_boxed_str()) });
+                        info!(symbol = %store_key, price = %price, "Chainlink initial price from history");
+                        feeds.set_price(store_key, price).await;
+                    }
+                } else {
+                    // Real-time crypto_prices update — store under the chainlink key
+                    let payload: LivePricePayload = serde_json::from_value(payload_val)?;
+                    let price = Decimal::try_from(payload.value)?;
+                    let binance_sym = payload.symbol.to_lowercase();
+                    if let Some(cl_key) = binance_to_chainlink_symbol(&binance_sym) {
+                        feeds.set_price(cl_key, price).await;
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 
     Ok(())

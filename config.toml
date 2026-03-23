@@ -10,11 +10,11 @@ daily_summary = true
 verbose_skips = false
 on_fill = true
 on_settlement = true
-on_order_placed = false
+on_order_placed = true
 on_startup = true
-on_watching = false
-on_window_miss = false
-on_heartbeat = false
+on_watching = true
+on_window_miss = true
+on_heartbeat = true
 
 [bankroll]
 total = 239
@@ -293,7 +293,7 @@ delta_tiers = [
 ]
 
 [infrastructure]
-chainlink_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+chainlink_ws_url = "wss://ws-live-data.polymarket.com"
 binance_ws_base = "wss://stream.binance.com:9443/ws"
 polymarket_clob_url = "https://clob.polymarket.com"
 polygon_rpc_url = "https://polygon-rpc.com"
