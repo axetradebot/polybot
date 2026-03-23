@@ -41,4 +41,8 @@ pub struct Cli {
     /// Run diagnostic mode: resolve current market tokens and test orderbook for each enabled market, then exit.
     #[arg(long)]
     pub diagnose: bool,
+
+    /// Reconcile past trade outcomes against Polymarket's actual resolutions and fix any mismatches.
+    #[arg(long)]
+    pub reconcile: bool,
 }

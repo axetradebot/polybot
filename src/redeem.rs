@@ -1,8 +1,12 @@
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-/// Check if a market has been resolved and whether our position won.
-pub async fn check_settlement(market_slug: &str) -> Result<Option<bool>> {
+/// Check if a market has been resolved and whether the token we bought won.
+///
+/// Matches `our_token_id` against `clob_token_ids` to find which index we
+/// bought, then checks if `outcome_prices[our_index] == 1.0`. This is the
+/// only reliable way to determine win/loss — never infer from price feeds.
+pub async fn check_settlement(market_slug: &str, our_token_id: &str) -> Result<Option<bool>> {
     use polymarket_client_sdk::gamma::Client as GammaClient;
     use polymarket_client_sdk::gamma::types::request::MarketBySlugRequest;
 
@@ -17,17 +21,42 @@ pub async fn check_settlement(market_slug: &str) -> Result<Option<bool>> {
             }
 
             let outcome_prices = market.outcome_prices.unwrap_or_default();
-            if outcome_prices.len() >= 2 {
-                let up_won = outcome_prices[0] == rust_decimal::Decimal::ONE;
-                info!(
+            let token_ids = market.clob_token_ids.unwrap_or_default();
+
+            if outcome_prices.len() < 2 || token_ids.len() < 2 {
+                warn!(
                     slug = %market_slug,
-                    up_won = up_won,
-                    "Market resolved"
+                    outcomes = outcome_prices.len(),
+                    tokens = token_ids.len(),
+                    "Market resolved but missing outcome_prices or token_ids"
                 );
-                Ok(Some(up_won))
-            } else {
-                warn!(slug = %market_slug, "Market resolved but no outcome prices");
-                Ok(None)
+                return Ok(None);
+            }
+
+            let our_index = token_ids.iter().position(|t| t.to_string() == our_token_id);
+
+            match our_index {
+                Some(idx) => {
+                    let won = outcome_prices[idx] == rust_decimal::Decimal::ONE;
+                    info!(
+                        slug = %market_slug,
+                        our_token = %our_token_id,
+                        our_index = idx,
+                        our_outcome_price = %outcome_prices[idx],
+                        won = won,
+                        "Market resolved — token-based settlement"
+                    );
+                    Ok(Some(won))
+                }
+                None => {
+                    warn!(
+                        slug = %market_slug,
+                        our_token = %our_token_id,
+                        api_tokens = ?token_ids.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                        "Our token_id not found in market's clob_token_ids"
+                    );
+                    Ok(None)
+                }
             }
         }
         Err(e) => {
@@ -35,10 +64,6 @@ pub async fn check_settlement(market_slug: &str) -> Result<Option<bool>> {
             Err(e.into())
         }
     }
-}
-
-pub fn did_we_win(our_direction_is_up: bool, up_won: bool) -> bool {
-    our_direction_is_up == up_won
 }
 
 /// Auto-redeem winning positions via the CTF contract on Polygon.

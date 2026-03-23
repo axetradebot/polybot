@@ -73,6 +73,11 @@ async fn main() -> Result<()> {
         return run_diagnostics(&config).await;
     }
 
+    // ── Reconciliation mode ──
+    if cli.reconcile {
+        return run_reconciliation(&config).await;
+    }
+
     let enabled = config.enabled_markets();
     let symbols = config.binance_symbols();
 
@@ -165,6 +170,80 @@ async fn main() -> Result<()> {
     }
 
     result
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reconciliation mode — re-check past trades against Polymarket resolutions
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn run_reconciliation(config: &AppConfig) -> Result<()> {
+    let db = TradeDb::open(std::path::Path::new(&config.infra.db_path))?;
+    let trades = db.get_filled_trades_for_reconciliation()?;
+
+    println!("\n{}", "=".repeat(70));
+    println!("  TRADE RECONCILIATION — checking {} filled trades", trades.len());
+    println!("{}\n", "=".repeat(70));
+
+    let mut checked = 0u32;
+    let mut corrections = 0u32;
+    let mut unresolved = 0u32;
+
+    for (order_id, slug, token_id, current_outcome, fill_price_str, contracts_str) in &trades {
+        if token_id.is_empty() || slug.is_empty() {
+            println!("  SKIP  order={} — missing slug or token_id", order_id);
+            continue;
+        }
+
+        match redeem::check_settlement(slug, token_id).await {
+            Ok(Some(won)) => {
+                checked += 1;
+                let correct_outcome = if won { "WIN" } else { "LOSS" };
+
+                if current_outcome != correct_outcome {
+                    corrections += 1;
+                    let fill_price: Decimal = fill_price_str.parse().unwrap_or(Decimal::ZERO);
+                    let contracts: Decimal = contracts_str.parse().unwrap_or(Decimal::ZERO);
+                    let pnl = if won {
+                        contracts * (Decimal::ONE - fill_price)
+                    } else {
+                        -(contracts * fill_price)
+                    };
+
+                    println!(
+                        "  FIX   order={} slug={} — was {} → now {} (pnl: {})",
+                        order_id, slug, current_outcome, correct_outcome, pnl
+                    );
+
+                    if let Err(e) = db.update_outcome(order_id, correct_outcome, pnl, Decimal::ZERO) {
+                        println!("  ERROR updating order {}: {}", order_id, e);
+                    }
+                } else {
+                    println!(
+                        "  OK    order={} slug={} — {} confirmed",
+                        order_id, slug, current_outcome
+                    );
+                }
+            }
+            Ok(None) => {
+                unresolved += 1;
+                println!("  PEND  order={} slug={} — market not yet resolved", order_id, slug);
+            }
+            Err(e) => {
+                println!("  ERR   order={} slug={} — {}", order_id, slug, e);
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    println!("\n{}", "-".repeat(70));
+    println!(
+        "  Checked: {} | Corrected: {} | Unresolved: {} | Total: {}",
+        checked, corrections, unresolved, trades.len()
+    );
+    println!("{}\n", "=".repeat(70));
+
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1682,75 +1761,34 @@ async fn settle_position(
 
     let fill_price = pos.fill_price.unwrap_or(pos.current_price);
     let fill_size = pos.fill_size.unwrap_or(pos.contracts);
-    let our_bet_is_up = pos.direction == Direction::Up;
 
-    let (won, _outcome_source) = match pos.mode {
-        BotMode::Paper => {
-            // Use asset price movement for settlement
-            let close_price = {
-                // For paper, we use a short delay then consider
-                // direction based on position data.
-                // In practice, the actual close price would be fetched from feeds.
-                // For simplicity, use BTC-equivalent logic.
-                fill_price // Placeholder: actual settlement uses Gamma API
-            };
-            let _ = close_price;
-            // Use Gamma API settlement for paper mode too
-            let mut resolved: Option<bool> = None;
-            for attempt in 0..10 {
-                match redeem::check_settlement(&pos.slug).await {
-                    Ok(Some(up_won)) => {
-                        resolved = Some(redeem::did_we_win(our_bet_is_up, up_won));
-                        break;
-                    }
-                    Ok(None) => {
-                        info!(attempt, slug = %pos.slug, market = %pos.market_name, "Settlement pending...");
-                        tokio::time::sleep(Duration::from_secs(30)).await;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, attempt, "Settlement check error");
-                        tokio::time::sleep(Duration::from_secs(15)).await;
-                    }
-                }
-            }
-            let won = resolved.unwrap_or_else(|| {
-                warn!(slug = %pos.slug, "Settlement unresolved, defaulting to loss");
-                false
-            });
-            (won, "gamma-api")
-        }
-        BotMode::Live => {
-            let mut resolved: Option<bool> = None;
-            for attempt in 0..20 {
-                match redeem::check_settlement(&pos.slug).await {
-                    Ok(Some(up_won)) => {
-                        resolved = Some(redeem::did_we_win(our_bet_is_up, up_won));
-                        break;
-                    }
-                    Ok(None) => {
-                        info!(attempt, slug = %pos.slug, market = %pos.market_name, "Settlement pending...");
-                        tokio::time::sleep(Duration::from_secs(30)).await;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, attempt, "Settlement check error");
-                        tokio::time::sleep(Duration::from_secs(15)).await;
-                    }
-                }
-            }
-            let won = resolved.unwrap_or_else(|| {
-                warn!(slug = %pos.slug, "Using fallback for settlement");
-                false
-            });
-            (
-                won,
-                if resolved.is_some() {
-                    "gamma-api"
-                } else {
-                    "fallback"
-                },
-            )
-        }
+    let max_attempts = match pos.mode {
+        BotMode::Paper => 10u32,
+        BotMode::Live => 20,
     };
+
+    let mut resolved: Option<bool> = None;
+    for attempt in 0..max_attempts {
+        match redeem::check_settlement(&pos.slug, &pos.token_id).await {
+            Ok(Some(won)) => {
+                resolved = Some(won);
+                break;
+            }
+            Ok(None) => {
+                info!(attempt, slug = %pos.slug, market = %pos.market_name, "Settlement pending...");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            Err(e) => {
+                warn!(error = %e, attempt, "Settlement check error");
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+        }
+    }
+    let won = resolved.unwrap_or_else(|| {
+        warn!(slug = %pos.slug, token_id = %pos.token_id, "Settlement unresolved after {max_attempts} attempts, defaulting to loss");
+        false
+    });
+    let _outcome_source = if resolved.is_some() { "gamma-api" } else { "fallback" };
 
     let pnl = if won {
         fill_size * (Decimal::ONE - fill_price)

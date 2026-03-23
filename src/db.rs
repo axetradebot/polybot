@@ -300,6 +300,34 @@ impl TradeDb {
         Ok(())
     }
 
+    /// Get all filled trades for reconciliation (re-checking outcomes).
+    /// Returns (order_id, slug, token_id, outcome, fill_price, contracts) for
+    /// trades that were filled.
+    pub fn get_filled_trades_for_reconciliation(&self) -> Result<Vec<(String, String, String, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT order_id, slug, token_id, outcome, COALESCE(fill_price, initial_price), contracts
+             FROM trades
+             WHERE filled = 1 AND order_id != ''
+             ORDER BY id DESC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
     /// Get stats for today, grouped by market.
     #[allow(dead_code)]
     pub fn market_stats_today(&self) -> Result<Vec<MarketDayStats>> {
