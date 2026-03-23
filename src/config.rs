@@ -166,6 +166,20 @@ pub struct TelegramConfig {
     pub daily_summary: bool,
     #[serde(default)]
     pub verbose_skips: bool,
+    #[serde(default = "default_true")]
+    pub on_fill: bool,
+    #[serde(default = "default_true")]
+    pub on_settlement: bool,
+    #[serde(default = "default_true")]
+    pub on_order_placed: bool,
+    #[serde(default = "default_true")]
+    pub on_startup: bool,
+    #[serde(default)]
+    pub on_watching: bool,
+    #[serde(default)]
+    pub on_window_miss: bool,
+    #[serde(default)]
+    pub on_heartbeat: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

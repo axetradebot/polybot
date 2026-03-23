@@ -226,6 +226,13 @@ on_trade = true
 on_error = true
 daily_summary = true
 verbose_skips = false
+on_fill = true
+on_settlement = true
+on_order_placed = false
+on_startup = true
+on_watching = false
+on_window_miss = false
+on_heartbeat = false
 
 [infrastructure]
 binance_ws_base = "wss://stream.binance.com:9443/ws"

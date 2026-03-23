@@ -30,6 +30,13 @@ pub struct TelegramNotifier {
     on_error: bool,
     on_daily_summary: bool,
     verbose_skips: bool,
+    on_fill: bool,
+    on_settlement: bool,
+    on_order_placed: bool,
+    on_startup: bool,
+    on_watching: bool,
+    on_window_miss: bool,
+    on_heartbeat: bool,
     mode: BotMode,
 }
 
@@ -52,6 +59,13 @@ impl TelegramNotifier {
             on_error: tg_config.on_error,
             on_daily_summary: tg_config.daily_summary,
             verbose_skips: tg_config.verbose_skips,
+            on_fill: tg_config.on_fill,
+            on_settlement: tg_config.on_settlement,
+            on_order_placed: tg_config.on_order_placed,
+            on_startup: tg_config.on_startup,
+            on_watching: tg_config.on_watching,
+            on_window_miss: tg_config.on_window_miss,
+            on_heartbeat: tg_config.on_heartbeat,
             mode,
         }
     }
@@ -68,7 +82,7 @@ impl TelegramNotifier {
         pipeline_ms: u128,
         order_id: &str,
     ) -> Result<()> {
-        if !self.enabled || !self.on_trade {
+        if !self.enabled || !self.on_order_placed {
             return Ok(());
         }
         let bet_usd = price * contracts;
@@ -136,7 +150,7 @@ impl TelegramNotifier {
         secs_remaining: u64,
         initial_reason: &str,
     ) -> Result<()> {
-        if !self.enabled || !self.on_trade {
+        if !self.enabled || !self.on_watching {
             return Ok(());
         }
         let msg = format!(
@@ -148,7 +162,7 @@ impl TelegramNotifier {
         self.send_message(&msg).await
     }
 
-    /// Fill notification — gated by `on_trade`.
+    /// Fill notification — gated by `on_fill`.
     pub async fn send_fill_multi(
         &self,
         trade: &TradeRecord,
@@ -159,7 +173,7 @@ impl TelegramNotifier {
         max_positions: usize,
         timing: Option<&OrderTiming>,
     ) -> Result<()> {
-        if !self.enabled || !self.on_trade {
+        if !self.enabled || !self.on_fill {
             return Ok(());
         }
 
@@ -208,7 +222,7 @@ impl TelegramNotifier {
         self.send_message(&msg).await
     }
 
-    /// Simple fill notification from position data — gated by `on_trade`.
+    /// Simple fill notification from position data — gated by `on_fill`.
     /// Used for live fills detected via order polling.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_fill_from_position(
@@ -227,7 +241,7 @@ impl TelegramNotifier {
         max_positions: usize,
         timing: Option<&OrderTiming>,
     ) -> Result<()> {
-        if !self.enabled || !self.on_trade {
+        if !self.enabled || !self.on_fill {
             return Ok(());
         }
 
@@ -262,7 +276,7 @@ impl TelegramNotifier {
         self.send_message(&msg).await
     }
 
-    /// Settlement notification — gated by `on_trade`.
+    /// Settlement notification — gated by `on_settlement`.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_settlement(
         &self,
@@ -281,7 +295,7 @@ impl TelegramNotifier {
         delta_pct: Decimal,
         mode_str: &str,
     ) -> Result<()> {
-        if !self.enabled || !self.on_trade {
+        if !self.enabled || !self.on_settlement {
             return Ok(());
         }
 
@@ -414,14 +428,14 @@ impl TelegramNotifier {
         self.send_message(&msg).await
     }
 
-    /// Startup notification — always sent when telegram is enabled.
+    /// Startup notification — gated by `on_startup`.
     /// Shows each market with its effective mode (LIVE/PAPER).
     pub async fn send_startup(
         &self,
         bankroll: Decimal,
         market_modes: &[(String, String)],
     ) -> Result<()> {
-        if !self.enabled {
+        if !self.enabled || !self.on_startup {
             return Ok(());
         }
         let mut market_lines = String::new();
@@ -441,7 +455,7 @@ impl TelegramNotifier {
         self.send_message(&msg).await
     }
 
-    /// Periodic heartbeat with market status — sent every N minutes.
+    /// Periodic heartbeat with market status — gated by `on_heartbeat`.
     /// Shows prices, deltas, positions, and why it's quiet if no trades.
     pub async fn send_heartbeat(
         &self,
@@ -454,7 +468,7 @@ impl TelegramNotifier {
         windows_scanned: u64,
         clob_balance: Option<Decimal>,
     ) -> Result<()> {
-        if !self.enabled {
+        if !self.enabled || !self.on_heartbeat {
             return Ok(());
         }
 
@@ -492,12 +506,12 @@ impl TelegramNotifier {
     }
 
     /// Window miss notification — sent when a window closes with no trades placed.
-    /// Gated by `on_trade`.
+    /// Gated by `on_window_miss`.
     pub async fn send_window_miss(
         &self,
         missed_markets: &[(String, String)], // (market_name, reason)
     ) -> Result<()> {
-        if !self.enabled || !self.on_trade || missed_markets.is_empty() {
+        if !self.enabled || !self.on_window_miss || missed_markets.is_empty() {
             return Ok(());
         }
         let mut msg = "⏭ Window closed — no trades placed".to_string();
