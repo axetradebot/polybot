@@ -151,6 +151,17 @@ pub async fn fetch_orderbook_lenient(clob_url: &str, token_id: &str) -> Result<O
         .max()
         .unwrap_or(Decimal::ZERO);
 
+    let depth_threshold = best_ask + Decimal::new(3, 2);
+    let depth_at_ask: Decimal = resp
+        .asks
+        .iter()
+        .filter_map(|l| {
+            let p = l.price.parse::<Decimal>().ok()?;
+            let s = l.size.parse::<Decimal>().ok()?;
+            if p <= depth_threshold { Some(s * p) } else { None }
+        })
+        .sum();
+
     let spread = best_ask - best_bid;
     let mid_price = (best_ask + best_bid) / Decimal::from(2);
 
@@ -158,7 +169,7 @@ pub async fn fetch_orderbook_lenient(clob_url: &str, token_id: &str) -> Result<O
         best_bid,
         best_ask,
         spread,
-        depth_at_ask: Decimal::ZERO,
+        depth_at_ask,
         mid_price,
     })
 }
