@@ -10,7 +10,7 @@ use crate::positions::PositionTracker;
 use crate::signal;
 use crate::types::{Direction, MarketInfo};
 
-const SANITY_MIN_ASK: &str = "0.30";
+const SANITY_MIN_ASK: &str = "0.50";
 
 /// A scored opportunity found by the scanner.
 #[derive(Debug, Clone)]
