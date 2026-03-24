@@ -242,7 +242,7 @@ delta_tiers = [
 name = "HYPE 5-min"
 asset = "HYPE"
 mode = "live"
-enabled = false
+enabled = true
 window_seconds = 300
 slug_prefix = "hype-updown-5m"
 resolution_source = "chainlink"
@@ -276,6 +276,26 @@ delta_tiers = [
     [0.10, 0.78],
     [0.15, 0.82],
     [0.25, 0.85],
+]
+
+[[markets]]
+name = "HYPE 15-min"
+asset = "HYPE"
+mode = "live"
+enabled = true
+window_seconds = 900
+slug_prefix = "hype-updown-15m"
+resolution_source = "chainlink"
+binance_symbol = "hypeusdt"
+chainlink_symbol = "hype/usd"
+entry_start_s = 30
+min_delta_pct = 0.10
+max_entry_price = 0.85
+delta_tiers = [
+    [0.10, 0.75],
+    [0.15, 0.78],
+    [0.20, 0.82],
+    [0.30, 0.85],
 ]
 
 [[markets]]

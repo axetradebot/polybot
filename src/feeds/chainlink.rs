@@ -212,6 +212,7 @@ fn binance_to_chainlink_symbol(sym: &str) -> Option<&'static str> {
         "xrpusdt" => Some("xrp/usd"),
         "dogeusdt" => Some("doge/usd"),
         "bnbusdt" => Some("bnb/usd"),
+        "hypeusdt" => Some("hype/usd"),
         _ => None,
     }
 }
