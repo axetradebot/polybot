@@ -21,9 +21,9 @@ total = 239
 max_concurrent_positions = 6
 max_per_market = 2
 bet_size_usd = 5.0
-daily_loss_limit_usd = 50.0
-consecutive_loss_pause = 5
-pause_duration_minutes = 30
+daily_loss_limit_usd = 100.0
+consecutive_loss_pause = 10
+pause_duration_minutes = 600
 
 [pricing]
 strategy = "orderbook_aware"
