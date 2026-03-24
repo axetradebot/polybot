@@ -1,6 +1,6 @@
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config::AppConfig;
 use crate::feeds::PriceFeeds;
@@ -243,10 +243,10 @@ pub async fn scan_all_markets(
             }
         };
 
-        // ── Token selection via CLOB API mapping ──
-        // CLOB API provides definitive mapping: Yes = UP token, No = DOWN token.
-        // Delta says UP → buy Yes token. Delta says DOWN → buy No token.
+        // ── Direction-only token selection via CLOB mapping ──
         let clob = &config.infra.polymarket_clob_url;
+        let sanity_floor: Decimal = SANITY_MIN_ASK.parse().unwrap();
+
         let trade_token_id = match direction {
             Direction::Up => market_info.up_token_id.clone(),
             Direction::Down => market_info.down_token_id.clone(),
@@ -256,9 +256,9 @@ pub async fn scan_all_markets(
             Ok(ob) => ob,
             Err(e) => {
                 let detail = format!("No asks on {} token: {e}", direction);
-                info!(market = %mkt.name, slug = %slug, direction = %direction,
+                debug!(market = %mkt.name, slug = %slug, direction = %direction,
                     token = %&trade_token_id[..trade_token_id.len().min(12)],
-                    secs_rem = secs_rem, "Skip: {detail}");
+                    secs_rem = secs_rem, "{detail}");
                 skip_reasons.insert(mkt.name.clone(), format!("Orderbook: {detail}"));
                 evaluations.push(ScanEvaluation {
                     market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
@@ -272,13 +272,12 @@ pub async fn scan_all_markets(
             }
         };
 
-        let sanity_floor: Decimal = SANITY_MIN_ASK.parse().unwrap();
         if ob.best_ask < sanity_floor {
             let detail = format!(
                 "{direction} signal but trade token ask=${:.2} < ${sanity_floor} — market disagrees",
                 ob.best_ask
             );
-            warn!(market = %mkt.name, slug = %slug, direction = %direction,
+            debug!(market = %mkt.name, slug = %slug, direction = %direction,
                 best_ask = %ob.best_ask, delta = delta_f64, "{detail}");
             skip_reasons.insert(mkt.name.clone(), detail.clone());
             evaluations.push(ScanEvaluation {

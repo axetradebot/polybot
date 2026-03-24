@@ -35,7 +35,7 @@ entry_cutoff_s = 4
 taker_delta_threshold = 0.0
 
 [scanner]
-scan_interval_ms = 1000
+scan_interval_ms = 500
 min_edge_score = 0.0
 max_orders_per_cycle = 3
 

@@ -742,7 +742,7 @@ async fn run_scanner_loop(
     let mut last_skip_reasons: HashMap<String, String> = HashMap::new();
     let mut skip_notified: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut shadow_recorded: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut watching_markets: HashMap<String, u64> = HashMap::new();
+    let mut watching_markets: HashMap<String, (u64, u32)> = HashMap::new();
     let mut window_max_delta: HashMap<String, (f64, String)> = HashMap::new();
     let mut last_analytics_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let scan_interval = Duration::from_millis(config.scanner.scan_interval_ms);
@@ -1103,8 +1103,8 @@ async fn run_scanner_loop(
                             .get(&mkt.name)
                             .cloned()
                             .unwrap_or_else(|| "No opportunity found".into());
-                        let reason = if let Some(started_secs) = was_watching {
-                            format!("Watched ~{}s — {}", started_secs, base_reason)
+                        let reason = if let Some((started_secs, poll_count)) = was_watching {
+                            format!("Watched ~{}s (polled {} times) — {}", started_secs, poll_count, base_reason)
                         } else {
                             base_reason
                         };
@@ -1420,8 +1420,10 @@ async fn run_scanner_loop(
             if is_recoverable {
                 if let Some(ref dir) = eval.direction {
                     let watch_key = format!("{}-{}", eval.market_name, eval.window_ts);
-                    if !watching_markets.contains_key(&watch_key) {
-                        watching_markets.insert(watch_key, eval.secs_remaining);
+                    if let Some(entry) = watching_markets.get_mut(&watch_key) {
+                        entry.1 += 1;
+                    } else {
+                        watching_markets.insert(watch_key, (eval.secs_remaining, 1));
                         telegram.send_watching(
                             &eval.market_name,
                             dir,
@@ -1496,14 +1498,15 @@ async fn run_scanner_loop(
 
                 // If this market was being watched, the orderbook just improved
                 let watch_key = format!("{}-{}", opp.market_name, opp.window_ts);
-                if let Some(started_secs) = watching_markets.remove(&watch_key) {
+                if let Some((started_secs, poll_count)) = watching_markets.remove(&watch_key) {
                     info!(
                         market = %opp.market_name,
                         direction = %opp.direction,
                         delta = opp.delta_pct,
                         best_ask = %opp.best_ask,
                         watched_for = %format!("~{}s", started_secs.saturating_sub(opp.seconds_remaining)),
-                        "Watching -> orderbook appeared! Placing order"
+                        polls = poll_count,
+                        "Watching -> orderbook appeared! Placing order (polled {} times)", poll_count
                     );
                 }
 
