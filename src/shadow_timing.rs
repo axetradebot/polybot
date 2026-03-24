@@ -17,7 +17,7 @@ use crate::types::MarketInfo;
 pub type SharedTokenCache = Arc<RwLock<HashMap<String, MarketInfo>>>;
 pub type SharedSlugMap = Arc<RwLock<HashMap<String, String>>>;
 
-const SNAPSHOT_TARGETS: [u64; 5] = [40, 30, 20, 10, 5];
+const SNAPSHOT_TARGETS: [u64; 6] = [120, 40, 30, 20, 10, 5];
 const DELTA_THRESHOLD_PCT: f64 = 0.04;
 
 fn nearest_snapshot(seconds_remaining: u64) -> Option<u64> {
@@ -70,9 +70,23 @@ pub async fn run_shadow_timing(
                 None => continue,
             };
 
-            // Skip if this snapshot exceeds the market's entry_start_s
-            // (e.g., a non-BTC market with entry_start_s=30 shouldn't snapshot at T-40)
-            if t_sec > mkt.entry_start_s + 2 {
+            // T-120 is a special early snapshot — only record if delta >= 0.20%
+            if t_sec == 120 {
+                let early_price = match price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let early_open = match price_feeds.get_window_open(&mkt.slug_prefix, window_ts).await {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let (_, early_delta) = signal::compute_delta(early_price, early_open);
+                let early_delta_f64: f64 = early_delta.try_into().unwrap_or(0.0);
+                if early_delta_f64 < 0.20 {
+                    continue;
+                }
+            } else if t_sec > mkt.entry_start_s + 2 {
+                // Skip non-T-120 snapshots that exceed the market's entry_start_s
                 continue;
             }
 
