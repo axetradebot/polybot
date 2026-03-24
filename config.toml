@@ -30,13 +30,13 @@ strategy = "orderbook_aware"
 undercut_offset = 0.01
 tighten_step = 0.01
 adjust_interval_ms = 1000
-min_entry_price = 0.55
-entry_cutoff_s = 4
+min_entry_price = 0.45
+entry_cutoff_s = 15
 taker_delta_threshold = 0.0
 
 [scanner]
 scan_interval_ms = 500
-min_edge_score = 0.025
+min_edge_score = 0.045
 max_orders_per_cycle = 3
 
 # ============================================================
@@ -68,7 +68,7 @@ undercut_offset = 0.01
 tighten_step = 0.01
 adjust_interval_ms = 500
 delta_tiers = [
-    [0.05, 0.80],
+    [0.05, 0.78],
     [0.07, 0.85],
     [0.10, 0.88],
     [0.15, 0.92],
@@ -114,7 +114,7 @@ entry_start_s = 40
 min_delta_pct = 0.05
 max_entry_price = 0.95
 delta_tiers = [
-    [0.05, 0.80],
+    [0.05, 0.78],
     [0.07, 0.85],
     [0.10, 0.88],
     [0.15, 0.92],
