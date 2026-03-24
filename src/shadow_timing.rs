@@ -99,20 +99,19 @@ pub async fn run_shadow_timing(
 
             let window_id = build_window_id(&mkt.slug_prefix, mkt.window_seconds, window_ts);
 
-            // Determine if we should fetch orderbooks for this snapshot
-            let is_early = t_sec == 40 || t_sec == 30;
+            // Determine if we should fetch orderbooks for this snapshot.
+            // For markets with entry_start_s <= 25, T-20 is the earliest snapshot
+            // and acts as the qualifying "early" check (since T-40/T-30 are skipped).
+            let is_early = t_sec >= 20;
             let market_window_key = (mkt.name.clone(), window_ts);
 
             let should_fetch_book = if delta_f64 >= DELTA_THRESHOLD_PCT {
                 if is_early {
                     qualified_early.insert(market_window_key.clone(), true);
-                    true
-                } else {
-                    // T-20, T-10, T-5: only if the market was interesting at T-40/T-30
-                    qualified_early.get(&market_window_key).copied().unwrap_or(false)
                 }
+                qualified_early.get(&market_window_key).copied().unwrap_or(true)
             } else {
-                if is_early {
+                if is_early && !qualified_early.contains_key(&market_window_key) {
                     qualified_early.insert(market_window_key.clone(), false);
                 }
                 false
