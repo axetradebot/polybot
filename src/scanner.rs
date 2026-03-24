@@ -10,7 +10,7 @@ use crate::positions::PositionTracker;
 use crate::signal;
 use crate::types::{Direction, MarketInfo};
 
-const SANITY_MIN_ASK: &str = "0.50";
+const SANITY_MIN_ASK: &str = "0.30";
 
 /// A scored opportunity found by the scanner.
 #[derive(Debug, Clone)]
@@ -252,23 +252,44 @@ pub async fn scan_all_markets(
             Direction::Down => market_info.down_token_id.clone(),
         };
 
+        let complement_token_id = match direction {
+            Direction::Up => market_info.down_token_id.clone(),
+            Direction::Down => market_info.up_token_id.clone(),
+        };
+
         let ob = match orderbook::fetch_orderbook(clob, &trade_token_id).await {
             Ok(ob) => ob,
             Err(e) => {
-                let detail = format!("No asks on {} token: {e}", direction);
-                debug!(market = %mkt.name, slug = %slug, direction = %direction,
-                    token = %&trade_token_id[..trade_token_id.len().min(12)],
-                    secs_rem = secs_rem, "{detail}");
-                skip_reasons.insert(mkt.name.clone(), format!("Orderbook: {detail}"));
-                evaluations.push(ScanEvaluation {
-                    market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
-                    direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
-                    open_price: Some(open_price), current_price: Some(current_price),
-                    best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
-                    suggested_entry: None, max_entry: None, edge_score: None,
-                    result: "SKIP_ORDERBOOK".into(), detail: Some(detail),
-                });
-                continue;
+                debug!(market = %mkt.name, direction = %direction,
+                    "No direct asks on {} token, trying complement...", direction);
+
+                match orderbook::fetch_orderbook_via_complement(clob, &complement_token_id).await {
+                    Ok(comp_ob) => {
+                        info!(market = %mkt.name, direction = %direction,
+                            effective_ask = %comp_ob.best_ask,
+                            "Using complement pricing for {} token", direction);
+                        comp_ob
+                    }
+                    Err(ce) => {
+                        let detail = format!(
+                            "No asks on {} token: {e} (complement also empty: {ce})",
+                            direction
+                        );
+                        debug!(market = %mkt.name, slug = %slug, direction = %direction,
+                            token = %&trade_token_id[..trade_token_id.len().min(12)],
+                            secs_rem = secs_rem, "{detail}");
+                        skip_reasons.insert(mkt.name.clone(), format!("Orderbook: {detail}"));
+                        evaluations.push(ScanEvaluation {
+                            market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
+                            direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
+                            open_price: Some(open_price), current_price: Some(current_price),
+                            best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
+                            suggested_entry: None, max_entry: None, edge_score: None,
+                            result: "SKIP_ORDERBOOK".into(), detail: Some(detail),
+                        });
+                        continue;
+                    }
+                }
             }
         };
 

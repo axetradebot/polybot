@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -296,6 +296,89 @@ impl OrderbookCache {
         let max = self.max_age_ms;
         map.retain(|_, e| (e.inserted_at.elapsed().as_millis() as u64) <= max * 5);
     }
+}
+
+/// Fetch the complement token's orderbook and derive the effective price for the
+/// directional token via complement matching.
+///
+/// When the directional token (e.g., DOWN) has no asks, we check the complement
+/// token's (UP) asks. If UP has asks at price X (below $0.50), a BUY order for
+/// DOWN at (1-X) can be filled via the CLOB's complement matching engine (mint
+/// UP+DOWN pair, sell UP at X, deliver DOWN at 1-X).
+pub async fn fetch_orderbook_via_complement(
+    clob_url: &str,
+    complement_token_id: &str,
+) -> Result<OrderbookState> {
+    let url = format!("{}/book?token_id={}", clob_url, complement_token_id);
+
+    let resp: BookResponse = http_client()
+        .get(&url)
+        .send()
+        .await
+        .context("complement orderbook HTTP request failed")?
+        .json()
+        .await
+        .context("failed to parse complement orderbook JSON")?;
+
+    let cheap_asks: Vec<(Decimal, Decimal)> = resp
+        .asks
+        .iter()
+        .filter_map(|l| {
+            let p = l.price.parse::<Decimal>().ok()?;
+            let s = l.size.parse::<Decimal>().ok()?;
+            if p <= Decimal::new(50, 2) {
+                Some((p, s))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if cheap_asks.is_empty() {
+        anyhow::bail!(
+            "complement token has no asks below $0.50 (asks={}, bids={})",
+            resp.asks.len(),
+            resp.bids.len()
+        );
+    }
+
+    let complement_best_ask = cheap_asks.iter().map(|(p, _)| *p).min().unwrap();
+    let effective_ask = Decimal::ONE - complement_best_ask;
+
+    let depth_threshold = complement_best_ask + Decimal::new(3, 2);
+    let depth_at_ask: Decimal = cheap_asks
+        .iter()
+        .filter(|(p, _)| *p <= depth_threshold)
+        .map(|(p, s)| *s * (Decimal::ONE - *p))
+        .sum();
+
+    let best_bid = resp
+        .bids
+        .iter()
+        .filter_map(|l| l.price.parse::<Decimal>().ok())
+        .max()
+        .map(|p| Decimal::ONE - p)
+        .unwrap_or(Decimal::ZERO);
+
+    let spread = effective_ask - best_bid;
+    let mid_price = (effective_ask + best_bid) / Decimal::from(2);
+
+    info!(
+        complement_token = %&complement_token_id[..complement_token_id.len().min(16)],
+        complement_best_ask = %complement_best_ask,
+        effective_ask = %effective_ask,
+        depth_usd = %depth_at_ask,
+        "Complement pricing: complement ask ${} → effective directional ask ${}",
+        complement_best_ask, effective_ask
+    );
+
+    Ok(OrderbookState {
+        best_bid,
+        best_ask: effective_ask,
+        spread,
+        depth_at_ask,
+        mid_price,
+    })
 }
 
 /// Diagnostic: fetch orderbooks for BOTH tokens and report which has asks.
