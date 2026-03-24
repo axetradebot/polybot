@@ -36,7 +36,7 @@ taker_delta_threshold = 0.0
 
 [scanner]
 scan_interval_ms = 500
-min_edge_score = 0.0
+min_edge_score = 0.025
 max_orders_per_cycle = 3
 
 # ============================================================
@@ -62,16 +62,17 @@ binance_symbol = "btcusdt"
 chainlink_symbol = "btc/usd"
 entry_start_s = 40
 entry_cutoff_s = 3
-min_delta_pct = 0.07
+min_delta_pct = 0.05
 max_entry_price = 0.85
 undercut_offset = 0.01
 tighten_step = 0.01
 adjust_interval_ms = 500
 delta_tiers = [
-    [0.07, 0.76],
-    [0.10, 0.80],
-    [0.15, 0.83],
-    [0.20, 0.85],
+    [0.05, 0.76],
+    [0.07, 0.80],
+    [0.10, 0.85],
+    [0.15, 0.90],
+    [0.20, 0.94],
 ]
 
 [[markets]]
@@ -86,16 +87,17 @@ binance_symbol = "btcusdt"
 chainlink_symbol = "btc/usd"
 entry_start_s = 40
 entry_cutoff_s = 3
-min_delta_pct = 0.07
+min_delta_pct = 0.05
 max_entry_price = 0.85
 undercut_offset = 0.01
 tighten_step = 0.01
 adjust_interval_ms = 1000
 delta_tiers = [
-    [0.07, 0.76],
-    [0.10, 0.80],
-    [0.15, 0.83],
-    [0.20, 0.85],
+    [0.05, 0.76],
+    [0.07, 0.80],
+    [0.10, 0.85],
+    [0.15, 0.90],
+    [0.20, 0.94],
 ]
 
 [[markets]]
@@ -109,13 +111,14 @@ resolution_source = "chainlink"
 binance_symbol = "ethusdt"
 chainlink_symbol = "eth/usd"
 entry_start_s = 40
-min_delta_pct = 0.07
+min_delta_pct = 0.05
 max_entry_price = 0.88
 delta_tiers = [
-    [0.07, 0.76],
-    [0.10, 0.80],
-    [0.15, 0.85],
-    [0.20, 0.88],
+    [0.05, 0.76],
+    [0.07, 0.80],
+    [0.10, 0.85],
+    [0.15, 0.90],
+    [0.20, 0.94],
 ]
 
 [[markets]]
@@ -129,13 +132,14 @@ resolution_source = "chainlink"
 binance_symbol = "ethusdt"
 chainlink_symbol = "eth/usd"
 entry_start_s = 40
-min_delta_pct = 0.07
+min_delta_pct = 0.05
 max_entry_price = 0.87
 delta_tiers = [
-    [0.07, 0.76],
-    [0.10, 0.80],
-    [0.15, 0.84],
-    [0.20, 0.87],
+    [0.05, 0.76],
+    [0.07, 0.80],
+    [0.10, 0.85],
+    [0.15, 0.90],
+    [0.20, 0.94],
 ]
 
 [[markets]]
@@ -149,13 +153,13 @@ resolution_source = "chainlink"
 binance_symbol = "solusdt"
 chainlink_symbol = "sol/usd"
 entry_start_s = 40
-min_delta_pct = 0.15
+min_delta_pct = 0.07
 max_entry_price = 0.87
 delta_tiers = [
-    [0.15, 0.76],
-    [0.20, 0.80],
-    [0.25, 0.84],
-    [0.30, 0.87],
+    [0.07, 0.76],
+    [0.10, 0.80],
+    [0.15, 0.84],
+    [0.20, 0.87],
 ]
 
 [[markets]]
@@ -169,13 +173,13 @@ resolution_source = "chainlink"
 binance_symbol = "solusdt"
 chainlink_symbol = "sol/usd"
 entry_start_s = 40
-min_delta_pct = 0.15
+min_delta_pct = 0.07
 max_entry_price = 0.82
 delta_tiers = [
-    [0.15, 0.75],
-    [0.20, 0.78],
-    [0.25, 0.80],
-    [0.30, 0.82],
+    [0.07, 0.75],
+    [0.10, 0.78],
+    [0.15, 0.80],
+    [0.20, 0.82],
 ]
 
 [[markets]]
@@ -189,13 +193,13 @@ resolution_source = "chainlink"
 binance_symbol = "xrpusdt"
 chainlink_symbol = "xrp/usd"
 entry_start_s = 40
-min_delta_pct = 0.15
+min_delta_pct = 0.07
 max_entry_price = 0.86
 delta_tiers = [
-    [0.15, 0.76],
-    [0.20, 0.80],
-    [0.25, 0.83],
-    [0.30, 0.86],
+    [0.07, 0.76],
+    [0.10, 0.80],
+    [0.15, 0.83],
+    [0.20, 0.86],
 ]
 
 [[markets]]
@@ -209,12 +213,12 @@ resolution_source = "chainlink"
 binance_symbol = "xrpusdt"
 chainlink_symbol = "xrp/usd"
 entry_start_s = 40
-min_delta_pct = 0.15
+min_delta_pct = 0.07
 max_entry_price = 0.80
 delta_tiers = [
-    [0.15, 0.75],
-    [0.20, 0.78],
-    [0.25, 0.80],
+    [0.07, 0.75],
+    [0.10, 0.78],
+    [0.15, 0.80],
 ]
 
 [[markets]]
@@ -228,13 +232,13 @@ resolution_source = "chainlink"
 binance_symbol = "dogeusdt"
 chainlink_symbol = "doge/usd"
 entry_start_s = 40
-min_delta_pct = 0.15
+min_delta_pct = 0.07
 max_entry_price = 0.84
 delta_tiers = [
-    [0.15, 0.75],
-    [0.20, 0.78],
-    [0.25, 0.82],
-    [0.30, 0.84],
+    [0.07, 0.75],
+    [0.10, 0.78],
+    [0.15, 0.82],
+    [0.20, 0.84],
 ]
 
 [[markets]]
@@ -269,13 +273,13 @@ resolution_source = "chainlink"
 binance_symbol = "bnbusdt"
 chainlink_symbol = "bnb/usd"
 entry_start_s = 40
-min_delta_pct = 0.15
+min_delta_pct = 0.07
 max_entry_price = 0.88
 delta_tiers = [
-    [0.15, 0.76],
-    [0.20, 0.80],
-    [0.25, 0.85],
-    [0.30, 0.88],
+    [0.07, 0.76],
+    [0.10, 0.80],
+    [0.15, 0.85],
+    [0.20, 0.88],
 ]
 
 [[markets]]
