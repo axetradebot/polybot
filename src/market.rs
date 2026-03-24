@@ -33,9 +33,7 @@ pub fn next_window_ts(window_seconds: u64) -> u64 {
 }
 
 /// Resolve market metadata from Gamma API using the market slug.
-/// Token IDs are stored as (token_a, token_b) without attempting to label
-/// which is UP/DOWN — the scanner determines that at runtime via orderbook
-/// mid-price comparison.
+/// Uses the `outcomes` field to correctly map token IDs to UP/DOWN.
 pub async fn resolve_market(slug: &str, _clob_url: &str) -> Result<MarketInfo> {
     use polymarket_client_sdk::gamma::types::request::MarketBySlugRequest;
     use polymarket_client_sdk::gamma::Client as GammaClient;
@@ -61,6 +59,47 @@ pub async fn resolve_market(slug: &str, _clob_url: &str) -> Result<MarketInfo> {
         anyhow::bail!("Market has fewer than 2 token IDs: {slug}");
     }
 
+    let outcomes = market.outcomes.as_deref().unwrap_or(&[]);
+
+    let (up_token_id, down_token_id) = if outcomes.len() >= 2 {
+        let up_idx = outcomes.iter().position(|o| {
+            let lower = o.to_lowercase();
+            lower == "up" || lower == "yes"
+        });
+        let down_idx = outcomes.iter().position(|o| {
+            let lower = o.to_lowercase();
+            lower == "down" || lower == "no"
+        });
+        match (up_idx, down_idx) {
+            (Some(ui), Some(di)) => {
+                info!(
+                    slug = %slug,
+                    outcomes = ?outcomes,
+                    up_idx = ui,
+                    down_idx = di,
+                    up_token = %token_ids[ui],
+                    down_token = %token_ids[di],
+                    "Mapped tokens via outcomes field"
+                );
+                (token_ids[ui].to_string(), token_ids[di].to_string())
+            }
+            _ => {
+                warn!(
+                    slug = %slug,
+                    outcomes = ?outcomes,
+                    "Could not find Up/Down in outcomes, falling back to array order"
+                );
+                (token_ids[0].to_string(), token_ids[1].to_string())
+            }
+        }
+    } else {
+        warn!(
+            slug = %slug,
+            "No outcomes field, falling back to array order"
+        );
+        (token_ids[0].to_string(), token_ids[1].to_string())
+    };
+
     let accepting = market.accepting_orders.unwrap_or(false);
     let neg_risk = market.neg_risk.unwrap_or(false);
     let tick_size = market
@@ -69,16 +108,16 @@ pub async fn resolve_market(slug: &str, _clob_url: &str) -> Result<MarketInfo> {
 
     info!(
         slug = %slug,
-        token_a = %token_ids[0],
-        token_b = %token_ids[1],
+        up_token = %up_token_id,
+        down_token = %down_token_id,
         accepting = accepting,
-        "Resolved market tokens (price-based detection at scan time)"
+        "Resolved market tokens"
     );
 
     let info = MarketInfo {
         condition_id,
-        up_token_id: token_ids[0].to_string(),
-        down_token_id: token_ids[1].to_string(),
+        up_token_id,
+        down_token_id,
         slug: slug.to_string(),
         accepting_orders: accepting,
         neg_risk,

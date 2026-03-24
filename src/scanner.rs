@@ -243,37 +243,31 @@ pub async fn scan_all_markets(
             }
         };
 
-        // ── Price-based token detection ──
-        // Fetch BOTH tokens' orderbooks (lenient — need both for price comparison).
-        // The token with the higher mid-price is the one the market thinks will win.
-        // This replaces string-based "Up"/"Down"/"Yes"/"No" label matching entirely.
+        // ── Direction-based token selection with market validation ──
+        // Select the token matching our delta direction (UP → up_token, DOWN → down_token).
+        // Then validate the market agrees (our token has higher mid-price).
         let clob = &config.infra.polymarket_clob_url;
-        let token_a_id = &market_info.up_token_id;
-        let token_b_id = &market_info.down_token_id;
-        let (ob_a, ob_b) = tokio::join!(
-            orderbook::fetch_orderbook_lenient(clob, token_a_id),
-            orderbook::fetch_orderbook_lenient(clob, token_b_id),
+        let up_token_id = &market_info.up_token_id;
+        let down_token_id = &market_info.down_token_id;
+        let (ob_up, ob_down) = tokio::join!(
+            orderbook::fetch_orderbook_lenient(clob, up_token_id),
+            orderbook::fetch_orderbook_lenient(clob, down_token_id),
         );
 
-        // Check which tokens have real orderbook data (not defaults)
-        let a_has_asks = ob_a.as_ref().ok().map_or(false, |a| a.best_ask < Decimal::ONE);
-        let b_has_asks = ob_b.as_ref().ok().map_or(false, |b| b.best_ask < Decimal::ONE);
+        let up_has_asks = ob_up.as_ref().ok().map_or(false, |a| a.best_ask < Decimal::ONE);
+        let down_has_asks = ob_down.as_ref().ok().map_or(false, |b| b.best_ask < Decimal::ONE);
 
-        // Settled market detection: ONLY flag when BOTH tokens have asks > $0.95.
-        // One-sided patterns (one token empty, other at pennies) are handled
-        // downstream by the sanity floor ($0.30) and "no tradeable asks" checks,
-        // which enter watching mode and keep polling instead of giving up.
         let settled_threshold = Decimal::new(95, 2);
-        let is_settled = match (&ob_a, &ob_b) {
+        let is_settled = match (&ob_up, &ob_down) {
             (Ok(a), Ok(b)) => {
                 a.best_ask > settled_threshold && b.best_ask > settled_threshold
             }
             _ => false,
         };
         if is_settled {
-            let detail = if let (Ok(a), Ok(b)) = (&ob_a, &ob_b) {
+            let detail = if let (Ok(a), Ok(b)) = (&ob_up, &ob_down) {
                 format!(
-                    "Both asks > $0.95: A(ask={} bid={}) B(ask={} bid={})",
+                    "Both asks > $0.95: UP(ask={} bid={}) DOWN(ask={} bid={})",
                     a.best_ask, a.best_bid, b.best_ask, b.best_bid
                 )
             } else {
@@ -285,88 +279,70 @@ pub async fn scan_all_markets(
                 market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
                 direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
                 open_price: Some(open_price), current_price: Some(current_price),
-                best_ask: ob_a.as_ref().ok().map(|a| a.best_ask),
-                best_bid: ob_a.as_ref().ok().map(|a| a.best_bid),
-                spread: ob_a.as_ref().ok().map(|a| a.spread),
-                depth_at_ask: ob_a.as_ref().ok().map(|a| a.depth_at_ask),
+                best_ask: ob_up.as_ref().ok().map(|a| a.best_ask),
+                best_bid: ob_up.as_ref().ok().map(|a| a.best_bid),
+                spread: ob_up.as_ref().ok().map(|a| a.spread),
+                depth_at_ask: ob_up.as_ref().ok().map(|a| a.depth_at_ask),
                 suggested_entry: None, max_entry: None, edge_score: None,
                 result: "SKIP_SETTLED".into(), detail: Some(detail),
             });
             continue;
         }
 
-        // Determine which token to buy using mid-price comparison.
-        // Only use real mid-prices (ignore tokens with no asks — their $1.00 default
-        // creates a fake mid of $0.50 that tricks the comparison).
+        // Select token based on our delta direction
         let sanity_floor: Decimal = SANITY_MIN_ASK.parse().unwrap();
-        let (token_id, _other_token_id, our_ob, other_ob) = {
-            let real_mid = |ob_result: &Result<crate::orderbook::OrderbookState, _>, has_asks: bool| -> Option<Decimal> {
-                if !has_asks { return None; }
-                ob_result.as_ref().ok().map(|ob| (ob.best_bid + ob.best_ask) / Decimal::from(2))
-            };
-            let mid_a = real_mid(&ob_a, a_has_asks);
-            let mid_b = real_mid(&ob_b, b_has_asks);
-
-            let swap = match (mid_a, mid_b) {
-                (Some(ma), Some(mb)) => {
-                    info!(
-                        market = %mkt.name, slug = %slug, direction = %direction,
-                        mid_a = %ma, mid_b = %mb,
-                        selected = if ma >= mb { "A" } else { "B" },
-                        "Price-based token detection (both have asks)"
-                    );
-                    ma < mb
-                }
-                (None, Some(mb)) => {
-                    if mb < sanity_floor {
-                        info!(
-                            market = %mkt.name, slug = %slug, direction = %direction,
-                            mid_b = %mb,
-                            "Only token B has asks at pennies — loser side. Winning token A book empty, waiting for asks"
-                        );
-                        false // keep A selected; downstream "no tradeable asks" will trigger watching mode
-                    } else {
-                        info!(
-                            market = %mkt.name, slug = %slug, direction = %direction,
-                            mid_b = %mb, "Only token B has asks — selecting B"
-                        );
-                        true
-                    }
-                }
-                (Some(ma), None) => {
-                    if ma < sanity_floor {
-                        info!(
-                            market = %mkt.name, slug = %slug, direction = %direction,
-                            mid_a = %ma,
-                            "Only token A has asks at pennies — loser side. Winning token B book empty, waiting for asks"
-                        );
-                        true // swap to B; downstream "no tradeable asks" will trigger watching mode
-                    } else {
-                        info!(
-                            market = %mkt.name, slug = %slug, direction = %direction,
-                            mid_a = %ma, "Only token A has asks — selecting A"
-                        );
-                        false
-                    }
-                }
-                (None, None) => {
-                    info!(market = %mkt.name, slug = %slug, "Neither token has asks");
-                    false
-                }
-            };
-
-            if swap {
-                (token_b_id.clone(), token_a_id.clone(), ob_b, ob_a)
-            } else {
-                (token_a_id.clone(), token_b_id.clone(), ob_a, ob_b)
-            }
+        let (our_token_id, other_token_id, our_ob, other_ob) = match direction {
+            Direction::Up => (up_token_id.clone(), down_token_id.clone(), ob_up, ob_down),
+            Direction::Down => (down_token_id.clone(), up_token_id.clone(), ob_down, ob_up),
         };
+        let our_has_asks = match direction { Direction::Up => up_has_asks, Direction::Down => down_has_asks };
+        let other_has_asks = match direction { Direction::Up => down_has_asks, Direction::Down => up_has_asks };
+
+        // Validate: market should agree with our direction (our token mid > other token mid)
+        let our_mid = if our_has_asks {
+            our_ob.as_ref().ok().map(|ob| (ob.best_bid + ob.best_ask) / Decimal::from(2))
+        } else { None };
+        let other_mid = if other_has_asks {
+            other_ob.as_ref().ok().map(|ob| (ob.best_bid + ob.best_ask) / Decimal::from(2))
+        } else { None };
+
+        if let (Some(ours), Some(theirs)) = (our_mid, other_mid) {
+            if theirs > ours {
+                let detail = format!(
+                    "Direction mismatch: delta says {} but market prices {dir} token mid=${ours:.2} < opposite mid=${theirs:.2}",
+                    direction, dir = direction
+                );
+                info!(market = %mkt.name, slug = %slug, direction = %direction,
+                    our_mid = %ours, other_mid = %theirs, delta = delta_f64,
+                    "SKIP: market disagrees with our direction — would buy losing side");
+                skip_reasons.insert(mkt.name.clone(), detail.clone());
+                evaluations.push(ScanEvaluation {
+                    market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
+                    direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
+                    open_price: Some(open_price), current_price: Some(current_price),
+                    best_ask: our_ob.as_ref().ok().map(|a| a.best_ask),
+                    best_bid: our_ob.as_ref().ok().map(|a| a.best_bid),
+                    spread: our_ob.as_ref().ok().map(|a| a.spread),
+                    depth_at_ask: our_ob.as_ref().ok().map(|a| a.depth_at_ask),
+                    suggested_entry: None, max_entry: None, edge_score: None,
+                    result: "SKIP_DIRECTION_MISMATCH".into(), detail: Some(detail),
+                });
+                continue;
+            }
+            info!(
+                market = %mkt.name, slug = %slug, direction = %direction,
+                our_mid = %ours, other_mid = %theirs,
+                "Direction confirmed: delta and market agree"
+            );
+        }
+
+        let (token_id, _other_token_id, our_ob, other_ob) = (our_token_id, other_token_id, our_ob, other_ob);
 
         // Validate our token has real asks
         let ob = match our_ob {
             Ok(ob) if ob.best_ask < Decimal::ONE => ob,
             Ok(_) | Err(_) => {
-                let detail = if !a_has_asks && !b_has_asks {
+                let detail = if !our_has_asks && !other_has_asks {
                     "Neither token has tradeable asks".to_string()
                 } else {
                     let other_ask = other_ob.as_ref().ok().map(|o| o.best_ask);
@@ -386,7 +362,7 @@ pub async fn scan_all_markets(
                     } else {
                         format!(
                             "No tradeable asks (a_has={}, b_has={})",
-                            a_has_asks, b_has_asks
+                            our_has_asks, other_has_asks
                         )
                     }
                 };

@@ -421,18 +421,36 @@ async fn run_resolution_audit_checker(db: Arc<TradeDb>) {
                     }
 
                     let outcome_prices = market.outcome_prices.unwrap_or_default();
+                    let outcomes = market.outcomes.unwrap_or_default();
                     if outcome_prices.len() < 2 {
                         warn!(slug = %slug, "Market closed but missing outcome_prices");
                         continue;
                     }
 
-                    let poly_resolution = if outcome_prices[0] == rust_decimal::Decimal::ONE {
-                        "UP"
-                    } else if outcome_prices[1] == rust_decimal::Decimal::ONE {
-                        "DOWN"
+                    let poly_resolution = if outcomes.len() >= 2 {
+                        let winner_idx = outcome_prices.iter().position(|p| *p == rust_decimal::Decimal::ONE);
+                        match winner_idx {
+                            Some(idx) => {
+                                let label = outcomes[idx].to_uppercase();
+                                if label == "UP" || label == "YES" { "UP" }
+                                else if label == "DOWN" || label == "NO" { "DOWN" }
+                                else {
+                                    warn!(slug = %slug, outcome = %outcomes[idx], "Unknown outcome label");
+                                    continue;
+                                }
+                            }
+                            None => {
+                                warn!(slug = %slug, prices = ?outcome_prices, "Market closed but no winner (no 1.0 price)");
+                                continue;
+                            }
+                        }
                     } else {
-                        warn!(slug = %slug, prices = ?outcome_prices, "Market closed but no clear winner");
-                        continue;
+                        if outcome_prices[0] == rust_decimal::Decimal::ONE { "UP" }
+                        else if outcome_prices[1] == rust_decimal::Decimal::ONE { "DOWN" }
+                        else {
+                            warn!(slug = %slug, prices = ?outcome_prices, "Market closed but no clear winner");
+                            continue;
+                        }
                     };
 
                     if let Err(e) = db.update_resolution_audit(market_name, *window_ts, poly_resolution) {
