@@ -780,6 +780,49 @@ impl TradeDb {
         Ok(())
     }
 
+    /// Re-settle shadow_trades using the authoritative Polymarket resolution,
+    /// overwriting the earlier price-based inference.
+    pub fn resettle_shadow_with_poly(
+        &self,
+        market_name: &str,
+        window_ts: u64,
+        poly_resolution: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute(
+            "UPDATE shadow_trades SET
+                actual_outcome = ?1,
+                would_have_won = CASE
+                    WHEN ?1 = 'FLAT' THEN 0
+                    WHEN direction_at_entry = ?1 THEN 1
+                    ELSE 0
+                END
+             WHERE market_name = ?2 AND window_ts = ?3",
+            params![poly_resolution, market_name, window_ts as i64],
+        )?;
+        Ok(affected)
+    }
+
+    /// Re-settle shadow_timing rows using the authoritative Polymarket resolution,
+    /// overwriting the earlier price-based inference.
+    pub fn resettle_shadow_timing_with_poly(
+        &self,
+        market_name: &str,
+        window_ts: u64,
+        poly_resolution: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let suffix = format!("%-{}", window_ts);
+        let affected = conn.execute(
+            "UPDATE shadow_timing SET
+                actual_outcome = ?1,
+                would_have_won = CASE WHEN direction = ?1 THEN 1 ELSE 0 END
+             WHERE market_name = ?2 AND window_id LIKE ?3",
+            params![poly_resolution, market_name, suffix],
+        )?;
+        Ok(affected)
+    }
+
     pub fn insert_resolution_audit(
         &self,
         market_name: &str,
@@ -816,6 +859,50 @@ impl TradeDb {
             params![poly_resolution, market_name, window_ts as i64],
         )?;
         Ok(())
+    }
+
+    /// Backfill: re-settle all shadow data using known Polymarket resolutions.
+    /// Returns the number of shadow_trades rows corrected.
+    pub fn backfill_shadow_from_poly(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT market_name, window_ts, poly_resolution FROM resolution_audit
+             WHERE poly_resolution IS NOT NULL"
+        )?;
+        let rows: Vec<(String, i64, String)> = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?.filter_map(|r| r.ok()).collect();
+        drop(stmt);
+
+        let mut corrected = 0usize;
+        for (market_name, window_ts, poly_res) in &rows {
+            let n = conn.execute(
+                "UPDATE shadow_trades SET
+                    actual_outcome = ?1,
+                    would_have_won = CASE
+                        WHEN ?1 = 'FLAT' THEN 0
+                        WHEN direction_at_entry = ?1 THEN 1
+                        ELSE 0
+                    END
+                 WHERE market_name = ?2 AND window_ts = ?3",
+                params![poly_res, market_name, window_ts],
+            )?;
+            corrected += n;
+
+            let suffix = format!("%-{}", window_ts);
+            conn.execute(
+                "UPDATE shadow_timing SET
+                    actual_outcome = ?1,
+                    would_have_won = CASE WHEN direction = ?1 THEN 1 ELSE 0 END
+                 WHERE market_name = ?2 AND window_id LIKE ?3",
+                params![poly_res, market_name, suffix],
+            )?;
+        }
+        Ok(corrected)
     }
 
     /// Get all audit rows where we haven't checked Polymarket's resolution yet.

@@ -108,6 +108,13 @@ async fn main() -> Result<()> {
         TradeDb::open(config.db_path()).context("Failed to open trade database")?,
     );
 
+    // Backfill shadow data with authoritative Polymarket resolutions
+    match db.backfill_shadow_from_poly() {
+        Ok(n) if n > 0 => info!(corrected = n, "Backfilled shadow data with Polymarket resolutions"),
+        Ok(_) => info!("Shadow data already in sync with Polymarket resolutions"),
+        Err(e) => warn!(error = %e, "Failed to backfill shadow data from Polymarket resolutions"),
+    }
+
     let telegram = Arc::new(TelegramNotifier::new(
         config.telegram_bot_token.clone(),
         config.telegram_chat_id.clone(),
@@ -394,7 +401,7 @@ async fn run_resolution_audit_checker(db: Arc<TradeDb>) {
     let gamma = GammaClient::default();
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
         let pending = match db.pending_resolution_audits() {
             Ok(rows) => rows,
@@ -462,6 +469,28 @@ async fn run_resolution_audit_checker(db: Arc<TradeDb>) {
                             poly_resolution,
                             "Resolution audit updated"
                         );
+
+                        // Re-settle shadow tables with authoritative Polymarket resolution
+                        match db.resettle_shadow_with_poly(market_name, *window_ts, poly_resolution) {
+                            Ok(n) if n > 0 => info!(
+                                market = %market_name,
+                                rows = n,
+                                poly_resolution,
+                                "Shadow trade re-settled with Polymarket resolution"
+                            ),
+                            Err(e) => warn!(error = %e, market = %market_name, "Failed to re-settle shadow trade"),
+                            _ => {}
+                        }
+                        match db.resettle_shadow_timing_with_poly(market_name, *window_ts, poly_resolution) {
+                            Ok(n) if n > 0 => info!(
+                                market = %market_name,
+                                rows = n,
+                                poly_resolution,
+                                "Shadow timing re-settled with Polymarket resolution"
+                            ),
+                            Err(e) => warn!(error = %e, market = %market_name, "Failed to re-settle shadow timing"),
+                            _ => {}
+                        }
                     }
                 }
                 Err(e) => {
@@ -744,6 +773,7 @@ async fn run_scanner_loop(
     let mut shadow_recorded: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut watching_markets: HashMap<String, (u64, u32)> = HashMap::new();
     let mut window_max_delta: HashMap<String, (f64, String)> = HashMap::new();
+    let mut early_reject_until: HashMap<String, std::time::Instant> = HashMap::new();
     let mut last_analytics_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let scan_interval = Duration::from_millis(config.scanner.scan_interval_ms);
     let adjust_ms = config.pricing.adjust_interval_ms;
@@ -1199,6 +1229,7 @@ async fn run_scanner_loop(
                     }
 
                     window_traded.remove(&key);
+                    early_reject_until.remove(&key);
                 }
                 // Clear skip reason and skip notifications for fresh window
                 last_skip_reasons.remove(&mkt.name);
@@ -1615,6 +1646,20 @@ async fn run_scanner_loop(
                     );
                 } else if client.is_some() {
                     // Live: place CLOB order
+                    let traded_key = format!("{}-{}", opp.market_name, opp.window_ts);
+
+                    // Check 425 "Too Early" backoff — skip if we were recently rejected
+                    if let Some(retry_at) = early_reject_until.get(&traded_key) {
+                        if std::time::Instant::now() < *retry_at {
+                            debug!(
+                                market = %opp.market_name,
+                                "Skipping order — 425 backoff active"
+                            );
+                            continue;
+                        }
+                        early_reject_until.remove(&traded_key);
+                    }
+
                     let token_id_u256 = match U256::from_str(&opp.token_id) {
                         Ok(id) => id,
                         Err(e) => {
@@ -1714,38 +1759,53 @@ async fn run_scanner_loop(
                                 opp.suggested_entry, opp.contracts,
                                 secs_after_post, pipeline_elapsed_ms, &oid,
                             ).await.ok();
+
+                            orders_fired += 1;
+                            window_traded.insert(traded_key.clone(), true);
+                            let _ = db.mark_shadow_traded(&opp.market_name, opp.window_ts);
+
+                            let (md, md_dir) = window_max_delta.get(&traded_key).cloned().unwrap_or((opp.delta_pct, opp.direction.to_string()));
+                            let _ = db.upsert_window_summary(
+                                &opp.market_name, opp.window_ts,
+                                &opp.open_price.to_string(), &opp.open_price.to_string(),
+                                md, Some(&md_dir), true, None,
+                                Some(&opp.suggested_entry.to_string()), None, None,
+                            );
                         }
                         Err(e) => {
+                            let err_str = format!("{e}");
                             let fail_secs = window_end_epoch.saturating_sub(market::epoch_secs());
-                            warn!(
-                                error = ?e,
-                                market = %opp.market_name,
-                                price = %opp.suggested_entry,
-                                utc = %Utc::now().format("%H:%M:%S%.3f"),
-                                secs_before_close = fail_secs,
-                                "Failed to post order"
-                            );
+
+                            if err_str.contains("425") || err_str.to_lowercase().contains("too early") {
+                                let backoff = Duration::from_secs(5);
+                                early_reject_until.insert(
+                                    traded_key.clone(),
+                                    std::time::Instant::now() + backoff,
+                                );
+                                warn!(
+                                    market = %opp.market_name,
+                                    secs_before_close = fail_secs,
+                                    backoff_s = 5,
+                                    "425 Too Early — will retry in 5s"
+                                );
+                            } else {
+                                warn!(
+                                    error = ?e,
+                                    market = %opp.market_name,
+                                    price = %opp.suggested_entry,
+                                    utc = %Utc::now().format("%H:%M:%S%.3f"),
+                                    secs_before_close = fail_secs,
+                                    "Failed to post order"
+                                );
+                                window_traded.insert(traded_key.clone(), true);
+                            }
                             telegram.send_order_failed(
                                 &opp.market_name, &opp.slug, &opp.direction.to_string(),
-                                opp.suggested_entry, fail_secs, &format!("{e}"),
+                                opp.suggested_entry, fail_secs, &err_str,
                             ).await.ok();
                         }
                     }
                 }
-
-                orders_fired += 1;
-                let traded_key = format!("{}-{}", opp.market_name, opp.window_ts);
-                window_traded.insert(traded_key.clone(), true);
-                let _ = db.mark_shadow_traded(&opp.market_name, opp.window_ts);
-
-                // Write window_summary for the traded window
-                let (md, md_dir) = window_max_delta.get(&traded_key).cloned().unwrap_or((opp.delta_pct, opp.direction.to_string()));
-                let _ = db.upsert_window_summary(
-                    &opp.market_name, opp.window_ts,
-                    &opp.open_price.to_string(), &opp.open_price.to_string(),
-                    md, Some(&md_dir), true, None,
-                    Some(&opp.suggested_entry.to_string()), None, None,
-                );
             }
         }
 
