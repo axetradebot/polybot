@@ -30,7 +30,7 @@ strategy = "orderbook_aware"
 undercut_offset = 0.01
 tighten_step = 0.01
 adjust_interval_ms = 1000
-min_entry_price = 0.
+min_entry_price = 0.45
 entry_cutoff_s = 3
 taker_delta_threshold = 0.0
 
