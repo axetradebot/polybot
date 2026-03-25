@@ -1504,6 +1504,10 @@ async fn run_scanner_loop(
                         eval.secs_remaining,
                         false,
                         skip,
+                        eval.velocity_5s,
+                        None,
+                        eval.range_30s,
+                        eval.signal_score,
                     ) {
                         warn!(error = %e, market = %eval.market_name, "Failed to record shadow trade");
                     }

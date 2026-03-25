@@ -13,7 +13,7 @@ on_settlement = true
 on_order_placed = false
 on_startup = true
 on_watching = false
-on_window_miss = true
+on_window_miss = false
 on_heartbeat = false
 
 [bankroll]
@@ -29,7 +29,7 @@ pause_duration_minutes = 600
 strategy = "orderbook_aware"
 undercut_offset = 0.01
 tighten_step = 0.01
-adjust_interval_ms = 1000
+adjust_interval_ms = 700
 min_entry_price = 0.45
 entry_cutoff_s = 3
 taker_delta_threshold = 0.0
@@ -38,6 +38,12 @@ taker_delta_threshold = 0.0
 scan_interval_ms = 500
 min_edge_score = 0.045
 max_orders_per_cycle = 3
+signal_weight_delta = 1.0
+signal_weight_velocity = 0.3
+signal_weight_volatility = 0.2
+signal_weight_accel = 0.15
+min_volatility_pct = 0.0
+require_acceleration = false
 
 # ============================================================
 # MARKET DEFINITIONS

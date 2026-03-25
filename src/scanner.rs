@@ -40,6 +40,11 @@ pub struct MarketOpportunity {
     pub bet_size_usd: Decimal,
     pub entry_start_s: u64,
     pub is_taker: bool,
+    pub velocity_5s: f64,
+    pub velocity_15s: f64,
+    pub acceleration: f64,
+    pub range_30s: f64,
+    pub signal_score: f64,
 }
 
 /// A single scanner evaluation record for analytics logging.
@@ -59,15 +64,18 @@ pub struct ScanEvaluation {
     pub suggested_entry: Option<Decimal>,
     pub max_entry: Option<Decimal>,
     pub edge_score: Option<f64>,
+    pub velocity_5s: Option<f64>,
+    pub range_30s: Option<f64>,
+    pub signal_score: Option<f64>,
     pub result: String,
     pub detail: Option<String>,
 }
 
 /// Compute the edge score for an opportunity.
 ///
-/// `edge_score = delta_pct × (1.0 / entry_price) × liquidity_factor × time_factor`
+/// `edge_score = signal_score × (1.0 / entry_price) × liquidity_factor × time_factor`
 fn compute_edge_score(
-    delta_pct: f64,
+    signal_score: f64,
     entry_price: f64,
     depth_usd: f64,
     seconds_remaining: u64,
@@ -88,7 +96,7 @@ fn compute_edge_score(
         1.0
     };
 
-    delta_pct * (1.0 / entry_price) * liquidity * time_factor
+    signal_score * (1.0 / entry_price) * liquidity * time_factor
 }
 
 /// Result of scanning all markets: opportunities + per-market skip reasons + evaluation log.
@@ -112,6 +120,13 @@ pub async fn scan_all_markets(
     let mut evaluations = Vec::new();
     let bet_size = Decimal::try_from(config.bankroll.bet_size_usd).unwrap_or(dec!(5));
     let min_entry = Decimal::try_from(config.pricing.min_entry_price).unwrap_or(dec!(0.55));
+
+    let sig_weights = signal::SignalWeights {
+        delta: config.scanner.signal_weight_delta,
+        velocity: config.scanner.signal_weight_velocity,
+        volatility: config.scanner.signal_weight_volatility,
+        acceleration: config.scanner.signal_weight_accel,
+    };
 
     for mkt in config.enabled_markets() {
         let (window_ts, secs_rem) = market::current_window(mkt.window_seconds);
@@ -143,6 +158,7 @@ pub async fn scan_all_markets(
                     direction: None, delta_pct: None, open_price: None, current_price: None,
                     best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
                     suggested_entry: None, max_entry: None, edge_score: None,
+                    velocity_5s: None, range_30s: None, signal_score: None,
                     result: "SKIP_NO_DATA".into(), detail: Some("No price data".into()),
                 });
                 continue;
@@ -157,6 +173,7 @@ pub async fn scan_all_markets(
                 direction: None, delta_pct: None, open_price: None, current_price: Some(current_price),
                 best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
                 suggested_entry: None, max_entry: None, edge_score: None,
+                velocity_5s: None, range_30s: None, signal_score: None,
                 result: "SKIP_STALE".into(), detail: Some("Stale price data".into()),
             });
             continue;
@@ -172,14 +189,19 @@ pub async fn scan_all_markets(
                     direction: None, delta_pct: None, open_price: None, current_price: Some(current_price),
                     best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
                     suggested_entry: None, max_entry: None, edge_score: None,
+                    velocity_5s: None, range_30s: None, signal_score: None,
                     result: "SKIP_NO_OPEN".into(), detail: Some("No open price for window".into()),
                 });
                 continue;
             }
         };
 
-        let (direction, abs_delta) = signal::compute_delta(current_price, open_price);
-        let delta_f64: f64 = abs_delta.try_into().unwrap_or(0.0);
+        // Compute full signal bundle (delta + velocity + volatility + score)
+        let price_sym = PriceFeeds::price_symbol(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol);
+        let ticks = price_feeds.get_ticks(&price_sym, 60).await;
+        let sig = signal::compute_signals(current_price, open_price, &ticks, &sig_weights);
+        let direction = sig.direction.unwrap_or(Direction::Up);
+        let delta_f64 = sig.delta_pct;
 
         if delta_f64 < mkt.min_delta_pct {
             info!(market = %mkt.name, direction = %direction, delta = delta_f64, min_delta = mkt.min_delta_pct, "Skip: delta too low");
@@ -191,7 +213,45 @@ pub async fn scan_all_markets(
                 open_price: Some(open_price), current_price: Some(current_price),
                 best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
                 suggested_entry: None, max_entry: None, edge_score: None,
+                velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
+                signal_score: Some(sig.signal_score),
                 result: "SKIP_DELTA".into(), detail: Some(detail),
+            });
+            continue;
+        }
+
+        // Volatility filter: skip if price range over last 30s is too low
+        if config.scanner.min_volatility_pct > 0.0 && sig.range_30s < config.scanner.min_volatility_pct {
+            let detail = format!("Volatility too low: {:.4}% range < {:.2}% min", sig.range_30s, config.scanner.min_volatility_pct);
+            info!(market = %mkt.name, range_30s = sig.range_30s, min = config.scanner.min_volatility_pct, "Skip: low volatility");
+            skip_reasons.insert(mkt.name.clone(), detail.clone());
+            evaluations.push(ScanEvaluation {
+                market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
+                direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
+                open_price: Some(open_price), current_price: Some(current_price),
+                best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
+                suggested_entry: None, max_entry: None, edge_score: None,
+                velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
+                signal_score: Some(sig.signal_score),
+                result: "SKIP_LOW_VOLATILITY".into(), detail: Some(detail),
+            });
+            continue;
+        }
+
+        // Acceleration filter: require recent velocity to exceed longer-term velocity
+        if config.scanner.require_acceleration && sig.acceleration <= 0.0 {
+            let detail = format!("No acceleration: v5={:.4}% v15={:.4}% accel={:.4}%", sig.velocity_5s, sig.velocity_15s, sig.acceleration);
+            info!(market = %mkt.name, v5 = sig.velocity_5s, v15 = sig.velocity_15s, accel = sig.acceleration, "Skip: no acceleration");
+            skip_reasons.insert(mkt.name.clone(), detail.clone());
+            evaluations.push(ScanEvaluation {
+                market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
+                direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
+                open_price: Some(open_price), current_price: Some(current_price),
+                best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
+                suggested_entry: None, max_entry: None, edge_score: None,
+                velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
+                signal_score: Some(sig.signal_score),
+                result: "SKIP_NO_ACCELERATION".into(), detail: Some(detail),
             });
             continue;
         }
@@ -224,6 +284,8 @@ pub async fn scan_all_markets(
                     open_price: Some(open_price), current_price: Some(current_price),
                     best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
                     suggested_entry: None, max_entry: None, edge_score: None,
+                    velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
+                    signal_score: Some(sig.signal_score),
                     result: "SKIP_NOT_ACCEPTING".into(), detail: None,
                 });
                 continue;
@@ -237,6 +299,8 @@ pub async fn scan_all_markets(
                     open_price: Some(open_price), current_price: Some(current_price),
                     best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
                     suggested_entry: None, max_entry: None, edge_score: None,
+                    velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
+                    signal_score: Some(sig.signal_score),
                     result: "SKIP_TOKEN".into(), detail: None,
                 });
                 continue;
@@ -285,6 +349,8 @@ pub async fn scan_all_markets(
                             open_price: Some(open_price), current_price: Some(current_price),
                             best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
                             suggested_entry: None, max_entry: None, edge_score: None,
+                            velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
+                            signal_score: Some(sig.signal_score),
                             result: "SKIP_ORDERBOOK".into(), detail: Some(detail),
                         });
                         continue;
@@ -308,6 +374,8 @@ pub async fn scan_all_markets(
                 best_ask: Some(ob.best_ask), best_bid: Some(ob.best_bid),
                 spread: Some(ob.spread), depth_at_ask: Some(ob.depth_at_ask),
                 suggested_entry: None, max_entry: None, edge_score: None,
+                velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
+                signal_score: Some(sig.signal_score),
                 result: "SKIP_SANITY".into(), detail: Some(detail),
             });
             continue;
@@ -347,6 +415,8 @@ pub async fn scan_all_markets(
                 best_ask: Some(ob.best_ask), best_bid: Some(ob.best_bid), spread: Some(ob.spread),
                 depth_at_ask: Some(ob.depth_at_ask), suggested_entry: Some(suggested_entry),
                 max_entry: Some(max_entry), edge_score: None,
+                velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
+                signal_score: Some(sig.signal_score),
                 result: "SKIP_PRICE".into(), detail: Some(detail),
             });
             continue;
@@ -363,11 +433,11 @@ pub async fn scan_all_markets(
         let depth_f64: f64 = ob.depth_at_ask.try_into().unwrap_or(0.0);
         let entry_f64: f64 = suggested_entry.try_into().unwrap_or(0.5);
 
-        let edge_score = compute_edge_score(delta_f64, entry_f64, depth_f64, secs_rem, mkt.entry_start_s, entry_cutoff_s);
+        let edge_score = compute_edge_score(sig.signal_score, entry_f64, depth_f64, secs_rem, mkt.entry_start_s, entry_cutoff_s);
 
         if edge_score < config.scanner.min_edge_score {
-            info!(market = %mkt.name, edge = edge_score, min_edge = config.scanner.min_edge_score, delta = delta_f64, "Skip: edge score too low");
-            let detail = format!("Edge too low: {edge_score:.4} < {:.2} min (delta {delta_f64:.4}%)", config.scanner.min_edge_score);
+            info!(market = %mkt.name, edge = edge_score, min_edge = config.scanner.min_edge_score, delta = delta_f64, signal = sig.signal_score, "Skip: edge score too low");
+            let detail = format!("Edge too low: {edge_score:.4} < {:.2} min (delta {delta_f64:.4}%, signal {:.4})", config.scanner.min_edge_score, sig.signal_score);
             skip_reasons.insert(mkt.name.clone(), detail.clone());
             evaluations.push(ScanEvaluation {
                 market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
@@ -376,13 +446,21 @@ pub async fn scan_all_markets(
                 best_ask: Some(ob.best_ask), best_bid: Some(ob.best_bid), spread: Some(ob.spread),
                 depth_at_ask: Some(ob.depth_at_ask), suggested_entry: Some(suggested_entry),
                 max_entry: Some(max_entry), edge_score: Some(edge_score),
+                velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
+                signal_score: Some(sig.signal_score),
                 result: "SKIP_EDGE".into(), detail: Some(detail),
             });
             continue;
         }
 
         let order_type = if is_taker { "TAKER" } else { "MAKER" };
-        info!(market = %mkt.name, direction = %direction, delta = delta_f64, edge = edge_score, entry = %suggested_entry, best_ask = %ob.best_ask, contracts = %contracts, order_type, "OPPORTUNITY FOUND");
+        info!(
+            market = %mkt.name, direction = %direction, delta = delta_f64,
+            edge = edge_score, signal = sig.signal_score,
+            v5 = sig.velocity_5s, range = sig.range_30s, accel = sig.acceleration,
+            entry = %suggested_entry, best_ask = %ob.best_ask,
+            contracts = %contracts, order_type, "OPPORTUNITY FOUND"
+        );
 
         skip_reasons.remove(&mkt.name);
 
@@ -393,6 +471,8 @@ pub async fn scan_all_markets(
             best_ask: Some(ob.best_ask), best_bid: Some(ob.best_bid), spread: Some(ob.spread),
             depth_at_ask: Some(ob.depth_at_ask), suggested_entry: Some(suggested_entry),
             max_entry: Some(max_entry), edge_score: Some(edge_score),
+            velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
+            signal_score: Some(sig.signal_score),
             result: "OPPORTUNITY".into(), detail: None,
         });
 
@@ -421,6 +501,11 @@ pub async fn scan_all_markets(
             bet_size_usd: actual_bet,
             entry_start_s: mkt.entry_start_s,
             is_taker,
+            velocity_5s: sig.velocity_5s,
+            velocity_15s: sig.velocity_15s,
+            acceleration: sig.acceleration,
+            range_30s: sig.range_30s,
+            signal_score: sig.signal_score,
         });
     }
 

@@ -103,11 +103,24 @@ pub struct ScannerConfig {
     pub min_edge_score: f64,
     #[serde(default = "default_max_orders")]
     pub max_orders_per_cycle: usize,
+    #[serde(default = "default_weight_delta")]
+    pub signal_weight_delta: f64,
+    #[serde(default)]
+    pub signal_weight_velocity: f64,
+    #[serde(default)]
+    pub signal_weight_volatility: f64,
+    #[serde(default)]
+    pub signal_weight_accel: f64,
+    #[serde(default)]
+    pub min_volatility_pct: f64,
+    #[serde(default)]
+    pub require_acceleration: bool,
 }
 
 fn default_scan_ms() -> u64 { 1000 }
 fn default_min_edge() -> f64 { 0.05 }
 fn default_max_orders() -> usize { 3 }
+fn default_weight_delta() -> f64 { 1.0 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]

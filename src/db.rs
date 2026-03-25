@@ -247,6 +247,10 @@ impl TradeDb {
             "ALTER TABLE trades ADD COLUMN depth_at_ask TEXT NOT NULL DEFAULT '0'",
             "ALTER TABLE trades ADD COLUMN fill_latency_ms INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE trades ADD COLUMN market_type TEXT NOT NULL DEFAULT '5min'",
+            "ALTER TABLE shadow_trades ADD COLUMN velocity_5s REAL",
+            "ALTER TABLE shadow_trades ADD COLUMN velocity_15s REAL",
+            "ALTER TABLE shadow_trades ADD COLUMN range_30s REAL",
+            "ALTER TABLE shadow_trades ADD COLUMN signal_score REAL",
         ];
         for sql in &migrations {
             let _ = conn.execute(sql, []);
@@ -660,14 +664,19 @@ impl TradeDb {
         seconds_before_close: u64,
         was_traded: bool,
         skip_reason: Option<&str>,
+        velocity_5s: Option<f64>,
+        velocity_15s: Option<f64>,
+        range_30s: Option<f64>,
+        signal_score: Option<f64>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO shadow_trades (
                 market_name, window_ts, window_seconds, open_price,
                 delta_at_entry, direction_at_entry, best_ask_at_entry,
-                seconds_before_close, was_traded, skip_reason
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                seconds_before_close, was_traded, skip_reason,
+                velocity_5s, velocity_15s, range_30s, signal_score
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 market_name,
                 window_ts as i64,
@@ -679,6 +688,10 @@ impl TradeDb {
                 seconds_before_close as i64,
                 was_traded as i32,
                 skip_reason,
+                velocity_5s,
+                velocity_15s,
+                range_30s,
+                signal_score,
             ],
         )?;
         Ok(())

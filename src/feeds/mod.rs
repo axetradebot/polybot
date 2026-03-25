@@ -3,8 +3,9 @@ pub mod chainlink;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::warn;
 
@@ -12,6 +13,14 @@ struct PriceData {
     price: Decimal,
     updated_at: DateTime<Utc>,
 }
+
+#[derive(Clone, Debug)]
+pub struct TickEntry {
+    pub price: Decimal,
+    pub ts: Instant,
+}
+
+const TICK_HISTORY_MAX_AGE_SECS: u64 = 60;
 
 /// Dual-source price feed: Chainlink (primary) + Binance (fallback).
 ///
@@ -25,6 +34,8 @@ pub struct PriceFeeds {
     window_opens: Arc<RwLock<HashMap<String, Decimal>>>,
     /// Maps Chainlink symbol → Binance symbol for fallback lookups.
     fallback_map: Arc<RwLock<HashMap<String, String>>>,
+    /// Per-symbol ring buffer of recent ticks (last 60s) for velocity/volatility.
+    tick_history: Arc<RwLock<HashMap<String, VecDeque<TickEntry>>>>,
 }
 
 impl PriceFeeds {
@@ -33,6 +44,7 @@ impl PriceFeeds {
             prices: Arc::new(RwLock::new(HashMap::new())),
             window_opens: Arc::new(RwLock::new(HashMap::new())),
             fallback_map: Arc::new(RwLock::new(HashMap::new())),
+            tick_history: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -45,14 +57,48 @@ impl PriceFeeds {
     }
 
     pub async fn set_price(&self, symbol: &str, price: Decimal) {
+        let key = symbol.to_lowercase();
+        let now = Instant::now();
+
         let mut map = self.prices.write().await;
         map.insert(
-            symbol.to_lowercase(),
+            key.clone(),
             PriceData {
                 price,
                 updated_at: Utc::now(),
             },
         );
+        drop(map);
+
+        let mut hist = self.tick_history.write().await;
+        let deque = hist.entry(key).or_insert_with(VecDeque::new);
+        deque.push_back(TickEntry { price, ts: now });
+        let cutoff = now - std::time::Duration::from_secs(TICK_HISTORY_MAX_AGE_SECS);
+        while deque.front().map_or(false, |t| t.ts < cutoff) {
+            deque.pop_front();
+        }
+    }
+
+    /// Get recent ticks for a symbol within the last `lookback_secs` seconds.
+    pub async fn get_ticks(&self, symbol: &str, lookback_secs: u64) -> Vec<TickEntry> {
+        let hist = self.tick_history.read().await;
+        let key = symbol.to_lowercase();
+        match hist.get(&key) {
+            Some(deque) => {
+                let cutoff = Instant::now() - std::time::Duration::from_secs(lookback_secs);
+                deque.iter().filter(|t| t.ts >= cutoff).cloned().collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Get the price symbol key for a market based on its resolution source.
+    pub fn price_symbol(resolution_source: &str, chainlink_sym: &str, binance_sym: &str) -> String {
+        if resolution_source == "binance" {
+            binance_sym.to_lowercase()
+        } else {
+            chainlink_sym.to_lowercase()
+        }
     }
 
     /// Get price for a symbol. Returns the value if present, regardless of age.
