@@ -58,6 +58,14 @@ pub struct BankrollConfig {
     pub consecutive_loss_pause: u32,
     #[serde(default = "default_pause_min")]
     pub pause_duration_minutes: u64,
+    #[serde(default)]
+    pub dynamic_sizing: bool,
+    #[serde(default = "default_min_bet_mult")]
+    pub min_bet_multiplier: f64,
+    #[serde(default = "default_max_bet_mult")]
+    pub max_bet_multiplier: f64,
+    #[serde(default = "default_baseline_signal")]
+    pub baseline_signal: f64,
 }
 
 fn default_max_concurrent() -> usize { 6 }
@@ -66,6 +74,9 @@ fn default_bet_size() -> f64 { 5.0 }
 fn default_daily_loss() -> f64 { 50.0 }
 fn default_consec_pause() -> u32 { 5 }
 fn default_pause_min() -> u64 { 15 }
+fn default_min_bet_mult() -> f64 { 0.5 }
+fn default_max_bet_mult() -> f64 { 2.0 }
+fn default_baseline_signal() -> f64 { 0.10 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
@@ -86,6 +97,24 @@ pub struct PricingConfig {
     /// instead of undercutting. Set to 0.0 to always use maker orders.
     #[serde(default)]
     pub taker_delta_threshold: f64,
+    /// Expected win rate (0.0–1.0). When > 0, enforces a hard fill price ceiling
+    /// of `breakeven_win_rate - profit_margin_pct` regardless of delta tiers.
+    #[serde(default)]
+    pub breakeven_win_rate: f64,
+    #[serde(default = "default_profit_margin")]
+    pub profit_margin_pct: f64,
+}
+
+impl PricingConfig {
+    /// Hard ceiling on fill price to ensure profitability at the target win rate.
+    /// Returns 1.0 (no cap) when breakeven_win_rate is 0 (disabled).
+    pub fn max_profitable_price(&self) -> f64 {
+        if self.breakeven_win_rate > 0.0 {
+            (self.breakeven_win_rate - self.profit_margin_pct).max(0.30)
+        } else {
+            1.0
+        }
+    }
 }
 
 fn default_strategy() -> String { "orderbook_aware".into() }
@@ -94,6 +123,7 @@ fn default_tighten() -> f64 { 0.01 }
 fn default_adjust_ms() -> u64 { 2000 }
 fn default_min_entry() -> f64 { 0.55 }
 fn default_cutoff() -> u64 { 4 }
+fn default_profit_margin() -> f64 { 0.05 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScannerConfig {

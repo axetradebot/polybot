@@ -10,6 +10,7 @@ pub struct RiskManager {
     max_consecutive_losses: u32,
     pause_duration: std::time::Duration,
     bet_size_usd: Decimal,
+    max_bet_usd: Decimal,
     max_concurrent: usize,
     max_per_market: usize,
 }
@@ -41,13 +42,21 @@ impl std::fmt::Display for RiskVeto {
 
 impl RiskManager {
     pub fn new(config: &AppConfig) -> Self {
+        let base = config.bet_size_decimal();
+        let max_bet = if config.bankroll.dynamic_sizing {
+            let mult = Decimal::try_from(config.bankroll.max_bet_multiplier).unwrap_or(Decimal::TWO);
+            base * mult
+        } else {
+            base
+        };
         Self {
             daily_loss_limit: config.daily_loss_limit_decimal(),
             max_consecutive_losses: config.bankroll.consecutive_loss_pause,
             pause_duration: std::time::Duration::from_secs(
                 config.bankroll.pause_duration_minutes * 60,
             ),
-            bet_size_usd: config.bet_size_decimal(),
+            bet_size_usd: base,
+            max_bet_usd: max_bet,
             max_concurrent: config.bankroll.max_concurrent_positions,
             max_per_market: config.bankroll.max_per_market,
         }
@@ -82,11 +91,11 @@ impl RiskManager {
             return Err(RiskVeto::ConsecutiveLossPause);
         }
 
-        if state.bankroll < self.bet_size_usd {
+        if state.bankroll < self.max_bet_usd {
             warn!(
                 bankroll = %state.bankroll,
-                min = %self.bet_size_usd,
-                "Insufficient bankroll"
+                min = %self.max_bet_usd,
+                "Insufficient bankroll for max possible bet"
             );
             return Err(RiskVeto::InsufficientBankroll);
         }

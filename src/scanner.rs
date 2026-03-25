@@ -403,7 +403,9 @@ pub async fn scan_all_markets(
             suggested_entry = ob.best_ask;
         }
 
-        let max_entry = Decimal::try_from(mkt.max_price_for_delta(delta_f64)).unwrap_or(dec!(0.85));
+        let tier_ceiling = mkt.max_price_for_delta(delta_f64);
+        let breakeven_ceiling = config.pricing.max_profitable_price();
+        let max_entry = Decimal::try_from(tier_ceiling.min(breakeven_ceiling)).unwrap_or(dec!(0.85));
         if suggested_entry > max_entry {
             info!(market = %mkt.name, direction = %direction, delta = delta_f64, best_ask = %ob.best_ask, suggested = %suggested_entry, ceiling = %max_entry, "Skip: entry price too high for delta");
             let detail = format!("Entry price too high: ${suggested_entry} > ${max_entry} ceiling (delta {delta_f64:.4}%, ask ${:.2})", ob.best_ask);
@@ -422,7 +424,15 @@ pub async fn scan_all_markets(
             continue;
         }
 
-        let contracts = (bet_size / suggested_entry).round_dp_with_strategy(0, rust_decimal::RoundingStrategy::ToZero);
+        let effective_bet = if config.bankroll.dynamic_sizing && config.bankroll.baseline_signal > 0.0 {
+            let mult = (sig.signal_score / config.bankroll.baseline_signal)
+                .clamp(config.bankroll.min_bet_multiplier, config.bankroll.max_bet_multiplier);
+            Decimal::try_from(config.bankroll.bet_size_usd * mult).unwrap_or(bet_size)
+        } else {
+            bet_size
+        };
+
+        let contracts = (effective_bet / suggested_entry).round_dp_with_strategy(0, rust_decimal::RoundingStrategy::ToZero);
         if contracts < Decimal::ONE {
             info!(market = %mkt.name, entry = %suggested_entry, "Skip: bet too small for 1 contract");
             skip_reasons.insert(mkt.name.clone(), format!("Bet too small at ${suggested_entry} entry"));
