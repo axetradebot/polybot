@@ -432,11 +432,10 @@ pub async fn scan_all_markets(
             bet_size
         };
 
-        let contracts = (effective_bet / suggested_entry).round_dp_with_strategy(0, rust_decimal::RoundingStrategy::ToZero);
-        if contracts < Decimal::ONE {
-            info!(market = %mkt.name, entry = %suggested_entry, "Skip: bet too small for 1 contract");
-            skip_reasons.insert(mkt.name.clone(), format!("Bet too small at ${suggested_entry} entry"));
-            continue;
+        let min_contracts = dec!(5);
+        let mut contracts = (effective_bet / suggested_entry).round_dp_with_strategy(0, rust_decimal::RoundingStrategy::ToZero);
+        if contracts < min_contracts {
+            contracts = min_contracts;
         }
         let actual_bet = contracts * suggested_entry;
 
