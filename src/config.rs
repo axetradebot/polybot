@@ -187,6 +187,12 @@ pub struct MarketConfig {
     pub tighten_step: Option<f64>,
     #[serde(default)]
     pub adjust_interval_ms: Option<u64>,
+    /// Optional early entry window: start scanning this many seconds before close
+    /// with a higher delta requirement. 0 = disabled.
+    #[serde(default)]
+    pub early_entry_start_s: u64,
+    #[serde(default = "default_early_delta")]
+    pub early_entry_min_delta_pct: f64,
 }
 
 fn default_true() -> bool { true }
@@ -195,6 +201,7 @@ fn default_resolution_source() -> String { "chainlink".into() }
 fn default_entry_start() -> u64 { 20 }
 fn default_min_delta() -> f64 { 0.07 }
 fn default_max_entry_mkt() -> f64 { 0.85 }
+fn default_early_delta() -> f64 { 0.20 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]

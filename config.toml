@@ -76,6 +76,8 @@ entry_start_s = 30
 entry_cutoff_s = 5
 min_delta_pct = 0.06
 max_entry_price = 0.82
+early_entry_start_s = 120
+early_entry_min_delta_pct = 0.20
 undercut_offset = 0.01
 tighten_step = 0.01
 adjust_interval_ms = 500
@@ -101,6 +103,8 @@ entry_start_s = 30
 entry_cutoff_s = 5
 min_delta_pct = 0.05
 max_entry_price = 0.82
+early_entry_start_s = 120
+early_entry_min_delta_pct = 0.20
 undercut_offset = 0.01
 tighten_step = 0.01
 adjust_interval_ms = 1000
@@ -125,6 +129,8 @@ chainlink_symbol = "eth/usd"
 entry_start_s = 30
 min_delta_pct = 0.05
 max_entry_price = 0.82
+early_entry_start_s = 120
+early_entry_min_delta_pct = 0.20
 delta_tiers = [
     [0.05, 0.68],
     [0.10, 0.72],
@@ -146,6 +152,8 @@ chainlink_symbol = "eth/usd"
 entry_start_s = 30
 min_delta_pct = 0.05
 max_entry_price = 0.82
+early_entry_start_s = 120
+early_entry_min_delta_pct = 0.20
 delta_tiers = [
     [0.05, 0.68],
     [0.07, 0.72],
@@ -167,6 +175,8 @@ chainlink_symbol = "sol/usd"
 entry_start_s = 30
 min_delta_pct = 0.06
 max_entry_price = 0.82
+early_entry_start_s = 120
+early_entry_min_delta_pct = 0.20
 delta_tiers = [
     [0.06, 0.68],
     [0.10, 0.72],
@@ -188,6 +198,8 @@ chainlink_symbol = "sol/usd"
 entry_start_s = 30
 min_delta_pct = 0.06
 max_entry_price = 0.82
+early_entry_start_s = 120
+early_entry_min_delta_pct = 0.20
 delta_tiers = [
     [0.06, 0.68],
     [0.10, 0.72],
@@ -209,6 +221,8 @@ chainlink_symbol = "xrp/usd"
 entry_start_s = 30
 min_delta_pct = 0.05
 max_entry_price = 0.82
+early_entry_start_s = 120
+early_entry_min_delta_pct = 0.20
 delta_tiers = [
     [0.05, 0.68],
     [0.10, 0.72],
@@ -230,6 +244,8 @@ chainlink_symbol = "xrp/usd"
 entry_start_s = 30
 min_delta_pct = 0.07
 max_entry_price = 0.82
+early_entry_start_s = 120
+early_entry_min_delta_pct = 0.20
 delta_tiers = [
     [0.07, 0.68],
     [0.10, 0.72],
@@ -251,6 +267,8 @@ chainlink_symbol = "doge/usd"
 entry_start_s = 30
 min_delta_pct = 0.08
 max_entry_price = 0.82
+early_entry_start_s = 120
+early_entry_min_delta_pct = 0.20
 delta_tiers = [
     [0.08, 0.68],
     [0.10, 0.72],
@@ -272,6 +290,8 @@ chainlink_symbol = "hype/usd"
 entry_start_s = 30
 min_delta_pct = 0.07
 max_entry_price = 0.82
+early_entry_start_s = 120
+early_entry_min_delta_pct = 0.20
 delta_tiers = [
     [0.07, 0.68],
     [0.10, 0.72],
@@ -293,6 +313,8 @@ chainlink_symbol = "bnb/usd"
 entry_start_s = 30
 min_delta_pct = 0.05
 max_entry_price = 0.82
+early_entry_start_s = 120
+early_entry_min_delta_pct = 0.20
 delta_tiers = [
     [0.05, 0.68],
     [0.10, 0.72],
@@ -314,6 +336,8 @@ chainlink_symbol = "hype/usd"
 entry_start_s = 30
 min_delta_pct = 0.10
 max_entry_price = 0.82
+early_entry_start_s = 120
+early_entry_min_delta_pct = 0.20
 delta_tiers = [
     [0.10, 0.68],
     [0.15, 0.72],

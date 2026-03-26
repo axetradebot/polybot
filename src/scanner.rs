@@ -132,11 +132,20 @@ pub async fn scan_all_markets(
         let (window_ts, secs_rem) = market::current_window(mkt.window_seconds);
         let entry_cutoff_s = mkt.effective_entry_cutoff(config.pricing.entry_cutoff_s);
 
-        if secs_rem > mkt.entry_start_s || secs_rem < entry_cutoff_s {
+        let effective_start = if mkt.early_entry_start_s > 0 {
+            mkt.early_entry_start_s.max(mkt.entry_start_s)
+        } else {
+            mkt.entry_start_s
+        };
+        let in_early_window = mkt.early_entry_start_s > 0
+            && secs_rem > mkt.entry_start_s
+            && secs_rem <= mkt.early_entry_start_s;
+
+        if secs_rem > effective_start || secs_rem < entry_cutoff_s {
             debug!(
                 market = %mkt.name,
                 secs_remaining = secs_rem,
-                entry_window = %format!("{}s-{}s", entry_cutoff_s, mkt.entry_start_s),
+                entry_window = %format!("{}s-{}s", entry_cutoff_s, effective_start),
                 "Outside entry window"
             );
             continue;
@@ -145,6 +154,7 @@ pub async fn scan_all_markets(
         info!(
             market = %mkt.name,
             secs_remaining = secs_rem,
+            early = in_early_window,
             "In entry window — evaluating"
         );
 
@@ -203,9 +213,16 @@ pub async fn scan_all_markets(
         let direction = sig.direction.unwrap_or(Direction::Up);
         let delta_f64 = sig.delta_pct;
 
-        if delta_f64 < mkt.min_delta_pct {
-            info!(market = %mkt.name, direction = %direction, delta = delta_f64, min_delta = mkt.min_delta_pct, "Skip: delta too low");
-            let detail = format!("Delta too low: {:.4}% < {:.2}% min ({} ${open_price} → ${current_price})", delta_f64, mkt.min_delta_pct, direction);
+        let required_delta = if in_early_window {
+            mkt.early_entry_min_delta_pct
+        } else {
+            mkt.min_delta_pct
+        };
+
+        if delta_f64 < required_delta {
+            info!(market = %mkt.name, direction = %direction, delta = delta_f64, min_delta = required_delta, early = in_early_window, "Skip: delta too low");
+            let window_label = if in_early_window { "early" } else { "normal" };
+            let detail = format!("Delta too low: {:.4}% < {:.2}% {window_label} min ({} ${open_price} → ${current_price})", delta_f64, required_delta, direction);
             skip_reasons.insert(mkt.name.clone(), detail.clone());
             evaluations.push(ScanEvaluation {
                 market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
