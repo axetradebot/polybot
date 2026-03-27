@@ -940,6 +940,21 @@ impl TradeDb {
         Ok(corrected)
     }
 
+    pub fn get_resolution_audit_open(&self, market_name: &str, window_ts: u64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT our_open FROM resolution_audit WHERE market_name = ?1 AND window_ts = ?2"
+        )?;
+        let result = stmt.query_row(params![market_name, window_ts as i64], |row| {
+            row.get::<_, String>(0)
+        });
+        match result {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Get all audit rows where we haven't checked Polymarket's resolution yet.
     pub fn pending_resolution_audits(&self) -> Result<Vec<(String, u64, String)>> {
         let conn = self.conn.lock().unwrap();

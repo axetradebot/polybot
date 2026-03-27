@@ -79,6 +79,37 @@ impl PriceFeeds {
         }
     }
 
+    /// Get the price closest to `secs_ago` seconds in the past from the tick history.
+    /// Used to retroactively find the price at an exact window boundary.
+    pub async fn get_price_at_offset(&self, symbol: &str, secs_ago: u64) -> Option<Decimal> {
+        let hist = self.tick_history.read().await;
+        let key = symbol.to_lowercase();
+        let deque = hist.get(&key)?;
+        if deque.is_empty() {
+            return None;
+        }
+        let target = Instant::now() - std::time::Duration::from_secs(secs_ago);
+        let mut closest: Option<&TickEntry> = None;
+        let mut best_diff = u64::MAX;
+        for tick in deque.iter() {
+            let diff = if tick.ts >= target {
+                (tick.ts - target).as_millis() as u64
+            } else {
+                (target - tick.ts).as_millis() as u64
+            };
+            if diff < best_diff {
+                best_diff = diff;
+                closest = Some(tick);
+            }
+        }
+        // Only use if the closest tick is within 5 seconds of the target
+        if best_diff <= 5000 {
+            closest.map(|t| t.price)
+        } else {
+            None
+        }
+    }
+
     /// Get recent ticks for a symbol within the last `lookback_secs` seconds.
     pub async fn get_ticks(&self, symbol: &str, lookback_secs: u64) -> Vec<TickEntry> {
         let hist = self.tick_history.read().await;

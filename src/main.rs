@@ -491,6 +491,26 @@ async fn run_resolution_audit_checker(db: Arc<TradeDb>) {
                             Err(e) => warn!(error = %e, market = %market_name, "Failed to re-settle shadow timing"),
                             _ => {}
                         }
+
+                        // Audit: compare our open price vs Polymarket's priceToBeat
+                        if let Some(ptb) = market::fetch_price_to_beat(slug).await {
+                            let our_open = db.get_resolution_audit_open(market_name, *window_ts);
+                            if let Ok(Some(our_open_str)) = our_open {
+                                if let Ok(our_open_val) = our_open_str.parse::<f64>() {
+                                    let ptb_f64: f64 = ptb.try_into().unwrap_or(0.0);
+                                    let diff = our_open_val - ptb_f64;
+                                    let diff_pct = if ptb_f64 > 0.0 { (diff / ptb_f64) * 100.0 } else { 0.0 };
+                                    info!(
+                                        market = %market_name,
+                                        our_open = our_open_val,
+                                        poly_ptb = ptb_f64,
+                                        diff = diff,
+                                        diff_pct = format!("{:.4}%", diff_pct),
+                                        "Price-to-beat audit"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -1236,8 +1256,18 @@ async fn run_scanner_loop(
                 last_skip_reasons.remove(&mkt.name);
                 skip_notified.retain(|k| !k.starts_with(&mkt.name));
 
-                // New window detected — capture open price from market's resolution source
-                if let Some(price) = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
+                // New window detected — capture open price precisely at the window boundary.
+                // The scan loop may detect the transition a few seconds late, so we look
+                // back in the tick history to find the price at the exact window start.
+                let secs_since_start = mkt.window_seconds.saturating_sub(secs_rem);
+                let price_sym = PriceFeeds::price_symbol(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol);
+                let precise_price = if secs_since_start > 0 {
+                    price_feeds.get_price_at_offset(&price_sym, secs_since_start).await
+                } else {
+                    None
+                };
+
+                if let Some(price) = precise_price {
                     price_feeds
                         .set_window_open(&mkt.slug_prefix, window_ts, price)
                         .await;
@@ -1246,7 +1276,19 @@ async fn run_scanner_loop(
                         window_ts,
                         open_price = %price,
                         secs_remaining = secs_rem,
-                        "New window started"
+                        lookback_secs = secs_since_start,
+                        "New window started (tick-buffer precise open)"
+                    );
+                } else if let Some(price) = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
+                    price_feeds
+                        .set_window_open(&mkt.slug_prefix, window_ts, price)
+                        .await;
+                    info!(
+                        market = %mkt.name,
+                        window_ts,
+                        open_price = %price,
+                        secs_remaining = secs_rem,
+                        "New window started (current price fallback)"
                     );
                 }
 
