@@ -48,6 +48,7 @@ pub struct Position {
     pub submit_secs_before_close: Option<u64>,
     pub confirm_secs_before_close: Option<u64>,
     pub pipeline_ms: Option<u128>,
+    pub is_early_limit: bool,
 }
 
 /// Thread-safe tracker for all active and recently-settled positions.
@@ -106,6 +107,32 @@ impl PositionTracker {
         let positions = self.positions.read().await;
         positions.iter().any(|p| {
             p.slug == slug
+                && !matches!(
+                    p.status,
+                    PositionStatus::Settled | PositionStatus::Cancelled
+                )
+        })
+    }
+
+    /// Check if we have a non-early-limit position in a window (for allowing T-120 + T-30 coexistence).
+    pub async fn has_normal_position_in_window(&self, slug: &str) -> bool {
+        let positions = self.positions.read().await;
+        positions.iter().any(|p| {
+            p.slug == slug
+                && !p.is_early_limit
+                && !matches!(
+                    p.status,
+                    PositionStatus::Settled | PositionStatus::Cancelled
+                )
+        })
+    }
+
+    /// Check if we have an early limit position in a window.
+    pub async fn has_early_position_in_window(&self, slug: &str) -> bool {
+        let positions = self.positions.read().await;
+        positions.iter().any(|p| {
+            p.slug == slug
+                && p.is_early_limit
                 && !matches!(
                     p.status,
                     PositionStatus::Settled | PositionStatus::Cancelled

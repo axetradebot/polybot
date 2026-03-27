@@ -876,6 +876,7 @@ async fn run_scanner_loop(
                     submit_secs_before_close: None,
                     confirm_secs_before_close: None,
                     pipeline_ms: None,
+                    is_early_limit: pp.initial_price.parse::<Decimal>().unwrap_or_default() == dec!(0.30),
                 };
                 let now_epoch = market::epoch_secs();
                 let window_end = pos.window_ts + pos.window_seconds;
@@ -1617,6 +1618,7 @@ async fn run_scanner_loop(
                         submit_secs_before_close: None,
                         confirm_secs_before_close: None,
                         pipeline_ms: None,
+                        is_early_limit: opp.is_early_limit,
                     };
 
                     let pos_id = positions.add(pos).await;
@@ -1741,11 +1743,12 @@ async fn run_scanner_loop(
                                 submit_secs_before_close: Some(secs_before_close),
                                 confirm_secs_before_close: Some(secs_after_post),
                                 pipeline_ms: Some(pipeline_elapsed_ms),
+                                is_early_limit: opp.is_early_limit,
                             };
 
                             let pos_id = positions.add(pos).await;
 
-                            let order_type = if opp.is_taker { "TAKER" } else { "MAKER" };
+                            let order_type = if opp.is_early_limit { "EARLY_LIMIT" } else if opp.is_taker { "TAKER" } else { "MAKER" };
                             info!(
                                 market = %opp.market_name,
                                 order_id = %oid,
