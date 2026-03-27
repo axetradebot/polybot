@@ -794,6 +794,7 @@ async fn run_scanner_loop(
     let mut watching_markets: HashMap<String, (u64, u32)> = HashMap::new();
     let mut window_max_delta: HashMap<String, (f64, String)> = HashMap::new();
     let mut early_reject_until: HashMap<String, std::time::Instant> = HashMap::new();
+    let mut open_resnapped: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_analytics_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let scan_interval = Duration::from_millis(config.scanner.scan_interval_ms);
     let adjust_ms = config.pricing.adjust_interval_ms;
@@ -1255,6 +1256,7 @@ async fn run_scanner_loop(
                 // Clear skip reason and skip notifications for fresh window
                 last_skip_reasons.remove(&mkt.name);
                 skip_notified.retain(|k| !k.starts_with(&mkt.name));
+                open_resnapped.remove(&mkt.name);
 
                 // New window detected — capture open price precisely at the window boundary.
                 // The scan loop may detect the transition a few seconds late, so we look
@@ -1354,6 +1356,32 @@ async fn run_scanner_loop(
                             window_ts,
                             open_price = %price,
                             "Open price set (late capture)"
+                        );
+                    }
+                }
+
+                // Re-snap open price to fresh Chainlink value ~60s into window.
+                // Polymarket publishes priceToBeat around T-240 (60s in), using
+                // the first Chainlink tick after window start.
+                let secs_into_window = mkt.window_seconds.saturating_sub(secs_rem);
+                if secs_into_window >= 60
+                    && secs_into_window < 120
+                    && !open_resnapped.contains(&mkt.name)
+                    && mkt.resolution_source != "binance"
+                {
+                    if let Some(fresh_cl) = price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await {
+                        let old_open = price_feeds.get_window_open(&mkt.slug_prefix, window_ts).await;
+                        price_feeds
+                            .set_window_open(&mkt.slug_prefix, window_ts, fresh_cl)
+                            .await;
+                        open_resnapped.insert(mkt.name.clone());
+                        info!(
+                            market = %mkt.name,
+                            window_ts,
+                            old_open = ?old_open.map(|p| p.to_string()),
+                            new_open = %fresh_cl,
+                            secs_into_window,
+                            "Open price re-snapped to fresh Chainlink value"
                         );
                     }
                 }
