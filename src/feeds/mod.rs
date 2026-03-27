@@ -21,6 +21,10 @@ pub struct TickEntry {
 }
 
 const TICK_HISTORY_MAX_AGE_SECS: u64 = 60;
+/// Chainlink updates less frequently than Binance. Use a generous stale
+/// threshold so we don't fall back to Binance (USDT) prices unnecessarily.
+const CHAINLINK_STALE_MS: i64 = 300_000; // 5 minutes
+const BINANCE_STALE_MS: i64 = 60_000;    // 1 minute
 
 /// Dual-source price feed: Chainlink (primary) + Binance (fallback).
 ///
@@ -164,10 +168,10 @@ impl PriceFeeds {
         let sym_lower = chainlink_sym.to_lowercase();
         let map = self.prices.read().await;
 
-        // Try primary (Chainlink)
+        // Try primary (Chainlink) — 5-minute stale window
         if let Some(d) = map.get(&sym_lower) {
             let age_ms = (Utc::now() - d.updated_at).num_milliseconds();
-            if age_ms < 60_000 {
+            if age_ms < CHAINLINK_STALE_MS {
                 return Some(d.price);
             }
         }
@@ -179,7 +183,7 @@ impl PriceFeeds {
             let map = self.prices.read().await;
             if let Some(d) = map.get(binance_sym) {
                 let age_ms = (Utc::now() - d.updated_at).num_milliseconds();
-                if age_ms < 60_000 {
+                if age_ms < BINANCE_STALE_MS {
                     warn!(
                         chainlink = %chainlink_sym,
                         binance_fallback = %binance_sym,
@@ -220,7 +224,7 @@ impl PriceFeeds {
         if resolution_source == "binance" {
             let map = self.prices.read().await;
             map.get(&binance_sym.to_lowercase())
-                .map(|d| (Utc::now() - d.updated_at).num_milliseconds() < 60_000)
+                .map(|d| (Utc::now() - d.updated_at).num_milliseconds() < BINANCE_STALE_MS)
                 .unwrap_or(false)
         } else {
             self.has_fresh_price(chainlink_sym).await
@@ -234,7 +238,7 @@ impl PriceFeeds {
         let map = self.prices.read().await;
         if let Some(d) = map.get(&sym_lower) {
             let age_ms = (Utc::now() - d.updated_at).num_milliseconds();
-            if age_ms < 60_000 {
+            if age_ms < CHAINLINK_STALE_MS {
                 return true;
             }
             warn!(
@@ -252,7 +256,7 @@ impl PriceFeeds {
             let map = self.prices.read().await;
             if let Some(d) = map.get(binance_sym) {
                 let age_ms = (Utc::now() - d.updated_at).num_milliseconds();
-                if age_ms < 60_000 {
+                if age_ms < BINANCE_STALE_MS {
                     warn!(
                         chainlink = symbol,
                         binance_fallback = %binance_sym,
@@ -280,7 +284,7 @@ impl PriceFeeds {
         let map = self.prices.read().await;
         let chainlink_fresh = map
             .get(&sym_lower)
-            .map(|d| (Utc::now() - d.updated_at).num_milliseconds() < 60_000)
+            .map(|d| (Utc::now() - d.updated_at).num_milliseconds() < CHAINLINK_STALE_MS)
             .unwrap_or(false);
         if chainlink_fresh {
             return false;
@@ -292,7 +296,7 @@ impl PriceFeeds {
             let map = self.prices.read().await;
             return map
                 .get(binance_sym)
-                .map(|d| (Utc::now() - d.updated_at).num_milliseconds() < 60_000)
+                .map(|d| (Utc::now() - d.updated_at).num_milliseconds() < BINANCE_STALE_MS)
                 .unwrap_or(false);
         }
         false
