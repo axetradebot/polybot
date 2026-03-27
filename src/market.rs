@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
@@ -19,6 +20,25 @@ struct ClobToken {
     outcome: String,
     #[allow(dead_code)]
     winner: bool,
+}
+
+// ── Gamma API types for priceToBeat extraction ──
+
+#[derive(Debug, Deserialize)]
+struct GammaMarketResponse {
+    events: Option<Vec<GammaEvent>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GammaEvent {
+    #[serde(rename = "eventMetadata")]
+    event_metadata: Option<GammaEventMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GammaEventMetadata {
+    #[serde(rename = "priceToBeat")]
+    price_to_beat: Option<f64>,
 }
 
 pub fn epoch_secs() -> u64 {
@@ -181,4 +201,38 @@ pub async fn resolve_market_with_retry(slug: &str, clob_url: &str, max_retries: 
         }
     }
     unreachable!()
+}
+
+/// Fetch the "Price to Beat" (reference/open price) from Polymarket's Gamma API.
+/// Returns `None` if the field isn't available yet or the request fails.
+pub async fn fetch_price_to_beat(slug: &str) -> Option<Decimal> {
+    let url = format!("https://gamma-api.polymarket.com/markets?slug={}", slug);
+    let resp = match reqwest::get(&url).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(slug = %slug, error = %e, "Failed to fetch priceToBeat from Gamma API");
+            return None;
+        }
+    };
+
+    let markets: Vec<GammaMarketResponse> = match resp.json().await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(slug = %slug, error = %e, "Failed to parse Gamma API response for priceToBeat");
+            return None;
+        }
+    };
+
+    let ptb = markets
+        .first()?
+        .events
+        .as_ref()?
+        .first()?
+        .event_metadata
+        .as_ref()?
+        .price_to_beat?;
+
+    let decimal = Decimal::from_str(&format!("{ptb}")).ok()?;
+    info!(slug = %slug, price_to_beat = %decimal, "Fetched priceToBeat from Polymarket");
+    Some(decimal)
 }

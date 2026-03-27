@@ -768,6 +768,7 @@ async fn run_scanner_loop(
     let token_cache: shadow_timing::SharedTokenCache =
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let mut window_traded: HashMap<String, bool> = HashMap::new();
+    let mut ptb_pending: HashMap<String, u64> = HashMap::new(); // markets where we used feed fallback and should retry priceToBeat
     let mut last_skip_reasons: HashMap<String, String> = HashMap::new();
     let mut skip_notified: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut shadow_recorded: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1236,17 +1237,37 @@ async fn run_scanner_loop(
                 last_skip_reasons.remove(&mkt.name);
                 skip_notified.retain(|k| !k.starts_with(&mkt.name));
 
-                // New window detected — capture open price from market's resolution source
-                if let Some(price) = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
+                // New window detected — try to fetch priceToBeat from Polymarket first
+                let slug_for_ptb = market::build_slug(&mkt.slug_prefix, window_ts);
+                let ptb = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    market::fetch_price_to_beat(&slug_for_ptb),
+                ).await.unwrap_or(None);
+
+                let ptb_key = format!("{}-{}", mkt.slug_prefix, window_ts);
+                if let Some(poly_price) = ptb {
+                    price_feeds
+                        .set_window_open(&mkt.slug_prefix, window_ts, poly_price)
+                        .await;
+                    ptb_pending.remove(&ptb_key);
+                    info!(
+                        market = %mkt.name,
+                        window_ts,
+                        open_price = %poly_price,
+                        secs_remaining = secs_rem,
+                        "New window started (priceToBeat from Polymarket)"
+                    );
+                } else if let Some(price) = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
                     price_feeds
                         .set_window_open(&mkt.slug_prefix, window_ts, price)
                         .await;
+                    ptb_pending.insert(ptb_key, window_ts);
                     info!(
                         market = %mkt.name,
                         window_ts,
                         open_price = %price,
                         secs_remaining = secs_rem,
-                        "New window started"
+                        "New window started (feed fallback — will retry priceToBeat)"
                     );
                 }
 
@@ -1303,16 +1324,59 @@ async fn run_scanner_loop(
                     .await
                     .is_some();
                 if !wo_key_exists {
-                    if let Some(price) = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
+                    let slug_for_ptb = market::build_slug(&mkt.slug_prefix, window_ts);
+                    let ptb = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        market::fetch_price_to_beat(&slug_for_ptb),
+                    ).await.unwrap_or(None);
+
+                    if let Some(poly_price) = ptb {
                         price_feeds
-                            .set_window_open(&mkt.slug_prefix, window_ts, price)
+                            .set_window_open(&mkt.slug_prefix, window_ts, poly_price)
                             .await;
                         info!(
                             market = %mkt.name,
                             window_ts,
-                            open_price = %price,
-                            "Open price set (late capture)"
+                            open_price = %poly_price,
+                            "Open price set (late priceToBeat from Polymarket)"
                         );
+                    } else if let Some(price) = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
+                        price_feeds
+                            .set_window_open(&mkt.slug_prefix, window_ts, price)
+                            .await;
+                        let late_ptb_key = format!("{}-{}", mkt.slug_prefix, window_ts);
+                        ptb_pending.insert(late_ptb_key, window_ts);
+                        info!(
+                            market = %mkt.name,
+                            window_ts,
+                            open_price = %price,
+                            "Open price set (late feed fallback — will retry priceToBeat)"
+                        );
+                    }
+                }
+
+                // Upgrade feed-fallback open price to priceToBeat if now available
+                {
+                    let retry_key = format!("{}-{}", mkt.slug_prefix, window_ts);
+                    if ptb_pending.contains_key(&retry_key) {
+                        let slug_for_ptb = market::build_slug(&mkt.slug_prefix, window_ts);
+                        if let Ok(Some(poly_price)) = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            market::fetch_price_to_beat(&slug_for_ptb),
+                        ).await {
+                            let old_price = price_feeds.get_window_open(&mkt.slug_prefix, window_ts).await;
+                            price_feeds
+                                .set_window_open(&mkt.slug_prefix, window_ts, poly_price)
+                                .await;
+                            ptb_pending.remove(&retry_key);
+                            info!(
+                                market = %mkt.name,
+                                window_ts,
+                                old_open = ?old_price,
+                                new_open = %poly_price,
+                                "Upgraded open price to priceToBeat from Polymarket"
+                            );
+                        }
                     }
                 }
 
