@@ -145,6 +145,8 @@ pub struct ScannerConfig {
     pub min_volatility_pct: f64,
     #[serde(default)]
     pub require_acceleration: bool,
+    #[serde(default)]
+    pub min_signal_score: f64,
 }
 
 fn default_scan_ms() -> u64 { 1000 }

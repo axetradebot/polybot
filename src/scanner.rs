@@ -238,6 +238,23 @@ pub async fn scan_all_markets(
             continue;
         }
 
+        if config.scanner.min_signal_score > 0.0 && sig.signal_score < config.scanner.min_signal_score {
+            let detail = format!("Signal too weak: {:.4} < {:.2} min", sig.signal_score, config.scanner.min_signal_score);
+            info!(market = %mkt.name, signal = sig.signal_score, min = config.scanner.min_signal_score, delta = delta_f64, "Skip: signal score too low");
+            skip_reasons.insert(mkt.name.clone(), detail.clone());
+            evaluations.push(ScanEvaluation {
+                market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
+                direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
+                open_price: Some(open_price), current_price: Some(current_price),
+                best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
+                suggested_entry: None, max_entry: None, edge_score: None,
+                velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
+                signal_score: Some(sig.signal_score),
+                result: "SKIP_SIGNAL".into(), detail: Some(detail),
+            });
+            continue;
+        }
+
         // ── Early limit order fast path ──
         // At T-120, orderbooks are often empty on the direction token.
         // Place a fixed-price limit bid at $0.30 and let it sit until filled.
