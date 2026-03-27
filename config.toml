@@ -13,7 +13,7 @@ on_settlement = true
 on_order_placed = false
 on_startup = true
 on_watching = false
-on_window_miss = false
+on_window_miss = true
 on_heartbeat = false
 
 [bankroll]
