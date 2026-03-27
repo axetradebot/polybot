@@ -50,6 +50,13 @@ pub async fn run_shadow_timing(
 ) {
     let clob_url = config.infra.polymarket_clob_url.clone();
 
+    let sig_weights = signal::SignalWeights {
+        delta: config.scanner.signal_weight_delta,
+        velocity: config.scanner.signal_weight_velocity,
+        volatility: config.scanner.signal_weight_volatility,
+        acceleration: config.scanner.signal_weight_accel,
+    };
+
     // Track snapshots we've already recorded: (market_name, window_ts, t_seconds)
     let mut recorded: HashSet<(String, u64, u64)> = HashSet::new();
     // Markets that had delta >= threshold at T-40 or T-30 (qualified for later snapshots)
@@ -152,6 +159,19 @@ pub async fn run_shadow_timing(
                     (None, None, 0, 0, 0.0, false, None)
                 };
 
+            let price_sym = PriceFeeds::price_symbol(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol);
+            let ticks = price_feeds.get_ticks(&price_sym, 60).await;
+            let tick_count_30s = {
+                let cutoff = std::time::Instant::now() - Duration::from_secs(30);
+                ticks.iter().filter(|t| t.ts >= cutoff).count() as i64
+            };
+            let (v5, v15, accel, range, score) = if !ticks.is_empty() {
+                let sig = signal::compute_signals(current_price, open_price, &ticks, &sig_weights);
+                (Some(sig.velocity_5s), Some(sig.velocity_15s), Some(sig.acceleration), Some(sig.range_30s), Some(sig.signal_score))
+            } else {
+                (None, None, None, None, None)
+            };
+
             if let Err(e) = db.insert_shadow_timing(
                 &window_id,
                 &mkt.name,
@@ -167,6 +187,12 @@ pub async fn run_shadow_timing(
                 total_size_w,
                 could_fill,
                 hypo_entry,
+                v5,
+                v15,
+                accel,
+                range,
+                score,
+                tick_count_30s,
             ) {
                 warn!(error = %e, market = %mkt.name, t = t_sec, "Failed to insert shadow timing");
             } else {
@@ -176,6 +202,8 @@ pub async fn run_shadow_timing(
                     delta = delta_f64,
                     direction = %dir_str,
                     book_fetched = should_fetch_book,
+                    signal_score = score.unwrap_or(0.0),
+                    tick_count = tick_count_30s,
                     "Shadow timing snapshot recorded"
                 );
             }

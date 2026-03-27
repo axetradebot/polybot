@@ -251,6 +251,13 @@ impl TradeDb {
             "ALTER TABLE shadow_trades ADD COLUMN velocity_15s REAL",
             "ALTER TABLE shadow_trades ADD COLUMN range_30s REAL",
             "ALTER TABLE shadow_trades ADD COLUMN signal_score REAL",
+            // TA indicators on shadow_timing for T-120 analysis
+            "ALTER TABLE shadow_timing ADD COLUMN velocity_5s REAL",
+            "ALTER TABLE shadow_timing ADD COLUMN velocity_15s REAL",
+            "ALTER TABLE shadow_timing ADD COLUMN acceleration REAL",
+            "ALTER TABLE shadow_timing ADD COLUMN range_30s REAL",
+            "ALTER TABLE shadow_timing ADD COLUMN signal_score REAL",
+            "ALTER TABLE shadow_timing ADD COLUMN tick_count_30s INTEGER DEFAULT 0",
         ];
         for sql in &migrations {
             let _ = conn.execute(sql, []);
@@ -733,6 +740,7 @@ impl TradeDb {
     }
 
     /// Record a shadow timing snapshot for a specific T-second.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_shadow_timing(
         &self,
         window_id: &str,
@@ -749,6 +757,12 @@ impl TradeDb {
         total_ask_size_winner: f64,
         could_have_filled: bool,
         hypothetical_entry_price: Option<f64>,
+        velocity_5s: Option<f64>,
+        velocity_15s: Option<f64>,
+        acceleration: Option<f64>,
+        range_30s: Option<f64>,
+        signal_score: Option<f64>,
+        tick_count_30s: i64,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -757,8 +771,10 @@ impl TradeDb {
                 binance_price, window_open_price,
                 best_ask_winner, best_ask_loser, ask_depth_winner, ask_depth_loser,
                 total_ask_size_winner, could_have_filled, hypothetical_entry_price,
-                would_have_won, actual_outcome, timestamp
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL,?15)",
+                would_have_won, actual_outcome,
+                velocity_5s, velocity_15s, acceleration, range_30s, signal_score, tick_count_30s,
+                timestamp
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL,?15,?16,?17,?18,?19,?20,?21)",
             params![
                 window_id,
                 market_name,
@@ -774,6 +790,12 @@ impl TradeDb {
                 total_ask_size_winner,
                 could_have_filled as i64,
                 hypothetical_entry_price,
+                velocity_5s,
+                velocity_15s,
+                acceleration,
+                range_30s,
+                signal_score,
+                tick_count_30s,
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
