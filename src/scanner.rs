@@ -291,7 +291,8 @@ pub async fn scan_all_markets(
             };
 
             let early_price = dec!(0.30);
-            let early_contracts = dec!(5);
+            let early_contracts = Decimal::from_str_exact(&format!("{}", (config.bankroll.bet_size_usd / 0.30).floor() as u64)).unwrap_or(dec!(50));
+            let early_contracts = early_contracts.max(dec!(5));
             let early_bet = early_contracts * early_price;
 
             info!(
