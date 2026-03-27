@@ -159,7 +159,7 @@ pub async fn scan_all_markets(
             "In entry window — evaluating"
         );
 
-        let current_price = match price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
+        let current_price = match price_feeds.get_live_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
             Some(p) => p,
             None => {
                 info!(market = %mkt.name, source = %mkt.resolution_source, "Skip: no price data");
@@ -208,8 +208,8 @@ pub async fn scan_all_markets(
         };
 
         // Compute full signal bundle (delta + velocity + volatility + score)
-        let price_sym = PriceFeeds::price_symbol(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol);
-        let ticks = price_feeds.get_ticks(&price_sym, 60).await;
+        let live_sym = PriceFeeds::live_price_symbol(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol);
+        let ticks = price_feeds.get_ticks(&live_sym, 60).await;
         let sig = signal::compute_signals(current_price, open_price, &ticks, &sig_weights);
         let direction = sig.direction.unwrap_or(Direction::Up);
         let delta_f64 = sig.delta_pct;

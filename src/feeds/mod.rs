@@ -147,12 +147,19 @@ impl PriceFeeds {
     }
 
     /// Get the price symbol key for a market based on its resolution source.
+    /// Used for open price capture (Chainlink preferred).
     pub fn price_symbol(resolution_source: &str, chainlink_sym: &str, binance_sym: &str) -> String {
         if resolution_source == "binance" {
             binance_sym.to_lowercase()
         } else {
             chainlink_sym.to_lowercase()
         }
+    }
+
+    /// Get the symbol key for live/real-time price data (always Binance).
+    /// Used for delta calculation and signal computation during scanning.
+    pub fn live_price_symbol(_resolution_source: &str, _chainlink_sym: &str, binance_sym: &str) -> String {
+        binance_sym.to_lowercase()
     }
 
     /// Get price for a symbol. Returns the value if present, regardless of age.
@@ -212,6 +219,35 @@ impl PriceFeeds {
         } else {
             self.get_price_with_fallback(chainlink_sym).await
         }
+    }
+
+    /// Get the freshest real-time price for scanning/delta calculation.
+    /// Prefers Binance (sub-second updates) over Chainlink (60-90s updates)
+    /// so that delta % is responsive during the entry window.
+    pub async fn get_live_price(
+        &self,
+        resolution_source: &str,
+        chainlink_sym: &str,
+        binance_sym: &str,
+    ) -> Option<Decimal> {
+        if resolution_source == "binance" {
+            return self.get_price(binance_sym).await;
+        }
+        // For chainlink-resolved markets, prefer the Binance feed for live data
+        let fb_map = self.fallback_map.read().await;
+        let sym_lower = chainlink_sym.to_lowercase();
+        if let Some(binance_key) = fb_map.get(&sym_lower) {
+            let map = self.prices.read().await;
+            if let Some(d) = map.get(binance_key) {
+                let age_ms = (Utc::now() - d.updated_at).num_milliseconds();
+                if age_ms < BINANCE_STALE_MS {
+                    return Some(d.price);
+                }
+            }
+        }
+        drop(fb_map);
+        // Fall back to Chainlink if Binance unavailable
+        self.get_price_with_fallback(chainlink_sym).await
     }
 
     /// Check freshness for a market based on its resolution source.
