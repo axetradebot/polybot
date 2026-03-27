@@ -24,10 +24,11 @@ const TICK_HISTORY_MAX_AGE_SECS: u64 = 60;
 
 /// Dual-source price feed: Chainlink (primary) + Binance (fallback).
 ///
-/// Both sources write into the same `prices` map using their own symbol format
-/// (Chainlink: "btc/usd", Binance: "btcusdt"). Callers should query with the
-/// Chainlink symbol. If the Chainlink price is stale, `get_price_with_fallback`
-/// will transparently try the Binance key.
+/// Chainlink prices are stored under Chainlink keys ("btc/usd") and Binance
+/// prices under Binance keys ("btcusdt"). They are NEVER mixed — this prevents
+/// Binance USDT prices from overwriting Chainlink USD prices that Polymarket
+/// uses for market resolution. `get_price_with_fallback` tries the Chainlink
+/// key first, falling back to the Binance key only when Chainlink is stale.
 #[derive(Clone)]
 pub struct PriceFeeds {
     prices: Arc<RwLock<HashMap<String, PriceData>>>,
@@ -79,16 +80,8 @@ impl PriceFeeds {
         }
     }
 
-    /// Get the price closest to `secs_ago` seconds in the past from the tick history.
-    /// Used to retroactively find the price at an exact window boundary.
-    pub async fn get_price_at_offset(&self, symbol: &str, secs_ago: u64) -> Option<Decimal> {
-        let hist = self.tick_history.read().await;
-        let key = symbol.to_lowercase();
-        let deque = hist.get(&key)?;
-        if deque.is_empty() {
-            return None;
-        }
-        let target = Instant::now() - std::time::Duration::from_secs(secs_ago);
+    /// Find the tick closest to a target `Instant` in a deque, within `max_diff_ms`.
+    fn find_closest_tick(deque: &VecDeque<TickEntry>, target: Instant, max_diff_ms: u64) -> Option<Decimal> {
         let mut closest: Option<&TickEntry> = None;
         let mut best_diff = u64::MAX;
         for tick in deque.iter() {
@@ -102,12 +95,38 @@ impl PriceFeeds {
                 closest = Some(tick);
             }
         }
-        // Only use if the closest tick is within 5 seconds of the target
-        if best_diff <= 5000 {
+        if best_diff <= max_diff_ms {
             closest.map(|t| t.price)
         } else {
             None
         }
+    }
+
+    /// Get the price closest to `secs_ago` seconds in the past from the tick history.
+    /// Tries the primary key first, then falls back to the registered Binance key.
+    pub async fn get_price_at_offset(&self, symbol: &str, secs_ago: u64) -> Option<Decimal> {
+        let target = Instant::now() - std::time::Duration::from_secs(secs_ago);
+        let hist = self.tick_history.read().await;
+        let key = symbol.to_lowercase();
+
+        // Try primary (Chainlink) key first
+        if let Some(deque) = hist.get(&key) {
+            if let Some(price) = Self::find_closest_tick(deque, target, 5000) {
+                return Some(price);
+            }
+        }
+
+        // Fallback: check the Binance key
+        drop(hist);
+        let fb_map = self.fallback_map.read().await;
+        if let Some(binance_sym) = fb_map.get(&key) {
+            let hist = self.tick_history.read().await;
+            if let Some(deque) = hist.get(binance_sym) {
+                return Self::find_closest_tick(deque, target, 5000);
+            }
+        }
+
+        None
     }
 
     /// Get recent ticks for a symbol within the last `lookback_secs` seconds.

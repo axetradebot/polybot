@@ -233,24 +233,29 @@ async fn handle_chainlink_message(feeds: &PriceFeeds, text: &str) -> Result<()> 
         "crypto_prices" => {
             if let Some(payload_val) = msg.payload {
                 if msg.msg_type == "subscribe" {
-                    // Initial subscribe response with historical data — take the last value
+                    // Initial subscribe response with historical data — take the last value.
+                    // Store under the Binance key so it doesn't overwrite Chainlink prices.
+                    // Only seed the Chainlink key if no Chainlink price exists yet.
                     let payload: HistoryPayload = serde_json::from_value(payload_val)?;
                     if let Some(last) = payload.data.last() {
                         let price = Decimal::try_from(last.value)?;
-                        let symbol = payload.symbol.to_lowercase();
-                        let store_key = binance_to_chainlink_symbol(&symbol)
-                            .unwrap_or_else(|| { Box::leak(symbol.clone().into_boxed_str()) });
-                        info!(symbol = %store_key, price = %price, "Chainlink initial price from history");
-                        feeds.set_price(store_key, price).await;
+                        let binance_sym = payload.symbol.to_lowercase();
+                        feeds.set_price(&binance_sym, price).await;
+                        if let Some(cl_key) = binance_to_chainlink_symbol(&binance_sym) {
+                            if feeds.get_price(cl_key).await.is_none() {
+                                info!(symbol = %cl_key, price = %price, "Seeding Chainlink key from Binance (no Chainlink data yet)");
+                                feeds.set_price(cl_key, price).await;
+                            }
+                        }
                     }
                 } else {
-                    // Real-time crypto_prices update — store under the chainlink key
+                    // Real-time Binance update — store under the BINANCE key only.
+                    // This prevents Binance (USDT) prices from overwriting
+                    // Chainlink (USD) prices that Polymarket uses for resolution.
                     let payload: LivePricePayload = serde_json::from_value(payload_val)?;
                     let price = Decimal::try_from(payload.value)?;
                     let binance_sym = payload.symbol.to_lowercase();
-                    if let Some(cl_key) = binance_to_chainlink_symbol(&binance_sym) {
-                        feeds.set_price(cl_key, price).await;
-                    }
+                    feeds.set_price(&binance_sym, price).await;
                 }
             }
         }
