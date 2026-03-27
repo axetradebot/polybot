@@ -186,9 +186,9 @@ fn build_subscribe_message(symbols: &[String]) -> String {
         }));
     }
 
-    // Also subscribe to crypto_prices for real-time updates on all symbols.
-    // crypto_prices_chainlink only streams live data for BTC; crypto_prices
-    // provides per-second updates for all symbols via Polymarket's RTDS.
+    // Also subscribe to crypto_prices (Binance source) as a fallback.
+    // crypto_prices_chainlink is the authoritative source for all crypto symbols.
+    // Binance prices are stored separately and only used if Chainlink goes stale.
     subscriptions.push(serde_json::json!({
         "topic": "crypto_prices",
         "type": "update",
