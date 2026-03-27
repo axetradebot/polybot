@@ -1360,30 +1360,66 @@ async fn run_scanner_loop(
                     }
                 }
 
-                // Re-snap open price to fresh Chainlink value ~60s into window.
-                // Polymarket publishes priceToBeat around T-240 (60s in), using
-                // the first Chainlink tick after window start.
+                // Fetch Polymarket's official priceToBeat once it becomes available
+                // (~60s into window). This is the exact reference price used for
+                // resolution, so using it eliminates direction mismatch from our
+                // Chainlink WebSocket feed not matching their on-chain snapshot.
+                // We attempt at 60s, 90s, and 120s into the window (3 tries max).
                 let secs_into_window = mkt.window_seconds.saturating_sub(secs_rem);
-                if secs_into_window >= 60
-                    && secs_into_window < 120
-                    && !open_resnapped.contains(&mkt.name)
+                if !open_resnapped.contains(&mkt.name)
                     && mkt.resolution_source != "binance"
+                    && (secs_into_window == 60
+                        || secs_into_window == 90
+                        || secs_into_window == 120)
                 {
-                    if let Some(fresh_cl) = price_feeds.get_price_with_fallback(&mkt.chainlink_symbol).await {
-                        let old_open = price_feeds.get_window_open(&mkt.slug_prefix, window_ts).await;
-                        price_feeds
-                            .set_window_open(&mkt.slug_prefix, window_ts, fresh_cl)
-                            .await;
-                        open_resnapped.insert(mkt.name.clone());
-                        info!(
-                            market = %mkt.name,
-                            window_ts,
-                            old_open = ?old_open.map(|p| p.to_string()),
-                            new_open = %fresh_cl,
-                            secs_into_window,
-                            "Open price re-snapped to fresh Chainlink value"
-                        );
+                    let slug = if mkt.is_hourly() {
+                        hs_local.get(&mkt.name).cloned()
+                    } else {
+                        Some(market::build_slug(&mkt.slug_prefix, window_ts))
+                    };
+                    if let Some(slug) = slug {
+                        match tokio::time::timeout(
+                            Duration::from_secs(3),
+                            market::fetch_price_to_beat(&slug),
+                        ).await {
+                            Ok(Some(ptb)) => {
+                                let old_open = price_feeds.get_window_open(&mkt.slug_prefix, window_ts).await;
+                                price_feeds
+                                    .set_window_open(&mkt.slug_prefix, window_ts, ptb)
+                                    .await;
+                                open_resnapped.insert(mkt.name.clone());
+                                info!(
+                                    market = %mkt.name,
+                                    window_ts,
+                                    old_open = ?old_open.map(|p| p.to_string()),
+                                    poly_ptb = %ptb,
+                                    secs_into_window,
+                                    "Open price set to Polymarket priceToBeat"
+                                );
+                            }
+                            Ok(None) => {
+                                info!(
+                                    market = %mkt.name,
+                                    secs_into_window,
+                                    "priceToBeat not yet available — will retry"
+                                );
+                            }
+                            Err(_) => {
+                                debug!(
+                                    market = %mkt.name,
+                                    "priceToBeat fetch timed out"
+                                );
+                            }
+                        }
                     }
+                }
+                // Give up after 130s — entry window starts at T-120
+                if secs_into_window >= 130 && !open_resnapped.contains(&mkt.name) {
+                    open_resnapped.insert(mkt.name.clone());
+                    info!(
+                        market = %mkt.name,
+                        "priceToBeat unavailable — using Chainlink open price"
+                    );
                 }
 
                 // Retry token resolution if missing
