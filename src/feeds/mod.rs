@@ -37,6 +37,8 @@ const BINANCE_STALE_MS: i64 = 60_000;    // 1 minute
 pub struct PriceFeeds {
     prices: Arc<RwLock<HashMap<String, PriceData>>>,
     window_opens: Arc<RwLock<HashMap<String, Decimal>>>,
+    /// Binance (USDT) open prices — used for unbiased delta calculation.
+    binance_window_opens: Arc<RwLock<HashMap<String, Decimal>>>,
     /// Maps Chainlink symbol → Binance symbol for fallback lookups.
     fallback_map: Arc<RwLock<HashMap<String, String>>>,
     /// Per-symbol ring buffer of recent ticks (last 60s) for velocity/volatility.
@@ -48,6 +50,7 @@ impl PriceFeeds {
         Self {
             prices: Arc::new(RwLock::new(HashMap::new())),
             window_opens: Arc::new(RwLock::new(HashMap::new())),
+            binance_window_opens: Arc::new(RwLock::new(HashMap::new())),
             fallback_map: Arc::new(RwLock::new(HashMap::new())),
             tick_history: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -397,14 +400,25 @@ impl PriceFeeds {
         self.window_opens.read().await.get(&key).copied()
     }
 
+    pub async fn set_binance_window_open(&self, slug_prefix: &str, window_ts: u64, price: Decimal) {
+        let key = Self::window_key(slug_prefix, window_ts);
+        self.binance_window_opens.write().await.insert(key, price);
+    }
+
+    pub async fn get_binance_window_open(&self, slug_prefix: &str, window_ts: u64) -> Option<Decimal> {
+        let key = Self::window_key(slug_prefix, window_ts);
+        self.binance_window_opens.read().await.get(&key).copied()
+    }
+
     pub async fn prune_old_window_opens(&self, current_ts: u64, max_age_s: u64) {
-        let mut map = self.window_opens.write().await;
-        map.retain(|key, _| {
+        let retain_fn = |key: &String, _: &mut Decimal| {
             key.rsplit_once(':')
                 .and_then(|(_, ts_str)| ts_str.parse::<u64>().ok())
                 .map(|ts| current_ts.saturating_sub(ts) <= max_age_s)
                 .unwrap_or(false)
-        });
+        };
+        self.window_opens.write().await.retain(retain_fn);
+        self.binance_window_opens.write().await.retain(retain_fn);
     }
 
     /// Spawn Chainlink (primary) price feed.

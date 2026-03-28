@@ -1293,6 +1293,22 @@ async fn run_scanner_loop(
                     );
                 }
 
+                // Also capture Binance open for unbiased delta calculation.
+                // USDT premium cancels out when both open and current use Binance.
+                let binance_sym = mkt.binance_symbol.to_lowercase();
+                let binance_open = if secs_since_start > 0 {
+                    price_feeds.get_price_at_offset(&binance_sym, secs_since_start).await
+                } else {
+                    None
+                };
+                if let Some(bp) = binance_open {
+                    price_feeds.set_binance_window_open(&mkt.slug_prefix, window_ts, bp).await;
+                    info!(market = %mkt.name, binance_open = %bp, "Binance open captured (tick-buffer)");
+                } else if let Some(bp) = price_feeds.get_price(&binance_sym).await {
+                    price_feeds.set_binance_window_open(&mkt.slug_prefix, window_ts, bp).await;
+                    info!(market = %mkt.name, binance_open = %bp, "Binance open captured (current price)");
+                }
+
                 // Resolve tokens for this window (best-effort)
                 if mkt.is_hourly() {
                     // Clear previous hourly slug on window transition

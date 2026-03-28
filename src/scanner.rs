@@ -202,10 +202,19 @@ pub async fn scan_all_markets(
             }
         };
 
+        // Use Binance open for delta calculation so USDT premium cancels out.
+        // Both current_price (Binance live) and delta_open (Binance at T-300)
+        // are in USDT, giving an unbiased delta magnitude.
+        // Falls back to Chainlink open if Binance open wasn't captured.
+        let delta_open = price_feeds
+            .get_binance_window_open(&mkt.slug_prefix, window_ts)
+            .await
+            .unwrap_or(open_price);
+
         // Compute full signal bundle (delta + velocity + volatility + score)
         let live_sym = PriceFeeds::live_price_symbol(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol);
         let ticks = price_feeds.get_ticks(&live_sym, 60).await;
-        let sig = signal::compute_signals(current_price, open_price, &ticks, &sig_weights);
+        let sig = signal::compute_signals(current_price, delta_open, &ticks, &sig_weights);
 
         // Direction must be determined from Chainlink (same source as open price
         // and Polymarket resolution) to avoid systematic USDT premium bias.
