@@ -222,12 +222,39 @@ async fn handle_chainlink_message(feeds: &PriceFeeds, text: &str) -> Result<()> 
 
     match msg.topic.as_str() {
         "crypto_prices_chainlink" => {
-            // Authoritative Chainlink oracle price — always overwrite
             if let Some(payload_val) = msg.payload {
-                let payload: LivePricePayload = serde_json::from_value(payload_val)?;
-                let price = Decimal::try_from(payload.value)?;
-                let symbol = payload.symbol.to_lowercase();
-                feeds.set_price(&symbol, price).await;
+                if msg.msg_type == "subscribe" {
+                    // Subscribe response with per-second historical data.
+                    // Backfill these into the tick buffer so get_price_at_offset
+                    // can look up the exact price at the window boundary.
+                    let payload: HistoryPayload = serde_json::from_value(payload_val)?;
+                    let symbol = payload.symbol.to_lowercase();
+                    let ticks: Vec<(u64, Decimal)> = payload
+                        .data
+                        .iter()
+                        .filter_map(|dp| {
+                            Decimal::try_from(dp.value)
+                                .ok()
+                                .map(|p| (dp.timestamp, p))
+                        })
+                        .collect();
+                    if !ticks.is_empty() {
+                        info!(
+                            symbol = %symbol,
+                            count = ticks.len(),
+                            first_ts = ticks.first().map(|t| t.0).unwrap_or(0),
+                            last_ts = ticks.last().map(|t| t.0).unwrap_or(0),
+                            "Chainlink RTDS history backfilled"
+                        );
+                        feeds.backfill_ticks(&symbol, &ticks).await;
+                    }
+                } else {
+                    // Live Chainlink price update
+                    let payload: LivePricePayload = serde_json::from_value(payload_val)?;
+                    let price = Decimal::try_from(payload.value)?;
+                    let symbol = payload.symbol.to_lowercase();
+                    feeds.set_price(&symbol, price).await;
+                }
             }
         }
         "crypto_prices" => {

@@ -20,7 +20,7 @@ pub struct TickEntry {
     pub ts: Instant,
 }
 
-const TICK_HISTORY_MAX_AGE_SECS: u64 = 60;
+const TICK_HISTORY_MAX_AGE_SECS: u64 = 180;
 /// Chainlink updates less frequently than Binance. Use a generous stale
 /// threshold so we don't fall back to Binance (USDT) prices unnecessarily.
 const CHAINLINK_STALE_MS: i64 = 300_000; // 5 minutes
@@ -81,6 +81,51 @@ impl PriceFeeds {
         let cutoff = now - std::time::Duration::from_secs(TICK_HISTORY_MAX_AGE_SECS);
         while deque.front().map_or(false, |t| t.ts < cutoff) {
             deque.pop_front();
+        }
+    }
+
+    /// Backfill historical ticks from RTDS subscribe response.
+    /// `ticks` is a list of (unix_timestamp_ms, price) pairs.
+    /// Inserts them into the tick history with correct relative timestamps.
+    pub async fn backfill_ticks(&self, symbol: &str, ticks: &[(u64, Decimal)]) {
+        if ticks.is_empty() {
+            return;
+        }
+        let key = symbol.to_lowercase();
+        let now_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let now_instant = Instant::now();
+
+        let mut hist = self.tick_history.write().await;
+        let deque = hist.entry(key.clone()).or_insert_with(VecDeque::new);
+        let cutoff = now_instant - std::time::Duration::from_secs(TICK_HISTORY_MAX_AGE_SECS);
+
+        for &(ts_ms, price) in ticks {
+            if ts_ms >= now_epoch_ms {
+                continue;
+            }
+            let age_ms = now_epoch_ms - ts_ms;
+            if let Some(tick_instant) = now_instant.checked_sub(std::time::Duration::from_millis(age_ms)) {
+                if tick_instant >= cutoff {
+                    deque.push_back(TickEntry { price, ts: tick_instant });
+                }
+            }
+        }
+
+        deque.make_contiguous().sort_by_key(|t| t.ts);
+
+        // Also update the current price to the latest tick
+        if let Some(last) = ticks.last() {
+            let mut map = self.prices.write().await;
+            map.insert(
+                key,
+                PriceData {
+                    price: last.1,
+                    updated_at: Utc::now(),
+                },
+            );
         }
     }
 
