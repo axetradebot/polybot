@@ -796,6 +796,7 @@ async fn run_scanner_loop(
     let mut early_reject_until: HashMap<String, std::time::Instant> = HashMap::new();
     let mut open_resnapped: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_analytics_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let mut risk_alert_sent: std::collections::HashSet<String> = std::collections::HashSet::new();
     let scan_interval = Duration::from_millis(config.scanner.scan_interval_ms);
     let adjust_ms = config.pricing.adjust_interval_ms;
     let tighten_step = Decimal::try_from(config.pricing.tighten_step).unwrap_or(dec!(0.01));
@@ -1601,7 +1602,59 @@ async fn run_scanner_loop(
         // Check global risk once
         let global_ok = {
             let st = state.read().await;
-            risk_manager.check_global(&st).is_ok()
+            match risk_manager.check_global(&st) {
+                Ok(()) => {
+                    risk_alert_sent.clear();
+                    true
+                }
+                Err(ref veto) => {
+                    let key = match veto {
+                        risk::RiskVeto::DailyLossLimitReached => "daily_loss",
+                        risk::RiskVeto::ConsecutiveLossPause => "consec_loss",
+                        risk::RiskVeto::Paused { .. } => "paused",
+                        risk::RiskVeto::InsufficientBankroll => "bankroll",
+                        _ => "other",
+                    };
+                    if risk_alert_sent.insert(key.to_string()) {
+                        let msg = match veto {
+                            risk::RiskVeto::DailyLossLimitReached => format!(
+                                "🛑 Daily Loss Limit Reached\n\n\
+                                 Daily P&L: {}\n\
+                                 Limit: ${:.2}\n\n\
+                                 Trading halted until next day reset.",
+                                st.daily_pnl,
+                                config.bankroll.daily_loss_limit_usd
+                            ),
+                            risk::RiskVeto::ConsecutiveLossPause => format!(
+                                "⚠️ Consecutive Loss Circuit Breaker\n\n\
+                                 Consecutive losses: {}\n\
+                                 Threshold: {}\n\
+                                 Pause duration: {} minutes\n\n\
+                                 Trading paused.",
+                                st.consecutive_losses,
+                                config.bankroll.consecutive_loss_pause,
+                                config.bankroll.pause_duration_minutes
+                            ),
+                            risk::RiskVeto::Paused { seconds_remaining } => format!(
+                                "⏸️ Trading Paused (Circuit Breaker)\n\n\
+                                 Time remaining: {}m {}s",
+                                seconds_remaining / 60,
+                                seconds_remaining % 60
+                            ),
+                            risk::RiskVeto::InsufficientBankroll => format!(
+                                "💸 Insufficient Bankroll\n\n\
+                                 Current bankroll: {}\n\
+                                 Minimum required: bet size\n\n\
+                                 Trading halted — deposit funds.",
+                                st.bankroll
+                            ),
+                            _ => format!("🚨 Risk Veto: {veto}"),
+                        };
+                        telegram.send_error(&msg).await.ok();
+                    }
+                    false
+                }
+            }
         };
 
         if global_ok {
