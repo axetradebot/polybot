@@ -211,7 +211,15 @@ pub async fn scan_all_markets(
         let live_sym = PriceFeeds::live_price_symbol(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol);
         let ticks = price_feeds.get_ticks(&live_sym, 60).await;
         let sig = signal::compute_signals(current_price, open_price, &ticks, &sig_weights);
-        let direction = sig.direction.unwrap_or(Direction::Up);
+
+        // Direction must be determined from Chainlink (same source as open price
+        // and Polymarket resolution) to avoid systematic USDT premium bias.
+        let chainlink_price = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await;
+        let direction = if let Some(cl) = chainlink_price {
+            if cl >= open_price { Direction::Up } else { Direction::Down }
+        } else {
+            sig.direction.unwrap_or(Direction::Up)
+        };
         let delta_f64 = sig.delta_pct;
 
         let required_delta = if in_early_window {
