@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::PriceFeeds;
 
@@ -220,41 +220,71 @@ fn binance_to_chainlink_symbol(sym: &str) -> Option<&'static str> {
 async fn handle_chainlink_message(feeds: &PriceFeeds, text: &str) -> Result<()> {
     let msg: ChainlinkMessage = serde_json::from_str(text)?;
 
+    // Detect history payload (subscribe response) regardless of topic field.
+    // The RTDS Chainlink subscribe response may omit topic/type fields.
+    if let Some(ref payload_val) = msg.payload {
+        if payload_val.get("data").is_some() {
+            if payload_val.get("symbol").is_some() {
+                let payload: HistoryPayload = serde_json::from_value(payload_val.clone())?;
+                let symbol = payload.symbol.to_lowercase();
+                let is_chainlink = symbol.contains('/');
+                let ticks: Vec<(u64, Decimal)> = payload
+                    .data
+                    .iter()
+                    .filter_map(|dp| {
+                        Decimal::try_from(dp.value)
+                            .ok()
+                            .map(|p| (dp.timestamp, p))
+                    })
+                    .collect();
+                if !ticks.is_empty() {
+                    info!(
+                        symbol = %symbol,
+                        count = ticks.len(),
+                        first_ts = ticks.first().map(|t| t.0).unwrap_or(0),
+                        last_ts = ticks.last().map(|t| t.0).unwrap_or(0),
+                        is_chainlink,
+                        "RTDS history backfilled"
+                    );
+                    feeds.backfill_ticks(&symbol, &ticks).await;
+                    if !is_chainlink {
+                        if let Some(cl_key) = binance_to_chainlink_symbol(&symbol) {
+                            if feeds.get_price(cl_key).await.is_none() {
+                                if let Some(last) = ticks.last() {
+                                    info!(symbol = %cl_key, price = %last.1, "Seeding Chainlink key from Binance history");
+                                    feeds.set_price(cl_key, last.1).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            } else {
+                // History data without symbol field — log the keys so we can fix parsing
+                let keys: Vec<&str> = payload_val.as_object()
+                    .map(|o| o.keys().map(|k| k.as_str()).collect())
+                    .unwrap_or_default();
+                let sample = &text[..text.len().min(500)];
+                warn!(
+                    keys = ?keys,
+                    topic = %msg.topic,
+                    msg_type = %msg.msg_type,
+                    sample = %sample,
+                    "RTDS history has data array but no symbol field"
+                );
+                return Ok(());
+            }
+        }
+    }
+
     match msg.topic.as_str() {
         "crypto_prices_chainlink" => {
             if let Some(payload_val) = msg.payload {
-                if msg.msg_type == "subscribe" {
-                    // Subscribe response with per-second historical data.
-                    // Backfill these into the tick buffer so get_price_at_offset
-                    // can look up the exact price at the window boundary.
-                    let payload: HistoryPayload = serde_json::from_value(payload_val)?;
-                    let symbol = payload.symbol.to_lowercase();
-                    let ticks: Vec<(u64, Decimal)> = payload
-                        .data
-                        .iter()
-                        .filter_map(|dp| {
-                            Decimal::try_from(dp.value)
-                                .ok()
-                                .map(|p| (dp.timestamp, p))
-                        })
-                        .collect();
-                    if !ticks.is_empty() {
-                        info!(
-                            symbol = %symbol,
-                            count = ticks.len(),
-                            first_ts = ticks.first().map(|t| t.0).unwrap_or(0),
-                            last_ts = ticks.last().map(|t| t.0).unwrap_or(0),
-                            "Chainlink RTDS history backfilled"
-                        );
-                        feeds.backfill_ticks(&symbol, &ticks).await;
-                    }
-                } else {
-                    // Live Chainlink price update
-                    let payload: LivePricePayload = serde_json::from_value(payload_val)?;
-                    let price = Decimal::try_from(payload.value)?;
-                    let symbol = payload.symbol.to_lowercase();
-                    feeds.set_price(&symbol, price).await;
-                }
+                // Live Chainlink price update
+                let payload: LivePricePayload = serde_json::from_value(payload_val)?;
+                let price = Decimal::try_from(payload.value)?;
+                let symbol = payload.symbol.to_lowercase();
+                feeds.set_price(&symbol, price).await;
             }
         }
         "crypto_prices" => {
@@ -286,7 +316,11 @@ async fn handle_chainlink_message(feeds: &PriceFeeds, text: &str) -> Result<()> 
                 }
             }
         }
-        _ => {}
+        other => {
+            if !other.is_empty() {
+                debug!(topic = %other, msg_type = %msg.msg_type, "Unhandled RTDS topic");
+            }
+        }
     }
 
     Ok(())
