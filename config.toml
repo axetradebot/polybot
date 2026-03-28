@@ -17,7 +17,7 @@ on_window_miss = false
 on_heartbeat = false
 
 [bankroll]
-total = 851.0
+total = 832.90
 max_concurrent_positions = 6
 max_per_market = 2
 bet_size_usd = 15.0
