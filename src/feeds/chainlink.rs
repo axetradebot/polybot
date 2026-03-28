@@ -87,11 +87,19 @@ pub async fn run_chainlink_feed(
                     }
                 });
 
-                // Track last message time for stale detection
+                // Chainlink RTDS only delivers price data in the subscribe
+                // response (~59s of history), then goes silent. Force a
+                // reconnect every 55s so we always have fresh Chainlink prices
+                // instead of falling back to Binance (USDT ≠ USD).
+                let reconnect_at = tokio::time::Instant::now() + Duration::from_secs(55);
                 let mut last_msg_at = tokio::time::Instant::now();
-                let stale_timeout = Duration::from_secs(30);
 
                 loop {
+                    if tokio::time::Instant::now() >= reconnect_at {
+                        info!("Chainlink periodic reconnect (55s) — refreshing price history");
+                        break;
+                    }
+
                     let read_result = tokio::time::timeout(
                         Duration::from_secs(10),
                         read.next(),
@@ -134,11 +142,11 @@ pub async fn run_chainlink_feed(
                             break;
                         }
                         Err(_) => {
-                            // Timeout — check if we've been stale too long
-                            if last_msg_at.elapsed() > stale_timeout {
+                            // Timeout — check if connection is truly dead
+                            if last_msg_at.elapsed() > Duration::from_secs(30) {
                                 warn!(
                                     stale_secs = last_msg_at.elapsed().as_secs(),
-                                    "Chainlink feed stale for >30s, forcing reconnect"
+                                    "Chainlink connection dead for >30s, forcing reconnect"
                                 );
                                 break;
                             }
@@ -154,6 +162,8 @@ pub async fn run_chainlink_feed(
                 }
 
                 ping_task.abort();
+                // Periodic reconnect — no backoff delay needed
+                continue;
             }
             Err(e) => {
                 error!(error = %e, "Failed to connect to Chainlink WebSocket");
