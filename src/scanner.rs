@@ -138,9 +138,8 @@ pub async fn scan_all_markets(
         } else {
             mkt.entry_start_s
         };
-        let in_early_window = mkt.early_entry_start_s > 0
-            && secs_rem > mkt.entry_start_s
-            && secs_rem <= mkt.early_entry_start_s;
+        // T-120 early entries disabled — 25% win rate at $0.30 is unprofitable
+        let in_early_window = false;
 
         if secs_rem > effective_start || secs_rem < entry_cutoff_s {
             debug!(
