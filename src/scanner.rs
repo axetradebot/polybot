@@ -133,12 +133,8 @@ pub async fn scan_all_markets(
         let (window_ts, secs_rem) = market::current_window(mkt.window_seconds);
         let entry_cutoff_s = mkt.effective_entry_cutoff(config.pricing.entry_cutoff_s);
 
-        let effective_start = if mkt.early_entry_start_s > 0 {
-            mkt.early_entry_start_s.max(mkt.entry_start_s)
-        } else {
-            mkt.entry_start_s
-        };
         // T-120 early entries disabled — 25% win rate at $0.30 is unprofitable
+        let effective_start = mkt.entry_start_s;
         let in_early_window = false;
 
         if secs_rem > effective_start || secs_rem < entry_cutoff_s {
