@@ -564,6 +564,16 @@ pub async fn scan_all_markets(
         } else {
             bet_size
         };
+        // Scale down bet for low-delta trades (< 0.075%) to reduce risk
+        // on marginal direction calls close to the price offset threshold.
+        let effective_bet = if delta_f64 < 0.075 {
+            let scale = (delta_f64 / 0.075).max(0.2);
+            let scaled = Decimal::try_from(scale).unwrap_or(dec!(1)) * effective_bet;
+            info!(market = %mkt.name, delta = delta_f64, scale, "Low-delta bet reduction");
+            scaled
+        } else {
+            effective_bet
+        };
 
         let min_contracts = dec!(5);
         let mut contracts = (effective_bet / suggested_entry).round_dp_with_strategy(0, rust_decimal::RoundingStrategy::ToZero);
