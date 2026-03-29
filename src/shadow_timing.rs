@@ -147,14 +147,23 @@ pub async fn run_shadow_timing(
                     (None, None, 0, 0, 0.0, false, None)
                 };
 
-            let price_sym = PriceFeeds::price_symbol(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol);
-            let ticks = price_feeds.get_ticks(&price_sym, 60).await;
+            let live_sym = PriceFeeds::live_price_symbol(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol);
+            let ticks = price_feeds.get_ticks(&live_sym, 60).await;
             let tick_count_30s = {
                 let cutoff = std::time::Instant::now() - Duration::from_secs(30);
                 ticks.iter().filter(|t| t.ts >= cutoff).count() as i64
             };
+            // Use Binance open for signal computation (consistent with scanner)
+            let delta_open = price_feeds
+                .get_binance_window_open(&mkt.slug_prefix, window_ts)
+                .await
+                .unwrap_or(open_price);
+            let binance_live = price_feeds
+                .get_price(&mkt.binance_symbol.to_lowercase())
+                .await
+                .unwrap_or(current_price);
             let (v5, v15, accel, range, score) = if !ticks.is_empty() {
-                let sig = signal::compute_signals(current_price, open_price, &ticks, &sig_weights);
+                let sig = signal::compute_signals(binance_live, delta_open, &ticks, &sig_weights);
                 (Some(sig.velocity_5s), Some(sig.velocity_15s), Some(sig.acceleration), Some(sig.range_30s), Some(sig.signal_score))
             } else {
                 (None, None, None, None, None)
