@@ -147,6 +147,12 @@ pub async fn run_shadow_timing(
                     (None, None, 0, 0, 0.0, false, None)
                 };
 
+            let ob_imbalance: Option<f64> = if depth_w > 0 || depth_l > 0 {
+                Some(depth_w as f64 / (depth_w as f64 + depth_l as f64))
+            } else {
+                None
+            };
+
             let live_sym = PriceFeeds::live_price_symbol(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol);
             let ticks = price_feeds.get_ticks(&live_sym, 60).await;
             let tick_count_30s = {
@@ -169,6 +175,9 @@ pub async fn run_shadow_timing(
                 (None, None, None, None, None)
             };
 
+            let live_sym_vol = PriceFeeds::live_price_symbol(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol);
+            let volume_ratio = price_feeds.get_volume_ratio(&live_sym_vol).await;
+
             if let Err(e) = db.insert_shadow_timing(
                 &window_id,
                 &mkt.name,
@@ -190,6 +199,8 @@ pub async fn run_shadow_timing(
                 range,
                 score,
                 tick_count_30s,
+                ob_imbalance,
+                volume_ratio,
             ) {
                 warn!(error = %e, market = %mkt.name, t = t_sec, "Failed to insert shadow timing");
             } else {

@@ -88,6 +88,11 @@ async fn handle_single_trade(feeds: &PriceFeeds, text: &str) -> Result<()> {
     let price = Decimal::from_str(&trade.price)?;
     let symbol = trade.symbol.to_lowercase();
     feeds.set_price(&symbol, price).await;
+    if let Ok(qty) = trade.quantity.parse::<f64>() {
+        if let Ok(px) = trade.price.parse::<f64>() {
+            feeds.record_volume(&symbol, qty * px).await;
+        }
+    }
     Ok(())
 }
 
@@ -96,5 +101,10 @@ async fn handle_combined_trade(feeds: &PriceFeeds, text: &str) -> Result<()> {
     let price = Decimal::from_str(&msg.data.price)?;
     let symbol = msg.data.symbol.to_lowercase();
     feeds.set_price(&symbol, price).await;
+    if let Ok(qty) = msg.data.quantity.parse::<f64>() {
+        if let Ok(px) = msg.data.price.parse::<f64>() {
+            feeds.record_volume(&symbol, qty * px).await;
+        }
+    }
     Ok(())
 }

@@ -20,6 +20,12 @@ pub struct TickEntry {
     pub ts: Instant,
 }
 
+#[derive(Clone, Debug)]
+pub struct VolumeEntry {
+    pub quantity: f64,
+    pub ts: Instant,
+}
+
 const TICK_HISTORY_MAX_AGE_SECS: u64 = 180;
 /// Chainlink updates less frequently than Binance. Use a generous stale
 /// threshold so we don't fall back to Binance (USDT) prices unnecessarily.
@@ -43,6 +49,8 @@ pub struct PriceFeeds {
     fallback_map: Arc<RwLock<HashMap<String, String>>>,
     /// Per-symbol ring buffer of recent ticks (last 60s) for velocity/volatility.
     tick_history: Arc<RwLock<HashMap<String, VecDeque<TickEntry>>>>,
+    /// Per-symbol rolling trade volume (last 120s) for volume spike detection.
+    volume_history: Arc<RwLock<HashMap<String, VecDeque<VolumeEntry>>>>,
 }
 
 impl PriceFeeds {
@@ -53,6 +61,7 @@ impl PriceFeeds {
             binance_window_opens: Arc::new(RwLock::new(HashMap::new())),
             fallback_map: Arc::new(RwLock::new(HashMap::new())),
             tick_history: Arc::new(RwLock::new(HashMap::new())),
+            volume_history: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -408,6 +417,39 @@ impl PriceFeeds {
     pub async fn get_binance_window_open(&self, slug_prefix: &str, window_ts: u64) -> Option<Decimal> {
         let key = Self::window_key(slug_prefix, window_ts);
         self.binance_window_opens.read().await.get(&key).copied()
+    }
+
+    /// Record a trade's volume for a symbol.
+    pub async fn record_volume(&self, symbol: &str, quantity: f64) {
+        let key = symbol.to_lowercase();
+        let now = Instant::now();
+        let mut hist = self.volume_history.write().await;
+        let deque = hist.entry(key).or_insert_with(VecDeque::new);
+        deque.push_back(VolumeEntry { quantity, ts: now });
+        let cutoff = now - std::time::Duration::from_secs(120);
+        while deque.front().map_or(false, |v| v.ts < cutoff) {
+            deque.pop_front();
+        }
+    }
+
+    /// Compute volume ratio: volume_last_10s / (volume_last_60s / 6).
+    /// Returns None if there's insufficient data (< 30s of history).
+    pub async fn get_volume_ratio(&self, symbol: &str) -> Option<f64> {
+        let key = symbol.to_lowercase();
+        let hist = self.volume_history.read().await;
+        let deque = hist.get(&key)?;
+        let now = Instant::now();
+        let cutoff_10 = now - std::time::Duration::from_secs(10);
+        let cutoff_60 = now - std::time::Duration::from_secs(60);
+
+        let vol_10: f64 = deque.iter().filter(|v| v.ts >= cutoff_10).map(|v| v.quantity).sum();
+        let vol_60: f64 = deque.iter().filter(|v| v.ts >= cutoff_60).map(|v| v.quantity).sum();
+
+        let avg_10s_in_60s = vol_60 / 6.0;
+        if avg_10s_in_60s < 1e-12 {
+            return None;
+        }
+        Some(vol_10 / avg_10s_in_60s)
     }
 
     pub async fn prune_old_window_opens(&self, current_ts: u64, max_age_s: u64) {

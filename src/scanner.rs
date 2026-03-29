@@ -68,6 +68,8 @@ pub struct ScanEvaluation {
     pub velocity_5s: Option<f64>,
     pub range_30s: Option<f64>,
     pub signal_score: Option<f64>,
+    pub ob_imbalance: Option<f64>,
+    pub volume_ratio: Option<f64>,
     pub result: String,
     pub detail: Option<String>,
 }
@@ -165,6 +167,7 @@ pub async fn scan_all_markets(
                     best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
                     suggested_entry: None, max_entry: None, edge_score: None,
                     velocity_5s: None, range_30s: None, signal_score: None,
+                    ob_imbalance: None, volume_ratio: None,
                     result: "SKIP_NO_DATA".into(), detail: Some("No price data".into()),
                 });
                 continue;
@@ -179,8 +182,9 @@ pub async fn scan_all_markets(
                 direction: None, delta_pct: None, open_price: None, current_price: Some(current_price),
                 best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
                 suggested_entry: None, max_entry: None, edge_score: None,
-                velocity_5s: None, range_30s: None, signal_score: None,
-                result: "SKIP_STALE".into(), detail: Some("Stale price data".into()),
+                    velocity_5s: None, range_30s: None, signal_score: None,
+                    ob_imbalance: None, volume_ratio: None,
+                    result: "SKIP_STALE".into(), detail: Some("Stale price data".into()),
             });
             continue;
         }
@@ -196,6 +200,7 @@ pub async fn scan_all_markets(
                     best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
                     suggested_entry: None, max_entry: None, edge_score: None,
                     velocity_5s: None, range_30s: None, signal_score: None,
+                    ob_imbalance: None, volume_ratio: None,
                     result: "SKIP_NO_OPEN".into(), detail: Some("No open price for window".into()),
                 });
                 continue;
@@ -226,6 +231,8 @@ pub async fn scan_all_markets(
         };
         let delta_f64 = sig.delta_pct;
 
+        let volume_ratio = price_feeds.get_volume_ratio(&live_sym).await;
+
         let required_delta = if in_early_window {
             mkt.early_entry_min_delta_pct
         } else {
@@ -245,6 +252,7 @@ pub async fn scan_all_markets(
                 suggested_entry: None, max_entry: None, edge_score: None,
                 velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
                 signal_score: Some(sig.signal_score),
+                ob_imbalance: None, volume_ratio,
                 result: "SKIP_DELTA".into(), detail: Some(detail),
             });
             continue;
@@ -262,6 +270,7 @@ pub async fn scan_all_markets(
                 suggested_entry: None, max_entry: None, edge_score: None,
                 velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
                 signal_score: Some(sig.signal_score),
+                ob_imbalance: None, volume_ratio,
                 result: "SKIP_SIGNAL".into(), detail: Some(detail),
             });
             continue;
@@ -323,6 +332,7 @@ pub async fn scan_all_markets(
                 edge_score: Some(sig.signal_score),
                 velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
                 signal_score: Some(sig.signal_score),
+                ob_imbalance: None, volume_ratio,
                 result: "EARLY_LIMIT".into(), detail: None,
             });
 
@@ -377,6 +387,7 @@ pub async fn scan_all_markets(
                 suggested_entry: None, max_entry: None, edge_score: None,
                 velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
                 signal_score: Some(sig.signal_score),
+                ob_imbalance: None, volume_ratio,
                 result: "SKIP_LOW_VOLATILITY".into(), detail: Some(detail),
             });
             continue;
@@ -395,6 +406,7 @@ pub async fn scan_all_markets(
                 suggested_entry: None, max_entry: None, edge_score: None,
                 velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
                 signal_score: Some(sig.signal_score),
+                ob_imbalance: None, volume_ratio,
                 result: "SKIP_NO_ACCELERATION".into(), detail: Some(detail),
             });
             continue;
@@ -431,6 +443,7 @@ pub async fn scan_all_markets(
                     suggested_entry: None, max_entry: None, edge_score: None,
                     velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
                     signal_score: Some(sig.signal_score),
+                    ob_imbalance: None, volume_ratio,
                     result: "SKIP_NOT_ACCEPTING".into(), detail: None,
                 });
                 continue;
@@ -446,6 +459,7 @@ pub async fn scan_all_markets(
                     suggested_entry: None, max_entry: None, edge_score: None,
                     velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
                     signal_score: Some(sig.signal_score),
+                    ob_imbalance: None, volume_ratio,
                     result: "SKIP_TOKEN".into(), detail: None,
                 });
                 continue;
@@ -496,6 +510,7 @@ pub async fn scan_all_markets(
                             suggested_entry: None, max_entry: None, edge_score: None,
                             velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
                             signal_score: Some(sig.signal_score),
+                            ob_imbalance: None, volume_ratio,
                             result: "SKIP_ORDERBOOK".into(), detail: Some(detail),
                         });
                         continue;
@@ -521,6 +536,7 @@ pub async fn scan_all_markets(
                 suggested_entry: None, max_entry: None, edge_score: None,
                 velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
                 signal_score: Some(sig.signal_score),
+                ob_imbalance: None, volume_ratio,
                 result: "SKIP_SANITY".into(), detail: Some(detail),
             });
             continue;
@@ -564,6 +580,7 @@ pub async fn scan_all_markets(
                 max_entry: Some(max_entry), edge_score: None,
                 velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
                 signal_score: Some(sig.signal_score),
+                ob_imbalance: None, volume_ratio,
                 result: "SKIP_PRICE".into(), detail: Some(detail),
             });
             continue;
@@ -612,6 +629,7 @@ pub async fn scan_all_markets(
                 max_entry: Some(max_entry), edge_score: Some(edge_score),
                 velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
                 signal_score: Some(sig.signal_score),
+                ob_imbalance: None, volume_ratio,
                 result: "SKIP_EDGE".into(), detail: Some(detail),
             });
             continue;
@@ -637,6 +655,7 @@ pub async fn scan_all_markets(
             max_entry: Some(max_entry), edge_score: Some(edge_score),
             velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
             signal_score: Some(sig.signal_score),
+            ob_imbalance: None, volume_ratio,
             result: "OPPORTUNITY".into(), detail: None,
         });
 

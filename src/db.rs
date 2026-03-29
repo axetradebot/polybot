@@ -258,6 +258,11 @@ impl TradeDb {
             "ALTER TABLE shadow_timing ADD COLUMN range_30s REAL",
             "ALTER TABLE shadow_timing ADD COLUMN signal_score REAL",
             "ALTER TABLE shadow_timing ADD COLUMN tick_count_30s INTEGER DEFAULT 0",
+            // Orderbook imbalance and volume ratio for signal analysis
+            "ALTER TABLE shadow_timing ADD COLUMN ob_imbalance REAL",
+            "ALTER TABLE shadow_timing ADD COLUMN volume_ratio REAL",
+            "ALTER TABLE shadow_trades ADD COLUMN ob_imbalance REAL",
+            "ALTER TABLE shadow_trades ADD COLUMN volume_ratio REAL",
         ];
         for sql in &migrations {
             let _ = conn.execute(sql, []);
@@ -675,6 +680,8 @@ impl TradeDb {
         velocity_15s: Option<f64>,
         range_30s: Option<f64>,
         signal_score: Option<f64>,
+        ob_imbalance: Option<f64>,
+        volume_ratio: Option<f64>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -682,8 +689,9 @@ impl TradeDb {
                 market_name, window_ts, window_seconds, open_price,
                 delta_at_entry, direction_at_entry, best_ask_at_entry,
                 seconds_before_close, was_traded, skip_reason,
-                velocity_5s, velocity_15s, range_30s, signal_score
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                velocity_5s, velocity_15s, range_30s, signal_score,
+                ob_imbalance, volume_ratio
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             params![
                 market_name,
                 window_ts as i64,
@@ -699,6 +707,8 @@ impl TradeDb {
                 velocity_15s,
                 range_30s,
                 signal_score,
+                ob_imbalance,
+                volume_ratio,
             ],
         )?;
         Ok(())
@@ -763,6 +773,8 @@ impl TradeDb {
         range_30s: Option<f64>,
         signal_score: Option<f64>,
         tick_count_30s: i64,
+        ob_imbalance: Option<f64>,
+        volume_ratio: Option<f64>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -773,8 +785,9 @@ impl TradeDb {
                 total_ask_size_winner, could_have_filled, hypothetical_entry_price,
                 would_have_won, actual_outcome,
                 velocity_5s, velocity_15s, acceleration, range_30s, signal_score, tick_count_30s,
+                ob_imbalance, volume_ratio,
                 timestamp
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL,?15,?16,?17,?18,?19,?20,?21)",
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
             params![
                 window_id,
                 market_name,
@@ -796,6 +809,8 @@ impl TradeDb {
                 range_30s,
                 signal_score,
                 tick_count_30s,
+                ob_imbalance,
+                volume_ratio,
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
