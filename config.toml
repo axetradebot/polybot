@@ -51,7 +51,7 @@ signal_weight_accel = 0.05
 min_volatility_pct = 0.0
 require_acceleration = false
 min_signal_score = 0.06
-min_ob_imbalance = 0.5
+min_ob_imbalance = 0.4
 
 # ============================================================
 # MARKET DEFINITIONS
