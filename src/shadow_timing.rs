@@ -79,8 +79,8 @@ pub async fn run_shadow_timing(
 
             // T-120/T-100/T-60 are early shadow snapshots — record all for analysis.
             // Normal snapshots (T-40 and below) are gated by entry_start_s.
-            if t_sec > 60 {
-                // Early shadow snapshots — always record (no delta filter)
+            if t_sec >= 60 {
+                // Early shadow snapshots (T-120, T-100, T-60) — always record
             } else if t_sec > mkt.entry_start_s + 2 {
                 continue;
             }
