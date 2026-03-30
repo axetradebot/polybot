@@ -83,7 +83,7 @@ undercut_offset = 0.01
 tighten_step = 0.01
 adjust_interval_ms = 500
 delta_tiers = [
-    [0.05, 0.65],
+    [0.05, 0.72],
     [0.08, 0.82],
     [0.10, 0.88],
     [0.15, 0.92],
