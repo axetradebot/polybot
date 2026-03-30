@@ -147,7 +147,14 @@ pub struct ScannerConfig {
     pub require_acceleration: bool,
     #[serde(default)]
     pub min_signal_score: f64,
+    /// Minimum orderbook imbalance for early entries (0.0 = disabled).
+    /// Imbalance = winner_depth / (winner_depth + loser_depth).
+    /// Below this threshold, early entries are skipped.
+    #[serde(default = "default_min_ob_imbalance")]
+    pub min_ob_imbalance: f64,
 }
+
+fn default_min_ob_imbalance() -> f64 { 0.5 }
 
 fn default_scan_ms() -> u64 { 1000 }
 fn default_min_edge() -> f64 { 0.05 }

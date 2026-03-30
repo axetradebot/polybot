@@ -473,6 +473,40 @@ pub async fn scan_all_markets(
             continue;
         }
 
+        // ── OB imbalance check for early entries ──
+        // Fetch complement book and skip if the orderbook leans against our direction.
+        // Only applied to early entries where the signal is strongest (96% vs 52%).
+        if in_early_window && config.scanner.min_ob_imbalance > 0.0 {
+            let comp_depth = match orderbook::fetch_orderbook(clob, &complement_token_id).await {
+                Ok(comp_ob) => comp_ob.depth_at_ask.try_into().unwrap_or(0.0_f64),
+                Err(_) => 0.0,
+            };
+            let winner_depth: f64 = ob.depth_at_ask.try_into().unwrap_or(0.0);
+            let total_depth = winner_depth + comp_depth;
+            let imbalance = if total_depth > 0.0 { winner_depth / total_depth } else { 0.5 };
+
+            if imbalance < config.scanner.min_ob_imbalance {
+                let detail = format!("OB imbalance too low: {imbalance:.2} < {:.2} (winner ${:.0} vs loser ${:.0})",
+                    config.scanner.min_ob_imbalance, winner_depth, comp_depth);
+                info!(market = %mkt.name, direction = %direction, delta = delta_f64,
+                    imbalance, secs_rem, "Skip early: orderbook leans against direction");
+                skip_reasons.insert(mkt.name.clone(), detail.clone());
+                evaluations.push(ScanEvaluation {
+                    market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
+                    direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
+                    open_price: Some(open_price), current_price: Some(current_price),
+                    best_ask: Some(ob.best_ask), best_bid: Some(ob.best_bid),
+                    spread: Some(ob.spread), depth_at_ask: Some(ob.depth_at_ask),
+                    suggested_entry: None, max_entry: None, edge_score: None,
+                    velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
+                    signal_score: Some(sig.signal_score),
+                    ob_imbalance: Some(imbalance), volume_ratio,
+                    result: "SKIP_OB_IMBALANCE".into(), detail: Some(detail),
+                });
+                continue;
+            }
+        }
+
         let token_id = trade_token_id;
 
         let undercut = Decimal::try_from(mkt.effective_undercut_offset(config.pricing.undercut_offset)).unwrap_or(dec!(0.03));
