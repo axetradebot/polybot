@@ -135,9 +135,13 @@ pub async fn scan_all_markets(
         let (window_ts, secs_rem) = market::current_window(mkt.window_seconds);
         let entry_cutoff_s = mkt.effective_entry_cutoff(config.pricing.entry_cutoff_s);
 
-        // T-120 early entries disabled — 25% win rate at $0.30 is unprofitable
-        let effective_start = mkt.entry_start_s;
-        let in_early_window = false;
+        let early_enabled = mkt.early_entries_enabled();
+        let effective_start = if early_enabled {
+            mkt.early_entry_start_s
+        } else {
+            mkt.entry_start_s
+        };
+        let in_early_window = early_enabled && secs_rem > mkt.entry_start_s;
 
         if secs_rem > effective_start || secs_rem < entry_cutoff_s {
             debug!(
@@ -276,100 +280,27 @@ pub async fn scan_all_markets(
             continue;
         }
 
-        // ── Early limit order fast path ──
-        // At T-120, orderbooks are often empty on the direction token.
-        // Place a fixed-price limit bid at $0.30 and let it sit until filled.
+        // ── Early entry: check delta against early_delta_tiers ──
+        // Early entries (T-120) flow through normal orderbook evaluation below,
+        // but use early_delta_tiers for the price ceiling instead of delta_tiers.
         if in_early_window {
-            let slug = if mkt.is_hourly() {
-                match hourly_slugs.get(&mkt.name) {
-                    Some(s) => s.clone(),
-                    None => { continue; }
-                }
-            } else {
-                market::build_slug(&mkt.slug_prefix, window_ts)
-            };
-
-            if positions.has_early_position_in_window(&slug).await {
-                debug!(market = %mkt.name, "Skip: already have early limit in window");
+            if mkt.max_price_for_early_delta(delta_f64).is_none() {
+                let detail = format!("Early delta too low: {:.4}% doesn't meet any early tier", delta_f64);
+                debug!(market = %mkt.name, delta = delta_f64, secs_rem, "Skip: early delta below all tiers");
+                skip_reasons.insert(mkt.name.clone(), detail.clone());
+                evaluations.push(ScanEvaluation {
+                    market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
+                    direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
+                    open_price: Some(open_price), current_price: Some(current_price),
+                    best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
+                    suggested_entry: None, max_entry: None, edge_score: None,
+                    velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
+                    signal_score: Some(sig.signal_score),
+                    ob_imbalance: None, volume_ratio,
+                    result: "SKIP_EARLY_DELTA".into(), detail: Some(detail),
+                });
                 continue;
             }
-
-            let market_info = match token_cache.get(&slug) {
-                Some(info) if info.accepting_orders => info,
-                Some(_) => {
-                    debug!(market = %mkt.name, "Early limit: market not accepting orders yet");
-                    continue;
-                }
-                None => {
-                    debug!(market = %mkt.name, "Early limit: token not resolved yet");
-                    continue;
-                }
-            };
-
-            let trade_token_id = match direction {
-                Direction::Up => market_info.up_token_id.clone(),
-                Direction::Down => market_info.down_token_id.clone(),
-            };
-
-            let early_price = dec!(0.30);
-            let early_contracts = Decimal::from_str_exact(&format!("{}", (config.bankroll.bet_size_usd / 0.30).floor() as u64)).unwrap_or(dec!(50));
-            let early_contracts = early_contracts.max(dec!(5));
-            let early_bet = early_contracts * early_price;
-
-            info!(
-                market = %mkt.name, direction = %direction, delta = delta_f64,
-                price = %early_price, contracts = %early_contracts,
-                secs_remaining = secs_rem,
-                "EARLY LIMIT — placing $0.30 limit bid at T-{}", secs_rem
-            );
-
-            evaluations.push(ScanEvaluation {
-                market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
-                direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
-                open_price: Some(open_price), current_price: Some(current_price),
-                best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
-                suggested_entry: Some(early_price), max_entry: Some(early_price),
-                edge_score: Some(sig.signal_score),
-                velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
-                signal_score: Some(sig.signal_score),
-                ob_imbalance: None, volume_ratio,
-                result: "EARLY_LIMIT".into(), detail: None,
-            });
-
-            opportunities.push(MarketOpportunity {
-                market_name: mkt.name.clone(),
-                asset: mkt.asset.clone(),
-                market_type: mkt.market_type.clone(),
-                window_seconds: mkt.window_seconds,
-                window_ts,
-                slug,
-                direction,
-                delta_pct: delta_f64,
-                edge_score: sig.signal_score,
-                best_ask: early_price,
-                best_bid: Decimal::ZERO,
-                spread: Decimal::ZERO,
-                suggested_entry: early_price,
-                max_entry: early_price,
-                seconds_remaining: secs_rem,
-                token_id: trade_token_id,
-                condition_id: market_info.condition_id.clone(),
-                neg_risk: market_info.neg_risk,
-                depth_usd: Decimal::ZERO,
-                open_price,
-                contracts: early_contracts,
-                bet_size_usd: early_bet,
-                entry_start_s: mkt.entry_start_s,
-                is_taker: false,
-                velocity_5s: sig.velocity_5s,
-                velocity_15s: sig.velocity_15s,
-                acceleration: sig.acceleration,
-                range_30s: sig.range_30s,
-                signal_score: sig.signal_score,
-                is_early_limit: true,
-            });
-
-            continue;
         }
 
         // ── Normal entry flow (T-30 to T-5) ──
@@ -564,7 +495,11 @@ pub async fn scan_all_markets(
             suggested_entry = ob.best_ask;
         }
 
-        let tier_ceiling = mkt.max_price_for_delta(delta_f64);
+        let tier_ceiling = if in_early_window {
+            mkt.max_price_for_early_delta(delta_f64).unwrap_or(0.0)
+        } else {
+            mkt.max_price_for_delta(delta_f64)
+        };
         let breakeven_ceiling = config.pricing.max_profitable_price();
         let max_entry = Decimal::try_from(tier_ceiling.min(breakeven_ceiling)).unwrap_or(dec!(0.85));
         if suggested_entry > max_entry {
@@ -614,7 +549,7 @@ pub async fn scan_all_markets(
         let depth_f64: f64 = ob.depth_at_ask.try_into().unwrap_or(0.0);
         let entry_f64: f64 = suggested_entry.try_into().unwrap_or(0.5);
 
-        let edge_score = compute_edge_score(sig.signal_score, entry_f64, depth_f64, secs_rem, mkt.entry_start_s, entry_cutoff_s);
+        let edge_score = compute_edge_score(sig.signal_score, entry_f64, depth_f64, secs_rem, effective_start, entry_cutoff_s);
 
         if edge_score < config.scanner.min_edge_score {
             info!(market = %mkt.name, edge = edge_score, min_edge = config.scanner.min_edge_score, delta = delta_f64, signal = sig.signal_score, "Skip: edge score too low");
@@ -682,14 +617,14 @@ pub async fn scan_all_markets(
             open_price,
             contracts,
             bet_size_usd: actual_bet,
-            entry_start_s: mkt.entry_start_s,
+            entry_start_s: effective_start,
             is_taker,
             velocity_5s: sig.velocity_5s,
             velocity_15s: sig.velocity_15s,
             acceleration: sig.acceleration,
             range_30s: sig.range_30s,
             signal_score: sig.signal_score,
-            is_early_limit: false,
+            is_early_limit: in_early_window,
         });
     }
 

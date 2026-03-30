@@ -195,6 +195,10 @@ pub struct MarketConfig {
     pub early_entry_start_s: u64,
     #[serde(default = "default_early_delta")]
     pub early_entry_min_delta_pct: f64,
+    /// Delta tiers for early entries (T-120). Uses orderbook-aware pricing
+    /// with conservative ceilings. Empty = early entries disabled.
+    #[serde(default)]
+    pub early_delta_tiers: Vec<[f64; 2]>,
 }
 
 fn default_true() -> bool { true }
@@ -465,6 +469,25 @@ impl MarketConfig {
         ceiling.min(self.max_entry_price)
     }
 
+    /// Max entry price for early (T-120) entries. Returns None if early tiers
+    /// are empty (early entries disabled) or delta doesn't meet any tier.
+    pub fn max_price_for_early_delta(&self, delta_pct: f64) -> Option<f64> {
+        if self.early_delta_tiers.is_empty() {
+            return None;
+        }
+        let mut ceiling: Option<f64> = None;
+        for tier in &self.early_delta_tiers {
+            if delta_pct >= tier[0] {
+                ceiling = Some(tier[1]);
+            }
+        }
+        ceiling
+    }
+
+    pub fn early_entries_enabled(&self) -> bool {
+        self.early_entry_start_s > 0 && !self.early_delta_tiers.is_empty()
+    }
+
     /// Seconds before close at which we start watching (entry_start_s + buffer).
     pub fn watch_start_s(&self) -> u64 {
         self.entry_start_s + 2
@@ -510,6 +533,11 @@ fn validate_markets(markets: &[MarketConfig]) -> Result<()> {
         for (j, tier) in m.delta_tiers.iter().enumerate() {
             if tier[0] < 0.01 || tier[1] < 0.50 || tier[1] > 0.99 {
                 bail!("Market '{}' delta_tier {j}: invalid values {:?}", m.name, tier);
+            }
+        }
+        for (j, tier) in m.early_delta_tiers.iter().enumerate() {
+            if tier[0] < 0.01 || tier[1] < 0.20 || tier[1] > 0.99 {
+                bail!("Market '{}' early_delta_tier {j}: invalid values {:?}", m.name, tier);
             }
         }
         if m.entry_start_s < 5 {
