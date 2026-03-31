@@ -1770,6 +1770,11 @@ async fn run_scanner_loop(
                     // Live: place CLOB order
                     let traded_key = format!("{}-{}", opp.market_name, opp.window_ts);
 
+                    if window_traded.get(&traded_key).copied().unwrap_or(false) {
+                        debug!(market = %opp.market_name, window = opp.window_ts, "Already traded this window — skipping");
+                        continue;
+                    }
+
                     // Check 425 "Too Early" backoff — skip if we were recently rejected
                     if let Some(retry_at) = early_reject_until.get(&traded_key) {
                         if std::time::Instant::now() < *retry_at {
