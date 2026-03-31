@@ -798,6 +798,9 @@ async fn run_scanner_loop(
     let mut watching_markets: HashMap<String, (u64, u32)> = HashMap::new();
     let mut window_max_delta: HashMap<String, (f64, String)> = HashMap::new();
     let mut early_reject_until: HashMap<String, std::time::Instant> = HashMap::new();
+    let mut scanner_result_counts: HashMap<String, u64> = HashMap::new();
+    let mut last_cl_msg_count: u64 = 0;
+    let mut last_bn_msg_count: u64 = 0;
     let mut last_analytics_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let mut risk_alert_sent: std::collections::HashSet<String> = std::collections::HashSet::new();
     let scan_interval = Duration::from_millis(config.scanner.scan_interval_ms);
@@ -1085,6 +1088,76 @@ async fn run_scanner_loop(
             );
         }
 
+        // Scanner diagnostic heartbeat every 5 minutes
+        if heartbeat_counter % 300 == 0 && heartbeat_counter > 0 {
+            let mut market_deltas = Vec::new();
+            for mkt in config.enabled_markets() {
+                let (window_ts, secs_rem) = market::current_window(mkt.window_seconds);
+                let binance_sym = mkt.binance_symbol.to_lowercase();
+                let current = price_feeds.get_price(&binance_sym).await;
+                let open = price_feeds.get_binance_window_open(&mkt.slug_prefix, window_ts).await;
+                let cl_open = price_feeds.get_window_open(&mkt.slug_prefix, window_ts).await;
+                let delta = match (current, open) {
+                    (Some(c), Some(o)) if o > Decimal::ZERO => {
+                        let d: f64 = (((c - o).abs() / o) * Decimal::from(100)).try_into().unwrap_or(0.0);
+                        format!("{:.4}%", d)
+                    }
+                    (Some(_), None) => "NO_OPEN".into(),
+                    (None, _) => "NO_PRICE".into(),
+                    _ => "ZERO_OPEN".into(),
+                };
+                let slug = market::build_slug(&mkt.slug_prefix, window_ts);
+                let has_token = tc_local.contains_key(&slug);
+                market_deltas.push(format!(
+                    "{}[T-{}s delta={} open={} cl_open={} tok={}]",
+                    mkt.name, secs_rem, delta,
+                    open.map(|p| p.to_string()).unwrap_or("NONE".into()),
+                    cl_open.map(|p| p.to_string()).unwrap_or("NONE".into()),
+                    has_token,
+                ));
+            }
+
+            let mut result_summary: Vec<String> = scanner_result_counts
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            result_summary.sort();
+
+            let bn_age = price_feeds.price_age_ms("btcusdt").await;
+            let cl_age = price_feeds.price_age_ms("btc/usd").await;
+
+            let cl_now = crate::feeds::chainlink::messages_received();
+            let bn_now = crate::feeds::binance::messages_received();
+            let cl_delta = cl_now.saturating_sub(last_cl_msg_count);
+            let bn_delta = bn_now.saturating_sub(last_bn_msg_count);
+            last_cl_msg_count = cl_now;
+            last_bn_msg_count = bn_now;
+
+            let st = state.read().await;
+
+            info!(
+                scanner_results = %result_summary.join(", "),
+                binance_age_ms = ?bn_age,
+                chainlink_age_ms = ?cl_age,
+                cl_msgs_5min = cl_delta,
+                bn_msgs_5min = bn_delta,
+                bankroll = %st.bankroll,
+                daily_pnl = %st.daily_pnl,
+                consec_losses = st.consecutive_losses,
+                markets = %market_deltas.join(" | "),
+                "Scanner alive — 5min diagnostic"
+            );
+
+            if cl_delta == 0 {
+                warn!("Chainlink feed produced 0 messages in 5 minutes — may be dead");
+            }
+            if bn_delta == 0 {
+                warn!("Binance feed produced 0 messages in 5 minutes — may be dead");
+            }
+
+            scanner_result_counts.clear();
+        }
+
         // Telegram heartbeat every 15 minutes
         if heartbeat_counter % 900 == 0 {
             let open_pos = positions.open_count().await;
@@ -1256,6 +1329,7 @@ async fn run_scanner_loop(
 
                     window_traded.remove(&key);
                     early_reject_until.remove(&key);
+                    window_max_delta.remove(&key);
                 }
                 // Clear skip reason and skip notifications for fresh window
                 last_skip_reasons.remove(&mkt.name);
@@ -1539,6 +1613,7 @@ async fn run_scanner_loop(
             if let Err(e) = db.insert_scanner_log(eval) {
                 warn!(error = %e, market = %eval.market_name, "Failed to log scanner eval");
             }
+            *scanner_result_counts.entry(eval.result.clone()).or_insert(0) += 1;
             // Track max delta per window for window_summary
             if let Some(delta) = eval.delta_pct {
                 let key = format!("{}-{}", eval.market_name, eval.window_ts);
