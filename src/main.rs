@@ -708,23 +708,27 @@ async fn run_scanner_loop(
                                 price = %o.price,
                                 "poll_fills: order query result"
                             );
-                            if o.id == *oid && is_matched && has_size {
-                                info!(
-                                    order_id = %o.id,
-                                    status = ?o.status,
-                                    size_matched = %o.size_matched,
-                                    price = %o.price,
-                                    "poll_fills: confirmed fill via orders endpoint"
-                                );
+                            if o.id == *oid && has_size {
+                                if !is_matched {
+                                    info!(
+                                        order_id = %o.id,
+                                        status = ?o.status,
+                                        size_matched = %o.size_matched,
+                                        original_size = %o.original_size,
+                                        price = %o.price,
+                                        "poll_fills: partial fill (size_matched < original, status != Matched)"
+                                    );
+                                } else {
+                                    info!(
+                                        order_id = %o.id,
+                                        status = ?o.status,
+                                        size_matched = %o.size_matched,
+                                        price = %o.price,
+                                        "poll_fills: confirmed fill via orders endpoint"
+                                    );
+                                }
                                 fills.push((o.id.clone(), o.price, o.size_matched));
                                 seen_ids.insert(o.id.clone());
-                            } else if o.id == *oid && has_size && !is_matched {
-                                warn!(
-                                    order_id = %o.id,
-                                    status = ?o.status,
-                                    size_matched = %o.size_matched,
-                                    "poll_fills: size_matched>0 but status is NOT Matched — ignoring (false fill)"
-                                );
                             }
                         }
                     }
@@ -2121,6 +2125,7 @@ async fn run_scanner_loop(
 
         // ── Phase 5: Settlement ──
         let to_settle = positions.filled_past_close().await;
+        let has_settlements = !to_settle.is_empty();
         for pos in &to_settle {
             positions.mark_settlement_started(pos.id).await;
 
@@ -2143,6 +2148,23 @@ async fn run_scanner_loop(
                     }
                 }
             });
+        }
+
+        // After spawning settlements, sync bankroll from the real CLOB balance
+        // to correct any drift from partial fills or accounting mismatches.
+        if has_settlements {
+            if let Some(real_bal) = fetch_clob_balance!() {
+                let mut st = state.write().await;
+                if (st.bankroll - real_bal).abs() > dec!(0.50) {
+                    warn!(
+                        internal = %st.bankroll,
+                        clob = %real_bal,
+                        drift = %(st.bankroll - real_bal),
+                        "Bankroll drift detected — syncing from CLOB"
+                    );
+                }
+                st.bankroll = real_bal;
+            }
         }
 
         // ── Sync shared token caches back for shadow timing task ──
