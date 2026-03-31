@@ -619,6 +619,8 @@ async fn run_scanner_loop(
         telegram.send_startup(st.bankroll, &market_modes).await.ok();
     }
 
+    info!("Warm-up active: all markets will skip trading until their first full window boundary (prevents wrong-direction bets from stale open prices)");
+
     // ── Macros for CLOB operations ──
 
     macro_rules! post_order {
@@ -792,6 +794,12 @@ async fn run_scanner_loop(
     let token_cache: shadow_timing::SharedTokenCache =
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
     let mut window_traded: HashMap<String, bool> = HashMap::new();
+    // Markets that have completed at least one full window transition since
+    // startup. On the first window we join mid-way, so our captured "open"
+    // price is unreliable (it's the current price at boot, not the true
+    // window-start price Polymarket uses as "Price to Beat"). Trading with a
+    // wrong open causes inverted direction bets → guaranteed losses.
+    let mut warmed_up: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_skip_reasons: HashMap<String, String> = HashMap::new();
     let mut skip_notified: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut shadow_recorded: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1219,6 +1227,9 @@ async fn run_scanner_loop(
             if prev_ts != Some(window_ts) {
                 // Window transitioned — check if previous window missed trades
                 if let Some(old_ts) = prev_ts {
+                    if warmed_up.insert(mkt.name.clone()) {
+                        info!(market = %mkt.name, "Market warmed up — first full window boundary observed, trading enabled");
+                    }
                     let key = format!("{}-{}", mkt.name, old_ts);
                     let traded = window_traded.get(&key).copied().unwrap_or(false);
                     let old_open = price_feeds.get_window_open(&mkt.slug_prefix, old_ts).await.unwrap_or_default();
@@ -1725,6 +1736,20 @@ async fn run_scanner_loop(
             for (rank, opp) in opportunities.iter().enumerate() {
                 if orders_fired >= config.scanner.max_orders_per_cycle {
                     break;
+                }
+
+                // Block trades until this market has completed at least one
+                // full window boundary. The first window after startup uses a
+                // "current price at boot" as the open, which differs from
+                // Polymarket's "Price to Beat" and causes wrong-direction bets.
+                if !warmed_up.contains(&opp.market_name) {
+                    info!(
+                        market = %opp.market_name,
+                        direction = %opp.direction,
+                        delta = opp.delta_pct,
+                        "Skip order: market not warmed up (first window after restart — open price unreliable)"
+                    );
+                    continue;
                 }
 
                 // If this market was being watched, the orderbook just improved
