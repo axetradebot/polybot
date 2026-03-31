@@ -136,6 +136,22 @@ async fn main() -> Result<()> {
     // Spawn Binance (FALLBACK) price feed — only activates if Chainlink goes stale
     price_feeds.spawn_binance_feed(binance_symbols.clone(), &config.infra.binance_ws_base);
 
+    // Spawn Bybit inverse perpetual feed (USD prices for direction)
+    let bybit_symbols: Vec<String> = config
+        .enabled_markets()
+        .iter()
+        .filter_map(|m| {
+            if m.bybit_symbol.is_empty() { None } else { Some(m.bybit_symbol.clone()) }
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let has_bybit = !bybit_symbols.is_empty();
+    if has_bybit {
+        info!(symbols = ?bybit_symbols, "Spawning Bybit USD price feed");
+        price_feeds.spawn_bybit_feed(bybit_symbols, &config.infra.bybit_ws_url);
+    }
+
     // Wait for price data before starting — per-market resolution source
     info!("Waiting for initial price data...");
     let price_wait_start = tokio::time::Instant::now();
@@ -809,6 +825,7 @@ async fn run_scanner_loop(
     let mut scanner_result_counts: HashMap<String, u64> = HashMap::new();
     let mut last_cl_msg_count: u64 = 0;
     let mut last_bn_msg_count: u64 = 0;
+    let mut last_bybit_msg_count: u64 = 0;
     let mut last_analytics_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let mut risk_alert_sent: std::collections::HashSet<String> = std::collections::HashSet::new();
     let scan_interval = Duration::from_millis(config.scanner.scan_interval_ms);
@@ -1136,10 +1153,13 @@ async fn run_scanner_loop(
 
             let cl_now = crate::feeds::chainlink::messages_received();
             let bn_now = crate::feeds::binance::messages_received();
+            let bybit_now = crate::feeds::bybit::messages_received();
             let cl_delta = cl_now.saturating_sub(last_cl_msg_count);
             let bn_delta = bn_now.saturating_sub(last_bn_msg_count);
+            let bybit_delta = bybit_now.saturating_sub(last_bybit_msg_count);
             last_cl_msg_count = cl_now;
             last_bn_msg_count = bn_now;
+            last_bybit_msg_count = bybit_now;
 
             let st = state.read().await;
 
@@ -1149,6 +1169,7 @@ async fn run_scanner_loop(
                 chainlink_age_ms = ?cl_age,
                 cl_msgs_5min = cl_delta,
                 bn_msgs_5min = bn_delta,
+                bybit_msgs_5min = bybit_delta,
                 bankroll = %st.bankroll,
                 daily_pnl = %st.daily_pnl,
                 consec_losses = st.consecutive_losses,
@@ -1161,6 +1182,9 @@ async fn run_scanner_loop(
             }
             if bn_delta == 0 {
                 warn!("Binance feed produced 0 messages in 5 minutes — may be dead");
+            }
+            if bybit_delta == 0 && config.enabled_markets().iter().any(|m| !m.bybit_symbol.is_empty()) {
+                warn!("Bybit feed produced 0 messages in 5 minutes — may be dead");
             }
 
             scanner_result_counts.clear();
@@ -1383,6 +1407,15 @@ async fn run_scanner_loop(
                     info!(market = %mkt.name, binance_open = %bp, "Binance open captured (current price)");
                 }
 
+                // Capture Bybit USD open for direction (100ms precision)
+                if !mkt.bybit_symbol.is_empty() {
+                    let bybit_key = crate::feeds::bybit::bybit_price_key(&mkt.bybit_symbol);
+                    if let Some(bp) = price_feeds.get_price(&bybit_key).await {
+                        price_feeds.set_bybit_window_open(&mkt.slug_prefix, window_ts, bp).await;
+                        info!(market = %mkt.name, bybit_open = %bp, "Bybit USD open captured");
+                    }
+                }
+
                 // Resolve tokens for this window (best-effort)
                 if mkt.is_hourly() {
                     // Clear previous hourly slug on window transition
@@ -1457,6 +1490,19 @@ async fn run_scanner_loop(
                     if let Some(bp) = price_feeds.get_price(&binance_sym).await {
                         price_feeds.set_binance_window_open(&mkt.slug_prefix, window_ts, bp).await;
                         info!(market = %mkt.name, binance_open = %bp, "Binance open set (late capture)");
+                    }
+                }
+                if !mkt.bybit_symbol.is_empty() {
+                    let bybit_exists = price_feeds
+                        .get_bybit_window_open(&mkt.slug_prefix, window_ts)
+                        .await
+                        .is_some();
+                    if !bybit_exists {
+                        let bybit_key = crate::feeds::bybit::bybit_price_key(&mkt.bybit_symbol);
+                        if let Some(bp) = price_feeds.get_price(&bybit_key).await {
+                            price_feeds.set_bybit_window_open(&mkt.slug_prefix, window_ts, bp).await;
+                            info!(market = %mkt.name, bybit_open = %bp, "Bybit USD open set (late capture)");
+                        }
                     }
                 }
 

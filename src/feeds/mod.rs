@@ -1,4 +1,5 @@
 pub mod binance;
+pub mod bybit;
 pub mod chainlink;
 
 use chrono::{DateTime, Utc};
@@ -45,6 +46,8 @@ pub struct PriceFeeds {
     window_opens: Arc<RwLock<HashMap<String, Decimal>>>,
     /// Binance (USDT) open prices — used for unbiased delta calculation.
     binance_window_opens: Arc<RwLock<HashMap<String, Decimal>>>,
+    /// Bybit (USD) open prices — used for accurate direction determination.
+    bybit_window_opens: Arc<RwLock<HashMap<String, Decimal>>>,
     /// Maps Chainlink symbol → Binance symbol for fallback lookups.
     fallback_map: Arc<RwLock<HashMap<String, String>>>,
     /// Per-symbol ring buffer of recent ticks (last 60s) for velocity/volatility.
@@ -59,6 +62,7 @@ impl PriceFeeds {
             prices: Arc::new(RwLock::new(HashMap::new())),
             window_opens: Arc::new(RwLock::new(HashMap::new())),
             binance_window_opens: Arc::new(RwLock::new(HashMap::new())),
+            bybit_window_opens: Arc::new(RwLock::new(HashMap::new())),
             fallback_map: Arc::new(RwLock::new(HashMap::new())),
             tick_history: Arc::new(RwLock::new(HashMap::new())),
             volume_history: Arc::new(RwLock::new(HashMap::new())),
@@ -419,6 +423,16 @@ impl PriceFeeds {
         self.binance_window_opens.read().await.get(&key).copied()
     }
 
+    pub async fn set_bybit_window_open(&self, slug_prefix: &str, window_ts: u64, price: Decimal) {
+        let key = Self::window_key(slug_prefix, window_ts);
+        self.bybit_window_opens.write().await.insert(key, price);
+    }
+
+    pub async fn get_bybit_window_open(&self, slug_prefix: &str, window_ts: u64) -> Option<Decimal> {
+        let key = Self::window_key(slug_prefix, window_ts);
+        self.bybit_window_opens.read().await.get(&key).copied()
+    }
+
     /// Record a trade's volume for a symbol.
     pub async fn record_volume(&self, symbol: &str, quantity: f64) {
         let key = symbol.to_lowercase();
@@ -461,6 +475,18 @@ impl PriceFeeds {
         };
         self.window_opens.write().await.retain(retain_fn);
         self.binance_window_opens.write().await.retain(retain_fn);
+        self.bybit_window_opens.write().await.retain(retain_fn);
+    }
+
+    /// Spawn Bybit inverse perpetual feed (USD prices for direction).
+    pub fn spawn_bybit_feed(&self, symbols: Vec<String>, ws_url: &str) {
+        let feeds = self.clone();
+        let ws_url = ws_url.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = bybit::run_bybit_feed(feeds, &symbols, &ws_url).await {
+                tracing::error!(error = %e, "Bybit feed fatal error");
+            }
+        });
     }
 
     /// Spawn Chainlink (primary) price feed.

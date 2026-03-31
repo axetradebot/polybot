@@ -173,6 +173,10 @@ pub struct MarketConfig {
     pub binance_symbol: String,
     #[serde(default)]
     pub chainlink_symbol: String,
+    /// Bybit inverse perpetual symbol (e.g., "BTCUSD") for USD price feed.
+    /// If set, used for direction determination instead of Chainlink.
+    #[serde(default)]
+    pub bybit_symbol: String,
     #[serde(default = "default_resolution_source")]
     pub resolution_source: String,
     #[serde(default = "default_true")]
@@ -252,6 +256,8 @@ pub struct InfraConfig {
     pub binance_ws_base: String,
     #[serde(default = "default_chainlink_ws")]
     pub chainlink_ws_url: String,
+    #[serde(default = "default_bybit_ws")]
+    pub bybit_ws_url: String,
     pub polymarket_clob_url: String,
     #[serde(default = "default_rpc")]
     pub polygon_rpc_url: String,
@@ -267,6 +273,7 @@ pub struct InfraConfig {
 
 fn default_binance_ws() -> String { "wss://stream.binance.com:9443/ws".into() }
 fn default_chainlink_ws() -> String { "wss://ws-live-data.polymarket.com".into() }
+fn default_bybit_ws() -> String { "wss://stream.bybit.com/v5/public/inverse".into() }
 fn default_rpc() -> String { "https://polygon-rpc.com".into() }
 fn default_chain_id() -> u64 { 137 }
 fn default_sig_type() -> String { "GnosisSafe".into() }

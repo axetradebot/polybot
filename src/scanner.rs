@@ -1,6 +1,6 @@
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
 use crate::feeds::PriceFeeds;
@@ -225,14 +225,49 @@ pub async fn scan_all_markets(
         let ticks = price_feeds.get_ticks(&live_sym, 60).await;
         let sig = signal::compute_signals(current_price, delta_open, &ticks, &sig_weights);
 
-        // Direction must be determined from Chainlink (same source as open price
-        // and Polymarket resolution) to avoid systematic USDT premium bias.
-        let chainlink_price = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await;
-        let direction = if let Some(cl) = chainlink_price {
-            if cl >= open_price { Direction::Up } else { Direction::Down }
+        // Direction: prefer Bybit USD (100ms updates, true USD denomination)
+        // over Chainlink (60-90s stale). Falls back to Chainlink if Bybit
+        // is unavailable for this market.
+        let (direction, dir_source) = if !mkt.bybit_symbol.is_empty() {
+            let bybit_key = crate::feeds::bybit::bybit_price_key(&mkt.bybit_symbol);
+            let bybit_current = price_feeds.get_price(&bybit_key).await;
+            let bybit_open = price_feeds.get_bybit_window_open(&mkt.slug_prefix, window_ts).await;
+            match (bybit_current, bybit_open) {
+                (Some(cur), Some(opn)) => {
+                    let d = if cur >= opn { Direction::Up } else { Direction::Down };
+                    debug!(
+                        market = %mkt.name,
+                        bybit_current = %cur,
+                        bybit_open = %opn,
+                        direction = %d,
+                        "Direction from Bybit USD"
+                    );
+                    (d, "bybit")
+                }
+                _ => {
+                    warn!(
+                        market = %mkt.name,
+                        bybit_current = ?bybit_current.map(|d| d.to_string()),
+                        bybit_open = ?bybit_open.map(|d| d.to_string()),
+                        "Bybit data missing, falling back to Chainlink for direction"
+                    );
+                    let chainlink_price = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await;
+                    if let Some(cl) = chainlink_price {
+                        (if cl >= open_price { Direction::Up } else { Direction::Down }, "chainlink_fallback")
+                    } else {
+                        (sig.direction.unwrap_or(Direction::Up), "signal_fallback")
+                    }
+                }
+            }
         } else {
-            sig.direction.unwrap_or(Direction::Up)
+            let chainlink_price = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await;
+            if let Some(cl) = chainlink_price {
+                (if cl >= open_price { Direction::Up } else { Direction::Down }, "chainlink")
+            } else {
+                (sig.direction.unwrap_or(Direction::Up), "signal_fallback")
+            }
         };
+        let _ = dir_source; // used in debug logs below
         let delta_f64 = sig.delta_pct;
 
         let volume_ratio = price_feeds.get_volume_ratio(&live_sym).await;
