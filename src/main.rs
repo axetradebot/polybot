@@ -2150,20 +2150,21 @@ async fn run_scanner_loop(
             });
         }
 
-        // After spawning settlements, sync bankroll from the real CLOB balance
-        // to correct any drift from partial fills or accounting mismatches.
+        // After settlements, check for bankroll drift against the CLOB cash
+        // balance. Only LOG — don't overwrite, because cash balance excludes
+        // unredeemed winnings and open positions.
         if has_settlements {
-            if let Some(real_bal) = fetch_clob_balance!() {
-                let mut st = state.write().await;
-                if (st.bankroll - real_bal).abs() > dec!(0.50) {
+            if let Some(clob_cash) = fetch_clob_balance!() {
+                let st = state.read().await;
+                let drift = st.bankroll - clob_cash;
+                if drift.abs() > dec!(1.00) {
                     warn!(
-                        internal = %st.bankroll,
-                        clob = %real_bal,
-                        drift = %(st.bankroll - real_bal),
-                        "Bankroll drift detected — syncing from CLOB"
+                        internal_bankroll = %st.bankroll,
+                        clob_cash = %clob_cash,
+                        drift = %drift,
+                        "Bankroll vs CLOB cash drift (may include unredeemed wins)"
                     );
                 }
-                st.bankroll = real_bal;
             }
         }
 
