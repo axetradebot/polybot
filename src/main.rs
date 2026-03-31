@@ -1346,18 +1346,14 @@ async fn run_scanner_loop(
                 last_skip_reasons.remove(&mkt.name);
                 skip_notified.retain(|k| !k.starts_with(&mkt.name));
 
-                // New window detected — capture open price precisely at the window boundary.
-                // The scan loop may detect the transition a few seconds late, so we look
-                // back in the tick history to find the price at the exact window start.
+                // Capture the Chainlink (USD) open for direction determination.
+                // We use get_market_price (Chainlink with Binance fallback) rather
+                // than the tick-buffer because Chainlink updates every 60-90s, so
+                // get_price_at_offset's 5s tolerance almost always misses and falls
+                // back to Binance USDT — contaminating the USD open with a USDT
+                // price and causing systematic direction bias.
                 let secs_since_start = mkt.window_seconds.saturating_sub(secs_rem);
-                let price_sym = PriceFeeds::price_symbol(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol);
-                let precise_price = if secs_since_start > 0 {
-                    price_feeds.get_price_at_offset(&price_sym, secs_since_start).await
-                } else {
-                    None
-                };
-
-                if let Some(price) = precise_price {
+                if let Some(price) = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
                     price_feeds
                         .set_window_open(&mkt.slug_prefix, window_ts, price)
                         .await;
@@ -1366,19 +1362,8 @@ async fn run_scanner_loop(
                         window_ts,
                         open_price = %price,
                         secs_remaining = secs_rem,
-                        lookback_secs = secs_since_start,
-                        "New window started (tick-buffer precise open)"
-                    );
-                } else if let Some(price) = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await {
-                    price_feeds
-                        .set_window_open(&mkt.slug_prefix, window_ts, price)
-                        .await;
-                    info!(
-                        market = %mkt.name,
-                        window_ts,
-                        open_price = %price,
-                        secs_remaining = secs_rem,
-                        "New window started (current price fallback)"
+                        secs_into_window = secs_since_start,
+                        "New window — Chainlink (USD) open captured"
                     );
                 }
 
@@ -1459,8 +1444,19 @@ async fn run_scanner_loop(
                             market = %mkt.name,
                             window_ts,
                             open_price = %price,
-                            "Open price set (late capture)"
+                            "Chainlink open set (late capture)"
                         );
+                    }
+                }
+                let bwo_key_exists = price_feeds
+                    .get_binance_window_open(&mkt.slug_prefix, window_ts)
+                    .await
+                    .is_some();
+                if !bwo_key_exists {
+                    let binance_sym = mkt.binance_symbol.to_lowercase();
+                    if let Some(bp) = price_feeds.get_price(&binance_sym).await {
+                        price_feeds.set_binance_window_open(&mkt.slug_prefix, window_ts, bp).await;
+                        info!(market = %mkt.name, binance_open = %bp, "Binance open set (late capture)");
                     }
                 }
 
