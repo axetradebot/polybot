@@ -1188,6 +1188,35 @@ async fn run_scanner_loop(
             }
 
             scanner_result_counts.clear();
+
+            // Sample Bybit vs Chainlink price divergence (deduplicate by asset)
+            {
+                let mut sampled_assets = std::collections::HashSet::new();
+                for mkt in config.enabled_markets() {
+                    if mkt.bybit_symbol.is_empty() { continue; }
+                    if !sampled_assets.insert(mkt.asset.clone()) { continue; }
+                    let bybit_key = crate::feeds::bybit::bybit_price_key(&mkt.bybit_symbol);
+                    let bybit_p = price_feeds.get_price(&bybit_key).await;
+                    let cl_p = price_feeds.get_price(&mkt.chainlink_symbol.to_lowercase()).await;
+                    if let (Some(bp), Some(cp)) = (bybit_p, cl_p) {
+                        let bp_f = bp.to_string().parse::<f64>().unwrap_or(0.0);
+                        let cp_f = cp.to_string().parse::<f64>().unwrap_or(0.0);
+                        let diff = bp_f - cp_f;
+                        let diff_pct = if cp_f.abs() > 1e-12 { (diff / cp_f) * 100.0 } else { 0.0 };
+                        info!(
+                            asset = %mkt.asset,
+                            bybit = format!("{:.2}", bp_f),
+                            chainlink = format!("{:.2}", cp_f),
+                            diff_usd = format!("{:.4}", diff),
+                            diff_pct = format!("{:.4}", diff_pct),
+                            "Price divergence: Bybit vs Chainlink"
+                        );
+                        if let Err(e) = db.insert_price_divergence(&mkt.asset, bp_f, cp_f) {
+                            warn!(error = %e, asset = %mkt.asset, "Failed to log price divergence");
+                        }
+                    }
+                }
+            }
         }
 
         // Telegram heartbeat every 15 minutes

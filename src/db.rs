@@ -183,6 +183,16 @@ impl TradeDb {
             CREATE INDEX IF NOT EXISTS idx_resolution_audit_market
                 ON resolution_audit(market_name);
 
+            CREATE TABLE IF NOT EXISTS price_divergence (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp        TEXT NOT NULL DEFAULT (datetime('now')),
+                asset            TEXT NOT NULL,
+                bybit_price      REAL NOT NULL,
+                chainlink_price  REAL NOT NULL,
+                diff_usd         REAL NOT NULL,
+                diff_pct         REAL NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS active_positions (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 market_name      TEXT NOT NULL,
@@ -990,6 +1000,27 @@ impl TradeDb {
             results.push(row?);
         }
         Ok(results)
+    }
+
+    pub fn insert_price_divergence(
+        &self,
+        asset: &str,
+        bybit_price: f64,
+        chainlink_price: f64,
+    ) -> Result<()> {
+        let diff_usd = bybit_price - chainlink_price;
+        let diff_pct = if chainlink_price.abs() > 1e-12 {
+            (diff_usd / chainlink_price) * 100.0
+        } else {
+            0.0
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO price_divergence (asset, bybit_price, chainlink_price, diff_usd, diff_pct)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![asset, bybit_price, chainlink_price, diff_usd, diff_pct],
+        )?;
+        Ok(())
     }
 
     pub fn daily_analytics(&self) -> Result<DailyAnalytics> {
