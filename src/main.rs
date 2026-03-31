@@ -1900,17 +1900,31 @@ async fn run_scanner_loop(
                             let fail_secs = window_end_epoch.saturating_sub(market::epoch_secs());
 
                             if err_str.contains("425") || err_str.to_lowercase().contains("too early") {
-                                let backoff = Duration::from_secs(5);
+                                let already_backing_off = early_reject_until.contains_key(&traded_key);
+                                // If this was an early entry (T>30), back off until the
+                                // normal entry window instead of spamming every 5 seconds.
+                                let backoff_secs = if fail_secs > 35 {
+                                    fail_secs.saturating_sub(30)
+                                } else {
+                                    5
+                                };
                                 early_reject_until.insert(
                                     traded_key.clone(),
-                                    std::time::Instant::now() + backoff,
+                                    std::time::Instant::now() + Duration::from_secs(backoff_secs),
                                 );
                                 warn!(
                                     market = %opp.market_name,
                                     secs_before_close = fail_secs,
-                                    backoff_s = 5,
-                                    "425 Too Early — will retry in 5s"
+                                    backoff_s = backoff_secs,
+                                    "425 Too Early — will retry after backoff"
                                 );
+                                if !already_backing_off {
+                                    telegram.send_order_failed(
+                                        &opp.market_name, &opp.slug, &opp.direction.to_string(),
+                                        opp.suggested_entry, fail_secs,
+                                        &format!("425 Too Early — will retry at T-30 (backoff {backoff_secs}s)"),
+                                    ).await.ok();
+                                }
                             } else {
                                 warn!(
                                     error = ?e,
@@ -1921,11 +1935,11 @@ async fn run_scanner_loop(
                                     "Failed to post order"
                                 );
                                 window_traded.insert(traded_key.clone(), true);
+                                telegram.send_order_failed(
+                                    &opp.market_name, &opp.slug, &opp.direction.to_string(),
+                                    opp.suggested_entry, fail_secs, &err_str,
+                                ).await.ok();
                             }
-                            telegram.send_order_failed(
-                                &opp.market_name, &opp.slug, &opp.direction.to_string(),
-                                opp.suggested_entry, fail_secs, &err_str,
-                            ).await.ok();
                         }
                     }
                 }
