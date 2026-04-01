@@ -172,6 +172,7 @@ impl TelegramNotifier {
         open_positions: usize,
         max_positions: usize,
         timing: Option<&OrderTiming>,
+        price_info: Option<&str>,
     ) -> Result<()> {
         if !self.enabled || !self.on_fill {
             return Ok(());
@@ -193,6 +194,10 @@ impl TelegramNotifier {
             String::new()
         };
 
+        let price_line = price_info
+            .map(|p| format!("\n\u{200b}  📍 {p}"))
+            .unwrap_or_default();
+
         let msg = format!(
             "📊 FILL {mode_tag}— {}\n\
              \u{200b}  Window: {}\n\
@@ -201,7 +206,7 @@ impl TelegramNotifier {
              \u{200b}  Book ask: ${} → Filled: ${}{}\n\
              \u{200b}  Delta: {}%\n\
              \u{200b}  Contracts: {} | Bet: ${}\n\
-             \u{200b}  Open positions: {}/{}{}",
+             \u{200b}  Open positions: {}/{}{}{}",
             trade.market_name,
             trade.slug,
             trade.direction,
@@ -217,6 +222,7 @@ impl TelegramNotifier {
             open_positions,
             max_positions,
             timing_line,
+            price_line,
         );
 
         self.send_message(&msg).await
@@ -240,6 +246,7 @@ impl TelegramNotifier {
         open_positions: usize,
         max_positions: usize,
         timing: Option<&OrderTiming>,
+        price_info: Option<&str>,
     ) -> Result<()> {
         if !self.enabled || !self.on_fill {
             return Ok(());
@@ -262,6 +269,10 @@ impl TelegramNotifier {
             String::new()
         };
 
+        let price_line = price_info
+            .map(|p| format!("\n\u{200b}  📍 {p}"))
+            .unwrap_or_default();
+
         let msg = format!(
             "📊 FILL {mode_tag}— {market_name}\n\
              \u{200b}  Window: {slug}\n\
@@ -270,7 +281,7 @@ impl TelegramNotifier {
              \u{200b}  Book ask: ${best_ask} → Filled: ${fill_price}{tighten_info}\n\
              \u{200b}  Delta: {delta_pct}%\n\
              \u{200b}  Contracts: {fill_size} | Bet: ${bet_usd:.2}\n\
-             \u{200b}  Open positions: {open_positions}/{max_positions}{timing_line}",
+             \u{200b}  Open positions: {open_positions}/{max_positions}{timing_line}{price_line}",
         );
 
         self.send_message(&msg).await
@@ -294,6 +305,7 @@ impl TelegramNotifier {
         edge_score: f64,
         delta_pct: Decimal,
         mode_str: &str,
+        price_info: Option<&str>,
     ) -> Result<()> {
         if !self.enabled || !self.on_settlement {
             return Ok(());
@@ -325,6 +337,10 @@ impl TelegramNotifier {
             String::new()
         };
 
+        let price_line = price_info
+            .map(|p| format!("\n\u{200b}  📍 {p}"))
+            .unwrap_or_default();
+
         let msg = format!(
             "{emoji} {mode_tag}{outcome} — {market_name}\n\
              \u{200b}  Window: {slug}\n\
@@ -333,7 +349,7 @@ impl TelegramNotifier {
              \u{200b}  Fill: ${fill_price} × {fill_size} contracts\n\
              \u{200b}  Delta: {delta_pct:.4}% | Edge: {edge_score:.3}\n\
              \u{200b}  P&L: {pnl_sign}${pnl:.2} ({pnl_sign}{roi_pct}%)\n\
-             \u{200b}  Bankroll: ${bankroll:.2}"
+             \u{200b}  Bankroll: ${bankroll:.2}{price_line}"
         );
 
         self.send_message(&msg).await
@@ -509,14 +525,17 @@ impl TelegramNotifier {
     /// Gated by `on_window_miss`.
     pub async fn send_window_miss(
         &self,
-        missed_markets: &[(String, String)], // (market_name, reason)
+        missed_markets: &[(String, String, Option<String>)], // (market_name, reason, price_info)
     ) -> Result<()> {
         if !self.enabled || !self.on_window_miss || missed_markets.is_empty() {
             return Ok(());
         }
         let mut msg = "⏭ Window closed — no trades placed".to_string();
-        for (name, reason) in missed_markets {
+        for (name, reason, price_info) in missed_markets {
             msg.push_str(&format!("\n\u{200b}  ❌ {name}: {}", Self::escape_html(reason)));
+            if let Some(pi) = price_info {
+                msg.push_str(&format!("\n\u{200b}     📍 {pi}"));
+            }
         }
         self.send_message(&msg).await
     }

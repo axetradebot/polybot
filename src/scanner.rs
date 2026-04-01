@@ -46,6 +46,8 @@ pub struct MarketOpportunity {
     pub range_30s: f64,
     pub signal_score: f64,
     pub is_early_limit: bool,
+    pub bybit_open_price: Option<Decimal>,
+    pub bybit_symbol: String,
 }
 
 /// A single scanner evaluation record for analytics logging.
@@ -694,6 +696,12 @@ pub async fn scan_all_markets(
             range_30s: sig.range_30s,
             signal_score: sig.signal_score,
             is_early_limit: in_early_window,
+            bybit_open_price: if !mkt.bybit_symbol.is_empty() {
+                price_feeds.get_bybit_window_open(&mkt.slug_prefix, window_ts).await
+            } else {
+                None
+            },
+            bybit_symbol: mkt.bybit_symbol.clone(),
         });
     }
 

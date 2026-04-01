@@ -38,6 +38,9 @@ pub struct Position {
     pub placed_at: Instant,
 
     pub open_price: Decimal,
+    /// Bybit USD open at window start — used to show target price in notifications.
+    pub bybit_open_price: Option<Decimal>,
+    pub bybit_symbol: String,
     pub status: PositionStatus,
     pub fill_price: Option<Decimal>,
     pub fill_size: Option<Decimal>,

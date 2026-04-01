@@ -919,6 +919,8 @@ async fn run_scanner_loop(
                     last_adjust_at: now_inst,
                     placed_at: now_inst,
                     open_price: pp.open_price.parse().unwrap_or_default(),
+                    bybit_open_price: None,
+                    bybit_symbol: String::new(),
                     status,
                     fill_price: pp.fill_price.as_ref().and_then(|s| s.parse::<Decimal>().ok()),
                     fill_size: pp.fill_size.as_ref().and_then(|s| s.parse::<Decimal>().ok()),
@@ -958,9 +960,10 @@ async fn run_scanner_loop(
                     let pk = config.private_key.clone();
                     let do_redeem = config.infra.auto_redeem;
 
+                    let pf2 = price_feeds.clone();
                     tokio::spawn(async move {
                         let result = settle_position(
-                            pos_for_settle, db2.clone(), tg2, st2, pt2, &rpc, &pk, do_redeem,
+                            pos_for_settle, db2.clone(), tg2, st2, pt2, &rpc, &pk, do_redeem, pf2,
                         )
                         .await;
                         if result.is_ok() {
@@ -1002,9 +1005,10 @@ async fn run_scanner_loop(
                                 let do_redeem = config.infra.auto_redeem;
                                 let pp_id = pp.id;
 
+                                let pf2 = price_feeds.clone();
                                 tokio::spawn(async move {
                                     let result = settle_position(
-                                        filled_pos, db2.clone(), tg2, st2, pt2, &rpc, &pk, do_redeem,
+                                        filled_pos, db2.clone(), tg2, st2, pt2, &rpc, &pk, do_redeem, pf2,
                                     )
                                     .await;
                                     if result.is_ok() {
@@ -1044,9 +1048,10 @@ async fn run_scanner_loop(
                         let do_redeem = config.infra.auto_redeem;
                         let pp_id = pp.id;
 
+                        let pf2 = price_feeds.clone();
                         tokio::spawn(async move {
                             let result = settle_position(
-                                filled_pos, db2.clone(), tg2, st2, pt2, &rpc, &pk, do_redeem,
+                                filled_pos, db2.clone(), tg2, st2, pt2, &rpc, &pk, do_redeem, pf2,
                             )
                             .await;
                             if result.is_ok() {
@@ -1081,7 +1086,7 @@ async fn run_scanner_loop(
     loop {
         let cycle_start = tokio::time::Instant::now();
         heartbeat_counter += 1;
-        let mut missed_windows: Vec<(String, String)> = Vec::new();
+        let mut missed_windows: Vec<(String, String, Option<String>)> = Vec::new();
 
         // Snapshot shared token caches into locals for this cycle
         let mut tc_local = token_cache.read().await.clone();
@@ -1301,7 +1306,20 @@ async fn run_scanner_loop(
                         } else {
                             base_reason
                         };
-                        missed_windows.push((mkt.name.clone(), reason.clone()));
+                        let miss_price_info = if !mkt.bybit_symbol.is_empty() {
+                            let bybit_key = crate::feeds::bybit::bybit_price_key(&mkt.bybit_symbol);
+                            let cur = price_feeds.get_price(&bybit_key).await;
+                            let opn = price_feeds.get_bybit_window_open(&mkt.slug_prefix, old_ts).await;
+                            match (opn, cur) {
+                                (Some(o), Some(c)) => Some(format!("Target: ${o} | Close: ${c}")),
+                                (Some(o), None) => Some(format!("Target: ${o} | Close: n/a")),
+                                (None, Some(c)) => Some(format!("Target: n/a | Close: ${c}")),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        missed_windows.push((mkt.name.clone(), reason.clone(), miss_price_info));
 
                         let (md, md_dir) = window_max_delta.remove(&key).unwrap_or((0.0, String::new()));
                         let _ = db.upsert_window_summary(
@@ -1899,6 +1917,8 @@ async fn run_scanner_loop(
                         last_adjust_at: now_inst,
                         placed_at: now_inst,
                         open_price: opp.open_price,
+                        bybit_open_price: opp.bybit_open_price,
+                        bybit_symbol: opp.bybit_symbol.clone(),
                         status: PositionStatus::Filled,
                         fill_price: Some(opp.suggested_entry),
                         fill_size: Some(opp.contracts),
@@ -1919,6 +1939,18 @@ async fn run_scanner_loop(
                         error!(error = %e, "Failed to log paper fill");
                     }
 
+                    let paper_price_info = if !opp.bybit_symbol.is_empty() {
+                        let bybit_key = crate::feeds::bybit::bybit_price_key(&opp.bybit_symbol);
+                        let current = price_feeds.get_price(&bybit_key).await;
+                        match (opp.bybit_open_price, current) {
+                            (Some(o), Some(c)) => Some(format!("Target: ${o} | Now: ${c}")),
+                            (Some(o), None) => Some(format!("Target: ${o} | Now: n/a")),
+                            (None, Some(c)) => Some(format!("Target: n/a | Now: ${c}")),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     let open_count = positions.open_count().await;
                     telegram
                         .send_fill_multi(
@@ -1929,6 +1961,7 @@ async fn run_scanner_loop(
                             open_count,
                             config.bankroll.max_concurrent_positions,
                             None,
+                            paper_price_info.as_deref(),
                         )
                         .await
                         .ok();
@@ -2029,6 +2062,8 @@ async fn run_scanner_loop(
                                 last_adjust_at: now_inst,
                                 placed_at: now_inst,
                                 open_price: opp.open_price,
+                                bybit_open_price: opp.bybit_open_price,
+                                bybit_symbol: opp.bybit_symbol.clone(),
                                 status: PositionStatus::Pending,
                                 fill_price: None,
                                 fill_size: None,
@@ -2142,7 +2177,7 @@ async fn run_scanner_loop(
                         {
                             handle_live_fill(
                                 pos, *fill_price, *fill_size, positions, &db,
-                                &telegram, config,
+                                &telegram, config, price_feeds,
                             ).await;
                             continue;
                         }
@@ -2165,7 +2200,7 @@ async fn run_scanner_loop(
                                 );
                                 handle_live_fill(
                                     pos, *fill_price, *fill_size, positions, &db,
-                                    &telegram, config,
+                                    &telegram, config, price_feeds,
                                 ).await;
                                 continue;
                             }
@@ -2310,8 +2345,9 @@ async fn run_scanner_loop(
             let pk = config.private_key.clone();
             let do_redeem = config.infra.auto_redeem;
 
+            let pf2 = price_feeds.clone();
             tokio::spawn(async move {
-                let result = settle_position(pos_clone, db2.clone(), tg2, st2, pt2, &rpc, &pk, do_redeem)
+                let result = settle_position(pos_clone, db2.clone(), tg2, st2, pt2, &rpc, &pk, do_redeem, pf2)
                     .await;
                 if result.is_ok() {
                     if let Some(db_id) = pos_db_id {
@@ -2364,6 +2400,7 @@ async fn settle_position(
     _polygon_rpc_url: &str,
     _private_key: &str,
     _auto_redeem: bool,
+    price_feeds: crate::feeds::PriceFeeds,
 ) -> Result<()> {
     tokio::time::sleep(Duration::from_secs(25)).await;
 
@@ -2442,6 +2479,7 @@ async fn settle_position(
         "Trade settled"
     );
 
+    let price_info = build_price_info(&pos, &price_feeds).await;
     telegram
         .send_settlement(
             &pos.market_name,
@@ -2458,6 +2496,7 @@ async fn settle_position(
             pos.edge_score,
             pos.delta_pct,
             &pos.mode.to_string(),
+            price_info.as_deref(),
         )
         .await
         .ok();
@@ -2477,6 +2516,7 @@ async fn handle_live_fill(
     db: &Arc<TradeDb>,
     telegram: &Arc<TelegramNotifier>,
     config: &AppConfig,
+    price_feeds: &crate::feeds::PriceFeeds,
 ) {
     positions.mark_filled(pos.id, fill_price, fill_size).await;
 
@@ -2499,6 +2539,7 @@ async fn handle_live_fill(
         error!(error = %e, "Failed to log live fill");
     }
 
+    let price_info = build_price_info(pos, price_feeds).await;
     let open_count = positions.open_count().await;
     telegram
         .send_fill_from_position(
@@ -2519,6 +2560,7 @@ async fn handle_live_fill(
                 secs_before_confirm: pos.confirm_secs_before_close.unwrap_or(0),
                 pipeline_ms: pos.pipeline_ms.unwrap_or(0),
             }).as_ref(),
+            price_info.as_deref(),
         )
         .await
         .ok();
@@ -2531,6 +2573,24 @@ async fn handle_live_fill(
         tightens = pos.tighten_count,
         "FILLED!"
     );
+}
+
+async fn build_price_info(
+    pos: &Position,
+    price_feeds: &crate::feeds::PriceFeeds,
+) -> Option<String> {
+    if pos.bybit_symbol.is_empty() {
+        return None;
+    }
+    let bybit_key = crate::feeds::bybit::bybit_price_key(&pos.bybit_symbol);
+    let current = price_feeds.get_price(&bybit_key).await;
+    let open = pos.bybit_open_price;
+    match (open, current) {
+        (Some(o), Some(c)) => Some(format!("Target: ${o} | Now: ${c}")),
+        (Some(o), None) => Some(format!("Target: ${o} | Now: n/a")),
+        (None, Some(c)) => Some(format!("Target: n/a | Now: ${c}")),
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
