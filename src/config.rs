@@ -545,7 +545,7 @@ fn validate_markets(markets: &[MarketConfig]) -> Result<()> {
             bail!("Market '{}': delta_tiers must have at least one entry", m.name);
         }
         for (j, tier) in m.delta_tiers.iter().enumerate() {
-            if tier[0] < 0.01 || tier[1] < 0.50 || tier[1] > 0.99 {
+            if tier[0] < 0.01 || tier[1] < 0.30 || tier[1] > 0.99 {
                 bail!("Market '{}' delta_tier {j}: invalid values {:?}", m.name, tier);
             }
         }
