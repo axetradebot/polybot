@@ -273,8 +273,10 @@ pub async fn scan_all_markets(
         let volume_ratio = price_feeds.get_volume_ratio(&live_sym).await;
 
         // Cross-check: if Bybit determined direction, verify Chainlink agrees.
-        // Polymarket resolves on Chainlink, so never bet against it.
-        if dir_source == "bybit" {
+        // Only enforced when delta is weak (< 0.10%) — at higher deltas the
+        // signal is strong enough that both sources converge quickly and blocking
+        // on small timing divergences costs profitable trades.
+        if dir_source == "bybit" && delta_f64 < 0.10 {
             let chainlink_price = price_feeds
                 .get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol)
                 .await;
@@ -287,10 +289,11 @@ pub async fn scan_all_markets(
                         chainlink_dir = %cl_dir,
                         chainlink_price = %cl,
                         chainlink_open = %open_price,
-                        "Skip: Bybit/Chainlink direction mismatch — deferring to resolution source"
+                        delta = delta_f64,
+                        "Skip: Bybit/Chainlink direction mismatch (weak delta)"
                     );
                     let detail = format!(
-                        "Direction conflict: Bybit={direction} vs Chainlink={cl_dir} (CL ${cl} vs open ${open_price})"
+                        "Direction conflict: Bybit={direction} vs Chainlink={cl_dir} (delta {delta_f64:.4}%, CL ${cl} vs open ${open_price})"
                     );
                     skip_reasons.insert(mkt.name.clone(), detail.clone());
                     evaluations.push(ScanEvaluation {
