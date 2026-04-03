@@ -125,6 +125,10 @@ async fn main() -> Result<()> {
     let risk_manager = RiskManager::new(&config);
     let verbose = cli.verbose || config.telegram.verbose_skips;
 
+    if config.telegram.on_startup {
+        telegram.send_message("⏳ Bot deploying — connecting to price feeds…").await.ok();
+    }
+
     // Register Chainlink → Binance fallback mappings
     for (cl_sym, bn_sym) in config.fallback_symbol_map() {
         price_feeds.register_fallback(&cl_sym, &bn_sym).await;

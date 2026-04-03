@@ -643,7 +643,7 @@ impl TelegramNotifier {
         }
     }
 
-    async fn send_message(&self, text: &str) -> Result<()> {
+    pub async fn send_message(&self, text: &str) -> Result<()> {
         let url = format!(
             "https://api.telegram.org/bot{}/sendMessage",
             self.bot_token
