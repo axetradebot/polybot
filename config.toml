@@ -457,6 +457,31 @@ delta_tiers = [
     [0.20, 0.82],
 ]
 
+# ============================================================
+# KALSHI INTEGRATION
+# ============================================================
+
+[kalshi]
+enabled = false
+mode = "paper"
+series_ticker = "KXBTC15M"
+asset = "BTC"
+window_seconds = 900
+entry_start_s = 30
+entry_cutoff_s = 5
+min_delta_pct = 0.04
+max_entry_price = 0.85
+bet_size_usd = 15.0
+auth_refresh_seconds = 1500
+scan_interval_ms = 500
+delta_tiers = [
+    [0.04, 0.55],
+    [0.06, 0.65],
+    [0.08, 0.72],
+    [0.10, 0.80],
+    [0.15, 0.85],
+]
+
 [infrastructure]
 chainlink_ws_url = "wss://ws-live-data.polymarket.com"
 bybit_ws_url = "wss://stream.bybit.com/v5/public/inverse"

@@ -28,6 +28,7 @@ pub struct AppConfig {
     pub infra: InfraConfig,
     /// Markets that should run in paper mode even when the bot is in live mode.
     pub paper_markets: HashSet<String>,
+    pub kalshi: KalshiConfig,
 }
 
 // ─── Section configs ─────────────────────────────────────────────────────────
@@ -279,6 +280,83 @@ fn default_chain_id() -> u64 { 137 }
 fn default_sig_type() -> String { "GnosisSafe".into() }
 fn default_db_path() -> String { "./trades.db".into() }
 
+// ─── Kalshi config ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct KalshiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_kalshi_mode")]
+    pub mode: String,
+    #[serde(default = "default_kalshi_series")]
+    pub series_ticker: String,
+    #[serde(default = "default_kalshi_asset")]
+    pub asset: String,
+    #[serde(default = "default_kalshi_window")]
+    pub window_seconds: u64,
+    #[serde(default = "default_kalshi_entry_start")]
+    pub entry_start_s: u64,
+    #[serde(default = "default_kalshi_entry_cutoff")]
+    pub entry_cutoff_s: u64,
+    #[serde(default = "default_kalshi_min_delta")]
+    pub min_delta_pct: f64,
+    #[serde(default = "default_kalshi_max_entry")]
+    pub max_entry_price: f64,
+    #[serde(default = "default_kalshi_bet_size")]
+    pub bet_size_usd: f64,
+    #[serde(default)]
+    pub delta_tiers: Vec<[f64; 2]>,
+    #[serde(default = "default_kalshi_auth_refresh")]
+    pub auth_refresh_seconds: u64,
+    #[serde(default = "default_kalshi_scan_interval")]
+    pub scan_interval_ms: u64,
+}
+
+fn default_kalshi_mode() -> String { "paper".into() }
+fn default_kalshi_series() -> String { "KXBTC15M".into() }
+fn default_kalshi_asset() -> String { "BTC".into() }
+fn default_kalshi_window() -> u64 { 900 }
+fn default_kalshi_entry_start() -> u64 { 30 }
+fn default_kalshi_entry_cutoff() -> u64 { 5 }
+fn default_kalshi_min_delta() -> f64 { 0.05 }
+fn default_kalshi_max_entry() -> f64 { 0.92 }
+fn default_kalshi_bet_size() -> f64 { 15.0 }
+fn default_kalshi_auth_refresh() -> u64 { 1500 }
+fn default_kalshi_scan_interval() -> u64 { 500 }
+
+impl KalshiConfig {
+    pub fn max_price_for_delta(&self, delta_pct: f64) -> f64 {
+        let mut ceiling = self.max_entry_price;
+        for tier in &self.delta_tiers {
+            if delta_pct >= tier[0] {
+                ceiling = tier[1];
+            }
+        }
+        ceiling.min(self.max_entry_price)
+    }
+}
+
+impl Default for KalshiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_kalshi_mode(),
+            series_ticker: default_kalshi_series(),
+            asset: default_kalshi_asset(),
+            window_seconds: default_kalshi_window(),
+            entry_start_s: default_kalshi_entry_start(),
+            entry_cutoff_s: default_kalshi_entry_cutoff(),
+            min_delta_pct: default_kalshi_min_delta(),
+            max_entry_price: default_kalshi_max_entry(),
+            bet_size_usd: default_kalshi_bet_size(),
+            delta_tiers: Vec::new(),
+            auth_refresh_seconds: default_kalshi_auth_refresh(),
+            scan_interval_ms: default_kalshi_scan_interval(),
+        }
+    }
+}
+
 // ─── TOML deserialization target ─────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -290,6 +368,8 @@ struct TomlConfig {
     markets: Vec<MarketConfig>,
     telegram: TelegramConfig,
     infrastructure: InfraConfig,
+    #[serde(default)]
+    kalshi: Option<KalshiConfig>,
 }
 
 // ─── AppConfig implementation ────────────────────────────────────────────────
@@ -331,6 +411,7 @@ impl AppConfig {
             telegram: toml_cfg.telegram,
             infra: toml_cfg.infrastructure,
             paper_markets: HashSet::new(),
+            kalshi: toml_cfg.kalshi.unwrap_or_default(),
         })
     }
 

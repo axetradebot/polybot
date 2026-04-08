@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod feeds;
 mod hourly_discovery;
+mod kalshi;
 mod market;
 mod orderbook;
 mod positions;
@@ -134,7 +135,24 @@ async fn main() -> Result<()> {
         price_feeds.register_fallback(&cl_sym, &bn_sym).await;
     }
 
-    // Spawn Chainlink (PRIMARY) price feed from Polymarket
+    // Spawn Chainlink Data Streams (PRIMARY) — sub-second, resolution-aligned prices.
+    // This replaces the slow RTDS feed as the primary Chainlink price source.
+    let ds_assets: Vec<String> = config
+        .enabled_markets()
+        .iter()
+        .map(|m| m.asset.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let has_ds_creds = std::env::var("CHAINLINK_DS_API_KEY").is_ok();
+    if has_ds_creds {
+        info!(assets = ?ds_assets, "Spawning Chainlink Data Streams feed (sub-second)");
+        price_feeds.spawn_chainlink_streams_feed(ds_assets);
+    } else {
+        warn!("CHAINLINK_DS_API_KEY not set — falling back to slow RTDS Chainlink feed");
+    }
+
+    // Spawn legacy Chainlink RTDS feed as fallback (also provides Binance data)
     price_feeds.spawn_chainlink_feed(chainlink_symbols.clone(), &config.infra.chainlink_ws_url);
 
     // Spawn Binance (FALLBACK) price feed — only activates if Chainlink goes stale
@@ -189,8 +207,8 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // Run the main scanner loop
-    let result = run_scanner_loop(
+    // Run Polymarket scanner + optional Kalshi scanner in parallel
+    let polymarket_fut = run_scanner_loop(
         &config,
         &price_feeds,
         &positions,
@@ -199,16 +217,43 @@ async fn main() -> Result<()> {
         &telegram,
         &risk_manager,
         verbose,
-    )
-    .await;
+    );
 
-    if let Err(ref e) = result {
-        let msg = format!("Scanner loop crashed: {e}");
-        error!("{}", msg);
-        telegram.send_error(&msg).await.ok();
+    if config.kalshi.enabled {
+        info!("Kalshi scanner enabled — running in parallel with Polymarket");
+        let kalshi_fut = kalshi::run_kalshi_scanner(
+            &config.kalshi,
+            &price_feeds,
+            &telegram,
+            &db,
+        );
+        tokio::select! {
+            result = polymarket_fut => {
+                if let Err(ref e) = result {
+                    let msg = format!("Polymarket scanner crashed: {e}");
+                    error!("{}", msg);
+                    telegram.send_error(&msg).await.ok();
+                }
+                result
+            }
+            result = kalshi_fut => {
+                if let Err(ref e) = result {
+                    let msg = format!("Kalshi scanner crashed: {e}");
+                    error!("{}", msg);
+                    telegram.send_error(&msg).await.ok();
+                }
+                result
+            }
+        }
+    } else {
+        let result = polymarket_fut.await;
+        if let Err(ref e) = result {
+            let msg = format!("Scanner loop crashed: {e}");
+            error!("{}", msg);
+            telegram.send_error(&msg).await.ok();
+        }
+        result
     }
-
-    result
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

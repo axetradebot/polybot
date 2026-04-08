@@ -273,6 +273,8 @@ impl TradeDb {
             "ALTER TABLE shadow_timing ADD COLUMN volume_ratio REAL",
             "ALTER TABLE shadow_trades ADD COLUMN ob_imbalance REAL",
             "ALTER TABLE shadow_trades ADD COLUMN volume_ratio REAL",
+            "ALTER TABLE trades ADD COLUMN platform TEXT DEFAULT 'polymarket'",
+            "ALTER TABLE shadow_trades ADD COLUMN platform TEXT DEFAULT 'polymarket'",
         ];
         for sql in &migrations {
             let _ = conn.execute(sql, []);

@@ -1,6 +1,6 @@
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config::AppConfig;
 use crate::feeds::PriceFeeds;
@@ -227,73 +227,40 @@ pub async fn scan_all_markets(
         let ticks = price_feeds.get_ticks(&live_sym, 60).await;
         let sig = signal::compute_signals(current_price, delta_open, &ticks, &sig_weights);
 
-        // Direction: prefer Bybit USD (100ms updates, true USD denomination)
-        // over Chainlink (60-90s stale). Falls back to Chainlink if Bybit
-        // is unavailable for this market.
-        let (direction, dir_source) = if !mkt.bybit_symbol.is_empty() {
-            let bybit_key = crate::feeds::bybit::bybit_price_key(&mkt.bybit_symbol);
-            let bybit_current = price_feeds.get_price(&bybit_key).await;
-            let bybit_open = price_feeds.get_bybit_window_open(&mkt.slug_prefix, window_ts).await;
-            match (bybit_current, bybit_open) {
-                (Some(cur), Some(opn)) => {
-                    let d = if cur >= opn { Direction::Up } else { Direction::Down };
-                    debug!(
-                        market = %mkt.name,
-                        bybit_current = %cur,
-                        bybit_open = %opn,
-                        direction = %d,
-                        "Direction from Bybit USD"
-                    );
-                    (d, "bybit")
-                }
-                _ => {
-                    warn!(
-                        market = %mkt.name,
-                        bybit_current = ?bybit_current.map(|d| d.to_string()),
-                        bybit_open = ?bybit_open.map(|d| d.to_string()),
-                        "Bybit data missing, falling back to Chainlink for direction"
-                    );
-                    let chainlink_price = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await;
-                    if let Some(cl) = chainlink_price {
-                        (if cl >= open_price { Direction::Up } else { Direction::Down }, "chainlink_fallback")
-                    } else {
-                        (sig.direction.unwrap_or(Direction::Up), "signal_fallback")
-                    }
-                }
-            }
+        // Direction: Chainlink is primary — it's the resolution source for
+        // Polymarket, so aligning with it avoids systematic direction errors.
+        // Bybit is used as optional confirmation: if Bybit disagrees, skip.
+        let chainlink_dir_price = price_feeds
+            .get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol)
+            .await;
+        let direction = if let Some(cl) = chainlink_dir_price {
+            if cl >= open_price { Direction::Up } else { Direction::Down }
         } else {
-            let chainlink_price = price_feeds.get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol).await;
-            if let Some(cl) = chainlink_price {
-                (if cl >= open_price { Direction::Up } else { Direction::Down }, "chainlink")
-            } else {
-                (sig.direction.unwrap_or(Direction::Up), "signal_fallback")
-            }
+            sig.direction.unwrap_or(Direction::Up)
         };
         let delta_f64 = sig.delta_pct;
         let volume_ratio = price_feeds.get_volume_ratio(&live_sym).await;
 
-        // Cross-check: if Bybit determined direction, verify Chainlink agrees.
-        // Only enforced when delta is weak (< 0.10%) — at higher deltas the
-        // signal is strong enough that both sources converge quickly and blocking
-        // on small timing divergences costs profitable trades.
-        if dir_source == "bybit" && delta_f64 < 0.10 {
-            let chainlink_price = price_feeds
-                .get_market_price(&mkt.resolution_source, &mkt.chainlink_symbol, &mkt.binance_symbol)
-                .await;
-            if let Some(cl) = chainlink_price {
-                let cl_dir = if cl >= open_price { Direction::Up } else { Direction::Down };
-                if cl_dir != direction {
+        // Cross-check: if Bybit data is available, verify it agrees with
+        // Chainlink. If they disagree, skip — divergence at entry often
+        // means the price is near the inflection point and direction is
+        // unreliable regardless of delta magnitude.
+        if !mkt.bybit_symbol.is_empty() {
+            let bybit_key = crate::feeds::bybit::bybit_price_key(&mkt.bybit_symbol);
+            let bybit_current = price_feeds.get_price(&bybit_key).await;
+            let bybit_open = price_feeds.get_bybit_window_open(&mkt.slug_prefix, window_ts).await;
+            if let (Some(cur), Some(opn)) = (bybit_current, bybit_open) {
+                let bybit_dir = if cur >= opn { Direction::Up } else { Direction::Down };
+                if bybit_dir != direction {
                     info!(
                         market = %mkt.name,
-                        bybit_dir = %direction,
-                        chainlink_dir = %cl_dir,
-                        chainlink_price = %cl,
-                        chainlink_open = %open_price,
+                        chainlink_dir = %direction,
+                        bybit_dir = %bybit_dir,
                         delta = delta_f64,
-                        "Skip: Bybit/Chainlink direction mismatch (weak delta)"
+                        "Skip: Chainlink/Bybit direction disagree"
                     );
                     let detail = format!(
-                        "Direction conflict: Bybit={direction} vs Chainlink={cl_dir} (delta {delta_f64:.4}%, CL ${cl} vs open ${open_price})"
+                        "Direction conflict: Chainlink={direction} vs Bybit={bybit_dir} (delta {delta_f64:.4}%)"
                     );
                     skip_reasons.insert(mkt.name.clone(), detail.clone());
                     evaluations.push(ScanEvaluation {

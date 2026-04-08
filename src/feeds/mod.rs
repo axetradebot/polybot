@@ -1,6 +1,7 @@
 pub mod binance;
 pub mod bybit;
 pub mod chainlink;
+pub mod chainlink_streams;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -28,9 +29,9 @@ pub struct VolumeEntry {
 }
 
 const TICK_HISTORY_MAX_AGE_SECS: u64 = 180;
-/// Chainlink updates less frequently than Binance. Use a generous stale
-/// threshold so we don't fall back to Binance (USDT) prices unnecessarily.
-const CHAINLINK_STALE_MS: i64 = 300_000; // 5 minutes
+/// With Chainlink Data Streams providing sub-second updates, we tighten
+/// the stale threshold. Fall back to Binance if no update for 30 seconds.
+const CHAINLINK_STALE_MS: i64 = 30_000; // 30 seconds
 const BINANCE_STALE_MS: i64 = 60_000;    // 1 minute
 
 /// Dual-source price feed: Chainlink (primary) + Binance (fallback).
@@ -496,6 +497,16 @@ impl PriceFeeds {
         tokio::spawn(async move {
             if let Err(e) = chainlink::run_chainlink_feed(feeds, &symbols, &ws_url).await {
                 tracing::error!(error = %e, "Chainlink feed fatal error");
+            }
+        });
+    }
+
+    /// Spawn Chainlink Data Streams (sub-second, resolution-aligned) price feed.
+    pub fn spawn_chainlink_streams_feed(&self, assets: Vec<String>) {
+        let feeds = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = chainlink_streams::run_chainlink_streams_feed(feeds, assets).await {
+                tracing::error!(error = %e, "Chainlink Data Streams feed fatal error");
             }
         });
     }
