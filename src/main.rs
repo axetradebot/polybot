@@ -109,11 +109,16 @@ async fn main() -> Result<()> {
         TradeDb::open(config.db_path()).context("Failed to open trade database")?,
     );
 
-    // Backfill shadow data with authoritative Polymarket resolutions
-    match db.backfill_shadow_from_poly() {
-        Ok(n) if n > 0 => info!(corrected = n, "Backfilled shadow data with Polymarket resolutions"),
-        Ok(_) => info!("Shadow data already in sync with Polymarket resolutions"),
-        Err(e) => warn!(error = %e, "Failed to backfill shadow data from Polymarket resolutions"),
+    // Backfill shadow data with authoritative Polymarket resolutions (background — can be slow on large DBs)
+    {
+        let db_bg = db.clone();
+        std::thread::spawn(move || {
+            match db_bg.backfill_shadow_from_poly() {
+                Ok(n) if n > 0 => info!(corrected = n, "Backfilled shadow data with Polymarket resolutions"),
+                Ok(_) => info!("Shadow data already in sync with Polymarket resolutions"),
+                Err(e) => warn!(error = %e, "Failed to backfill shadow data from Polymarket resolutions"),
+            }
+        });
     }
 
     let telegram = Arc::new(TelegramNotifier::new(
