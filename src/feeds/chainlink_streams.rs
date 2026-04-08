@@ -181,9 +181,16 @@ async fn process_report(
 ) -> Result<()> {
     let report = &ws_report.report;
 
-    // full_report is a hex-encoded string
-    let payload = hex::decode(&report.full_report)
-        .context("Failed to hex-decode full_report")?;
+    // full_report is a hex-encoded string, possibly with "0x" prefix
+    let hex_str = report.full_report.strip_prefix("0x")
+        .or_else(|| report.full_report.strip_prefix("0X"))
+        .unwrap_or(&report.full_report);
+    let payload = hex::decode(hex_str)
+        .with_context(|| format!(
+            "Failed to hex-decode full_report (len={}, first20={})",
+            report.full_report.len(),
+            &report.full_report[..report.full_report.len().min(20)]
+        ))?;
 
     let (_report_context, report_blob) = decode_full_report(&payload)
         .map_err(|e| anyhow::anyhow!("decode_full_report failed: {e}"))?;
