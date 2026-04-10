@@ -241,44 +241,6 @@ pub async fn scan_all_markets(
         let delta_f64 = sig.delta_pct;
         let volume_ratio = price_feeds.get_volume_ratio(&live_sym).await;
 
-        // Cross-check: if Bybit data is available, verify it agrees with
-        // Chainlink. If they disagree, skip — divergence at entry often
-        // means the price is near the inflection point and direction is
-        // unreliable regardless of delta magnitude.
-        if !mkt.bybit_symbol.is_empty() {
-            let bybit_key = crate::feeds::bybit::bybit_price_key(&mkt.bybit_symbol);
-            let bybit_current = price_feeds.get_price(&bybit_key).await;
-            let bybit_open = price_feeds.get_bybit_window_open(&mkt.slug_prefix, window_ts).await;
-            if let (Some(cur), Some(opn)) = (bybit_current, bybit_open) {
-                let bybit_dir = if cur >= opn { Direction::Up } else { Direction::Down };
-                if bybit_dir != direction {
-                    info!(
-                        market = %mkt.name,
-                        chainlink_dir = %direction,
-                        bybit_dir = %bybit_dir,
-                        delta = delta_f64,
-                        "Skip: Chainlink/Bybit direction disagree"
-                    );
-                    let detail = format!(
-                        "Direction conflict: Chainlink={direction} vs Bybit={bybit_dir} (delta {delta_f64:.4}%)"
-                    );
-                    skip_reasons.insert(mkt.name.clone(), detail.clone());
-                    evaluations.push(ScanEvaluation {
-                        market_name: mkt.name.clone(), window_ts, secs_remaining: secs_rem,
-                        direction: Some(direction.to_string()), delta_pct: Some(delta_f64),
-                        open_price: Some(open_price), current_price: Some(current_price),
-                        best_ask: None, best_bid: None, spread: None, depth_at_ask: None,
-                        suggested_entry: None, max_entry: None, edge_score: None,
-                        velocity_5s: Some(sig.velocity_5s), range_30s: Some(sig.range_30s),
-                        signal_score: Some(sig.signal_score),
-                        ob_imbalance: None, volume_ratio,
-                        result: "SKIP_DIR_CONFLICT".into(), detail: Some(detail),
-                    });
-                    continue;
-                }
-            }
-        }
-
         let required_delta = if in_early_window {
             mkt.early_entry_min_delta_pct
         } else {
