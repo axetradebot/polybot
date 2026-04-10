@@ -1,0 +1,18 @@
+[Unit]
+Description=Polymarket Whale Detector
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-whale-detector
+ExecStart=/home/ubuntu/polymarket-whale-detector/venv/bin/python -m src.main
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+EnvironmentFile=/home/ubuntu/polymarket-whale-detector/.env
+
+[Install]
+WantedBy=multi-user.target
