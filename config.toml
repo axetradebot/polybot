@@ -79,30 +79,23 @@ entry_start_s = 30
 entry_cutoff_s = 5
 min_delta_pct = 0.04
 max_entry_price = 0.50
-early_entry_start_s = 120
-early_entry_min_delta_pct = 0.06
+early_entry_start_s = 0
 undercut_offset = 0.01
 tighten_step = 0.01
 adjust_interval_ms = 500
 delta_tiers = [
-    [0.04, 0.38],
-    [0.06, 0.42],
-    [0.08, 0.45],
-    [0.10, 0.48],
+    [0.04, 0.45],
+    [0.06, 0.48],
+    [0.08, 0.50],
+    [0.10, 0.50],
     [0.15, 0.50],
-]
-early_delta_tiers = [
-    [0.06, 0.36],
-    [0.08, 0.40],
-    [0.10, 0.42],
-    [0.15, 0.45],
 ]
 
 [[markets]]
 name = "BTC 15-min"
 asset = "BTC"
 mode = "live"
-enabled = true
+enabled = false
 window_seconds = 900
 slug_prefix = "btc-updown-15m"
 resolution_source = "chainlink"
@@ -113,23 +106,15 @@ entry_start_s = 30
 entry_cutoff_s = 5
 min_delta_pct = 0.04
 max_entry_price = 0.50
-early_entry_start_s = 120
-early_entry_min_delta_pct = 0.04
+early_entry_start_s = 0
 undercut_offset = 0.01
 tighten_step = 0.01
 adjust_interval_ms = 1000
 delta_tiers = [
-    [0.04, 0.40],
-    [0.06, 0.45],
-    [0.08, 0.48],
+    [0.04, 0.45],
+    [0.06, 0.48],
+    [0.08, 0.50],
     [0.10, 0.50],
-    [0.15, 0.50],
-]
-early_delta_tiers = [
-    [0.04, 0.38],
-    [0.06, 0.42],
-    [0.08, 0.45],
-    [0.10, 0.48],
     [0.15, 0.50],
 ]
 
@@ -147,26 +132,20 @@ bybit_symbol = "ETHUSD"
 entry_start_s = 30
 min_delta_pct = 0.04
 max_entry_price = 0.50
-early_entry_start_s = 120
-early_entry_min_delta_pct = 0.08
+early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.38],
-    [0.06, 0.42],
-    [0.08, 0.45],
-    [0.10, 0.48],
+    [0.04, 0.45],
+    [0.06, 0.48],
+    [0.08, 0.50],
+    [0.10, 0.50],
     [0.15, 0.50],
-]
-early_delta_tiers = [
-    [0.08, 0.38],
-    [0.10, 0.42],
-    [0.15, 0.45],
 ]
 
 [[markets]]
 name = "ETH 15-min"
 asset = "ETH"
 mode = "live"
-enabled = true
+enabled = false
 window_seconds = 900
 slug_prefix = "eth-updown-15m"
 resolution_source = "chainlink"
@@ -176,20 +155,13 @@ bybit_symbol = "ETHUSD"
 entry_start_s = 30
 min_delta_pct = 0.04
 max_entry_price = 0.50
-early_entry_start_s = 120
-early_entry_min_delta_pct = 0.04
+early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.40],
-    [0.06, 0.45],
-    [0.08, 0.48],
+    [0.04, 0.45],
+    [0.06, 0.48],
+    [0.08, 0.50],
     [0.10, 0.50],
     [0.15, 0.50],
-]
-early_delta_tiers = [
-    [0.04, 0.38],
-    [0.06, 0.42],
-    [0.10, 0.45],
-    [0.15, 0.48],
 ]
 
 [[markets]]
@@ -206,26 +178,20 @@ bybit_symbol = "SOLUSD"
 entry_start_s = 30
 min_delta_pct = 0.04
 max_entry_price = 0.50
-early_entry_start_s = 120
-early_entry_min_delta_pct = 0.10
+early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.38],
-    [0.06, 0.42],
-    [0.08, 0.45],
-    [0.10, 0.48],
+    [0.04, 0.45],
+    [0.06, 0.48],
+    [0.08, 0.50],
+    [0.10, 0.50],
     [0.15, 0.50],
-]
-early_delta_tiers = [
-    [0.10, 0.38],
-    [0.15, 0.42],
-    [0.20, 0.45],
 ]
 
 [[markets]]
 name = "SOL 15-min"
 asset = "SOL"
 mode = "live"
-enabled = true
+enabled = false
 window_seconds = 900
 slug_prefix = "sol-updown-15m"
 resolution_source = "chainlink"
@@ -235,20 +201,13 @@ bybit_symbol = "SOLUSD"
 entry_start_s = 30
 min_delta_pct = 0.04
 max_entry_price = 0.50
-early_entry_start_s = 120
-early_entry_min_delta_pct = 0.04
+early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.40],
-    [0.06, 0.45],
-    [0.08, 0.48],
+    [0.04, 0.45],
+    [0.06, 0.48],
+    [0.08, 0.50],
     [0.10, 0.50],
     [0.15, 0.50],
-]
-early_delta_tiers = [
-    [0.04, 0.38],
-    [0.06, 0.42],
-    [0.10, 0.45],
-    [0.15, 0.48],
 ]
 
 [[markets]]
@@ -265,27 +224,20 @@ bybit_symbol = "XRPUSD"
 entry_start_s = 30
 min_delta_pct = 0.04
 max_entry_price = 0.50
-early_entry_start_s = 120
-early_entry_min_delta_pct = 0.06
+early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.38],
-    [0.06, 0.42],
-    [0.08, 0.45],
-    [0.10, 0.48],
+    [0.04, 0.45],
+    [0.06, 0.48],
+    [0.08, 0.50],
+    [0.10, 0.50],
     [0.15, 0.50],
-]
-early_delta_tiers = [
-    [0.06, 0.36],
-    [0.08, 0.40],
-    [0.10, 0.42],
-    [0.15, 0.45],
 ]
 
 [[markets]]
 name = "XRP 15-min"
 asset = "XRP"
 mode = "live"
-enabled = true
+enabled = false
 window_seconds = 900
 slug_prefix = "xrp-updown-15m"
 resolution_source = "chainlink"
@@ -295,20 +247,12 @@ bybit_symbol = "XRPUSD"
 entry_start_s = 30
 min_delta_pct = 0.04
 max_entry_price = 0.50
-early_entry_start_s = 120
-early_entry_min_delta_pct = 0.04
+early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.40],
-    [0.06, 0.45],
-    [0.08, 0.48],
+    [0.04, 0.45],
+    [0.06, 0.48],
+    [0.08, 0.50],
     [0.10, 0.50],
-    [0.15, 0.50],
-]
-early_delta_tiers = [
-    [0.04, 0.38],
-    [0.06, 0.42],
-    [0.08, 0.45],
-    [0.10, 0.48],
     [0.15, 0.50],
 ]
 
@@ -326,19 +270,13 @@ bybit_symbol = "DOGEUSD"
 entry_start_s = 30
 min_delta_pct = 0.04
 max_entry_price = 0.50
-early_entry_start_s = 120
-early_entry_min_delta_pct = 0.10
+early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.38],
-    [0.06, 0.42],
-    [0.08, 0.45],
-    [0.10, 0.48],
+    [0.04, 0.45],
+    [0.06, 0.48],
+    [0.08, 0.50],
+    [0.10, 0.50],
     [0.15, 0.50],
-]
-early_delta_tiers = [
-    [0.10, 0.38],
-    [0.15, 0.42],
-    [0.20, 0.45],
 ]
 
 [[markets]]
@@ -377,19 +315,13 @@ chainlink_symbol = "bnb/usd"
 entry_start_s = 30
 min_delta_pct = 0.04
 max_entry_price = 0.50
-early_entry_start_s = 120
-early_entry_min_delta_pct = 0.08
+early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.38],
-    [0.06, 0.42],
-    [0.08, 0.45],
-    [0.10, 0.48],
+    [0.04, 0.45],
+    [0.06, 0.48],
+    [0.08, 0.50],
+    [0.10, 0.50],
     [0.15, 0.50],
-]
-early_delta_tiers = [
-    [0.08, 0.38],
-    [0.10, 0.42],
-    [0.15, 0.45],
 ]
 
 [[markets]]

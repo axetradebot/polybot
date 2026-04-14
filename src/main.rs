@@ -2154,7 +2154,15 @@ async fn run_scanner_loop(
 
                             orders_fired += 1;
                             window_traded.insert(traded_key.clone(), true);
-                            let _ = db.mark_shadow_traded(&opp.market_name, opp.window_ts);
+                            let _ = db.mark_shadow_traded(
+                                &opp.market_name,
+                                opp.window_ts,
+                                opp.delta_pct,
+                                &opp.direction.to_string(),
+                                Some(&opp.best_ask.to_string()),
+                                secs_after_post,
+                                Some(opp.signal_score),
+                            );
 
                             let (md, md_dir) = window_max_delta.get(&traded_key).cloned().unwrap_or((opp.delta_pct, opp.direction.to_string()));
                             let _ = db.upsert_window_summary(

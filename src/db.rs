@@ -750,13 +750,37 @@ impl TradeDb {
         Ok(())
     }
 
-    /// Mark an existing shadow trade as actually traded.
-    pub fn mark_shadow_traded(&self, market_name: &str, window_ts: u64) -> Result<()> {
+    /// Mark an existing shadow trade as actually traded, updating entry data to
+    /// reflect the opportunity that triggered the real trade (not the first eval).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_shadow_traded(
+        &self,
+        market_name: &str,
+        window_ts: u64,
+        delta_at_entry: f64,
+        direction_at_entry: &str,
+        best_ask_at_entry: Option<&str>,
+        seconds_before_close: u64,
+        signal_score: Option<f64>,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE shadow_trades SET was_traded = 1
+            "UPDATE shadow_trades SET was_traded = 1,
+                delta_at_entry = ?3,
+                direction_at_entry = ?4,
+                best_ask_at_entry = ?5,
+                seconds_before_close = ?6,
+                signal_score = ?7
              WHERE market_name = ?1 AND window_ts = ?2",
-            params![market_name, window_ts as i64],
+            params![
+                market_name,
+                window_ts as i64,
+                delta_at_entry,
+                direction_at_entry,
+                best_ask_at_entry,
+                seconds_before_close as i64,
+                signal_score,
+            ],
         )?;
         Ok(())
     }
