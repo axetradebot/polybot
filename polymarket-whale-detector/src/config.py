@@ -74,6 +74,8 @@ class Config:
     api_backoff_initial: int = 30
     api_backoff_max: int = 300
     ignore_near_resolution_seconds: int = 3600
+    ignore_price_above: float = 0.95
+    ignore_price_below: float = 0.05
 
 
 def load_config() -> Config:

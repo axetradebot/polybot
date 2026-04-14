@@ -191,6 +191,7 @@ class TradeMonitor:
 
         parsed: list[dict[str, Any]] = []
         skipped_resolution = 0
+        skipped_price = 0
         for t in rows:
             if not isinstance(t, dict):
                 continue
@@ -199,10 +200,16 @@ class TradeMonitor:
                 continue
             if not self.state.remember_seen(p["id"], self.cfg.seen_trade_ids_max):
                 continue
+            if p["price"] >= self.cfg.ignore_price_above or p["price"] <= self.cfg.ignore_price_below:
+                skipped_price += 1
+                continue
             if self.mcache.is_near_resolution(p["condition_id"], self.cfg.ignore_near_resolution_seconds):
                 skipped_resolution += 1
                 continue
             parsed.append(p)
+        if skipped_price:
+            log.debug("Skipped %s trades at extreme prices (>=%.2f or <=%.2f)",
+                      skipped_price, self.cfg.ignore_price_above, self.cfg.ignore_price_below)
         if skipped_resolution:
             log.debug("Skipped %s trades on markets within %sm of resolution",
                       skipped_resolution, self.cfg.ignore_near_resolution_seconds // 60)
