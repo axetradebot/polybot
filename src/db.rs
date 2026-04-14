@@ -854,12 +854,16 @@ impl TradeDb {
     }
 
     /// After a window resolves, update all shadow_timing rows with the actual outcome.
+    /// Wins are NOT counted if the predicted token ask was > $0.95 (false winrate inflation).
     pub fn settle_shadow_timing(&self, window_id: &str, actual_outcome: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE shadow_timing SET
                 actual_outcome = ?1,
-                would_have_won = CASE WHEN direction = ?1 THEN 1 ELSE 0 END
+                would_have_won = CASE
+                    WHEN direction = ?1 AND (best_ask_winner IS NULL OR best_ask_winner <= 0.95) THEN 1
+                    ELSE 0
+                END
              WHERE window_id = ?2 AND actual_outcome IS NULL",
             params![actual_outcome, window_id],
         )?;
@@ -891,6 +895,7 @@ impl TradeDb {
 
     /// Re-settle shadow_timing rows using the authoritative Polymarket resolution,
     /// overwriting the earlier price-based inference.
+    /// Wins are NOT counted if the predicted token ask was > $0.95 (false winrate inflation).
     pub fn resettle_shadow_timing_with_poly(
         &self,
         market_name: &str,
@@ -902,7 +907,10 @@ impl TradeDb {
         let affected = conn.execute(
             "UPDATE shadow_timing SET
                 actual_outcome = ?1,
-                would_have_won = CASE WHEN direction = ?1 THEN 1 ELSE 0 END
+                would_have_won = CASE
+                    WHEN direction = ?1 AND (best_ask_winner IS NULL OR best_ask_winner <= 0.95) THEN 1
+                    ELSE 0
+                END
              WHERE market_name = ?2 AND window_id LIKE ?3",
             params![poly_resolution, market_name, suffix],
         )?;

@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rust_decimal::Decimal;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -17,7 +16,7 @@ use crate::types::MarketInfo;
 pub type SharedTokenCache = Arc<RwLock<HashMap<String, MarketInfo>>>;
 pub type SharedSlugMap = Arc<RwLock<HashMap<String, String>>>;
 
-const SNAPSHOT_TARGETS: [u64; 8] = [120, 100, 60, 40, 30, 20, 10, 5];
+const SNAPSHOT_TARGETS: [u64; 4] = [30, 20, 10, 5];
 const DELTA_THRESHOLD_PCT: f64 = 0.04;
 
 fn nearest_snapshot(seconds_remaining: u64) -> Option<u64> {
@@ -77,11 +76,7 @@ pub async fn run_shadow_timing(
                 None => continue,
             };
 
-            // T-120/T-100/T-60 are early shadow snapshots — record all for analysis.
-            // Normal snapshots (T-40 and below) are gated by entry_start_s.
-            if t_sec >= 60 {
-                // Early shadow snapshots (T-120, T-100, T-60) — always record
-            } else if t_sec > mkt.entry_start_s + 2 {
+            if t_sec > mkt.entry_start_s + 2 {
                 continue;
             }
 
@@ -134,8 +129,7 @@ pub async fn run_shadow_timing(
                         &token_cache,
                         &hourly_slug_map,
                         window_ts,
-                        current_price,
-                        open_price,
+                        &direction,
                         &ob_cache,
                     )
                     .await
@@ -238,9 +232,15 @@ pub async fn run_shadow_timing(
     }
 }
 
-/// Fetch both token orderbooks and compute the winner/loser breakdown.
-/// Returns (best_ask_winner, best_ask_loser, depth_winner, depth_loser,
-///          total_ask_size_winner, could_have_filled, hypothetical_entry_price)
+/// Fetch both token orderbooks keyed by PREDICTED direction (not market-favored).
+///
+/// `best_ask_winner` = ask on the predicted direction's token (what we'd buy).
+/// `best_ask_loser`  = ask on the opposite token.
+/// `could_have_filled` = predicted token ask is within [$0.30, max_entry_price]
+///                       AND ask <= $0.95 (above this, even wins have terrible EV).
+///
+/// Returns (best_ask_predicted, best_ask_opposite, depth_predicted, depth_opposite,
+///          total_ask_size_predicted, could_have_filled, hypothetical_entry_price)
 #[allow(clippy::too_many_arguments)]
 async fn fetch_book_snapshot(
     clob_url: &str,
@@ -248,11 +248,9 @@ async fn fetch_book_snapshot(
     token_cache: &SharedTokenCache,
     hourly_slug_map: &SharedSlugMap,
     window_ts: u64,
-    _current_price: Decimal,
-    _open_price: Decimal,
+    predicted_direction: &crate::types::Direction,
     ob_cache: &OrderbookCache,
 ) -> Option<(Option<f64>, Option<f64>, i64, i64, f64, bool, Option<f64>)> {
-    // Resolve the slug for this market/window
     let slug = if mkt.is_hourly() {
         let map = hourly_slug_map.read().await;
         map.get(&mkt.name)?.clone()
@@ -260,59 +258,44 @@ async fn fetch_book_snapshot(
         market::build_slug(&mkt.slug_prefix, window_ts)
     };
 
-    // Look up token IDs from the shared cache
     let cache = token_cache.read().await;
     let market_info = cache.get(&slug)?;
-    let token_a = market_info.up_token_id.clone();
-    let token_b = market_info.down_token_id.clone();
+    let up_token = market_info.up_token_id.clone();
+    let down_token = market_info.down_token_id.clone();
     drop(cache);
 
-    // Fetch both books (via cache to avoid double-fetching with the live trader)
-    let (book_a, book_b) = tokio::join!(
-        ob_cache.get_or_fetch(clob_url, &token_a),
-        ob_cache.get_or_fetch(clob_url, &token_b),
+    let (predicted_token, opposite_token) = match predicted_direction {
+        crate::types::Direction::Up => (up_token, down_token),
+        crate::types::Direction::Down => (down_token, up_token),
+    };
+
+    let (book_pred, book_opp) = tokio::join!(
+        ob_cache.get_or_fetch(clob_url, &predicted_token),
+        ob_cache.get_or_fetch(clob_url, &opposite_token),
     );
 
-    let book_a = book_a.ok()?;
-    let book_b = book_b.ok()?;
-
-    // Determine winner using mid-price comparison (same logic as scanner.rs):
-    // the token with the higher mid-price is the "winner" side.
-    // Since DetailedOrderbook only has ask-side data, use best_ask as a proxy.
-    // A lower best_ask means the loser side (cheap shares = market thinks it loses).
-    // If one side has asks and the other doesn't, the one with asks is likely tradeable
-    let (winner_book, loser_book) = match (book_a.best_ask, book_b.best_ask) {
-        (Some(a_ask), Some(b_ask)) => {
-            // Higher ask = winner side (more expensive = market expects it to win)
-            if a_ask >= b_ask {
-                (book_a, book_b)
-            } else {
-                (book_b, book_a)
-            }
-        }
-        (Some(_), None) => (book_a, book_b),
-        (None, Some(_)) => (book_b, book_a),
-        (None, None) => return Some((None, None, 0, 0, 0.0, false, None)),
-    };
+    let book_pred = book_pred.ok()?;
+    let book_opp = book_opp.ok()?;
 
     let max_entry = mkt.max_entry_price;
     let undercut = mkt.undercut_offset.unwrap_or(0.03);
 
-    let could_fill = winner_book
+    let could_fill = book_pred
         .best_ask
-        .map(|p| p <= max_entry)
+        .map(|p| p >= 0.30 && p <= max_entry && p <= 0.95)
         .unwrap_or(false);
-    let hypo_entry = winner_book.best_ask.map(|p| {
+
+    let hypo_entry = book_pred.best_ask.map(|p| {
         let entry = p - undercut;
         if entry < 0.30 { 0.30 } else { entry }
     });
 
     Some((
-        winner_book.best_ask,
-        loser_book.best_ask,
-        winner_book.ask_depth,
-        loser_book.ask_depth,
-        winner_book.total_ask_size,
+        book_pred.best_ask,
+        book_opp.best_ask,
+        book_pred.ask_depth,
+        book_opp.ask_depth,
+        book_pred.total_ask_size,
         could_fill,
         hypo_entry,
     ))
