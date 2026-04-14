@@ -190,6 +190,7 @@ class TradeMonitor:
             return [], nrows
 
         parsed: list[dict[str, Any]] = []
+        skipped_resolution = 0
         for t in rows:
             if not isinstance(t, dict):
                 continue
@@ -198,7 +199,13 @@ class TradeMonitor:
                 continue
             if not self.state.remember_seen(p["id"], self.cfg.seen_trade_ids_max):
                 continue
+            if self.mcache.is_near_resolution(p["condition_id"], self.cfg.ignore_near_resolution_seconds):
+                skipped_resolution += 1
+                continue
             parsed.append(p)
+        if skipped_resolution:
+            log.debug("Skipped %s trades on markets within %sm of resolution",
+                      skipped_resolution, self.cfg.ignore_near_resolution_seconds // 60)
 
         if not parsed:
             return [], nrows
@@ -308,6 +315,9 @@ class TradeMonitor:
         price = float(trade.get("price") or 0)
         size = float(trade.get("size") or 0)
         trade_ts = int(trade.get("timestamp") or 0) or None
+        if trade_ts:
+            delay_s = int(time.time()) - trade_ts
+            log.info("Detection delay: %ss (trade at %s, detected now)", delay_s, trade_ts)
         ti = self.mcache.get_token(asset)
         question = (ti.question if ti else None) or str(trade.get("title") or "Unknown market")
         slug = (ti.slug if ti else None) or str(trade.get("slug") or "")

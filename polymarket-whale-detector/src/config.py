@@ -73,6 +73,7 @@ class Config:
     heartbeat_interval_seconds: int = 300
     api_backoff_initial: int = 30
     api_backoff_max: int = 300
+    ignore_near_resolution_seconds: int = 3600
 
 
 def load_config() -> Config:
@@ -93,6 +94,7 @@ def load_config() -> Config:
         poll_interval_seconds=max(5, _int("POLL_INTERVAL_SECONDS", 30)),
         insider_score_threshold=_float("INSIDER_SCORE_THRESHOLD", 0.6),
         known_wallets_path=known,
+        ignore_near_resolution_seconds=_int("IGNORE_NEAR_RESOLUTION_SECONDS", 3600),
     )
 
 

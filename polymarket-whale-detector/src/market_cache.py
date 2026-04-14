@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -18,6 +19,7 @@ class TokenInfo:
     slug: str
     condition_id: str
     outcome: str  # "Yes" or "No"
+    end_date_ts: float | None = None  # Unix timestamp of market end date
 
 
 class MarketCache:
@@ -27,6 +29,8 @@ class MarketCache:
         self._by_token: dict[str, TokenInfo] = {}
         self._volume24h_by_condition: dict[str, float] = {}
         self._event_slug_by_condition: dict[str, str] = {}
+        self._end_date_by_condition: dict[str, float] = {}
+        self._closed_conditions: set[str] = set()
 
     @property
     def token_count(self) -> int:
@@ -46,11 +50,27 @@ class MarketCache:
     def event_slug(self, condition_id: str) -> str | None:
         return self._event_slug_by_condition.get(condition_id.lower())
 
+    def end_date_ts(self, condition_id: str) -> float | None:
+        return self._end_date_by_condition.get(condition_id.lower())
+
+    def is_near_resolution(self, condition_id: str, buffer_seconds: int) -> bool:
+        """True if market resolves within buffer_seconds, or is already closed/resolved."""
+        cid = condition_id.lower()
+        if cid in self._closed_conditions:
+            return True
+        end = self._end_date_by_condition.get(cid)
+        if end is None:
+            return False
+        now = datetime.now(timezone.utc).timestamp()
+        return (end - now) < buffer_seconds
+
     async def refresh(self, client: httpx.AsyncClient) -> int:
         """Fetch all active markets; return number of token rows indexed."""
         self._by_token.clear()
         self._volume24h_by_condition.clear()
         self._event_slug_by_condition.clear()
+        self._end_date_by_condition.clear()
+        self._closed_conditions.clear()
         offset = 0
         limit = 500
         total_markets = 0
@@ -78,6 +98,20 @@ class MarketCache:
         if not cid:
             return
         cid_l = cid.lower()
+
+        if m.get("closed"):
+            self._closed_conditions.add(cid_l)
+
+        end_ts: float | None = None
+        end_raw = m.get("endDate")
+        if end_raw:
+            try:
+                dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+                end_ts = dt.timestamp()
+                self._end_date_by_condition[cid_l] = end_ts
+            except (ValueError, TypeError):
+                pass
+
         vol = m.get("volume24hrClob")
         if vol is not None:
             try:
@@ -117,4 +151,5 @@ class MarketCache:
                 slug=slug,
                 condition_id=cid,
                 outcome=label,
+                end_date_ts=end_ts,
             )
