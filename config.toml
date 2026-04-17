@@ -77,18 +77,18 @@ chainlink_symbol = "btc/usd"
 bybit_symbol = "BTCUSD"
 entry_start_s = 30
 entry_cutoff_s = 5
-min_delta_pct = 0.04
-max_entry_price = 0.50
+min_delta_pct = 0.06
+max_entry_price = 0.99
 early_entry_start_s = 0
 undercut_offset = 0.01
 tighten_step = 0.01
 adjust_interval_ms = 500
 delta_tiers = [
-    [0.04, 0.45],
-    [0.06, 0.48],
-    [0.08, 0.50],
-    [0.10, 0.50],
-    [0.15, 0.50],
+    [0.06, 0.93],
+    [0.08, 0.96],
+    [0.10, 0.97],
+    [0.15, 0.98],
+    [0.20, 0.99],
 ]
 
 [[markets]]
@@ -104,18 +104,18 @@ chainlink_symbol = "btc/usd"
 bybit_symbol = "BTCUSD"
 entry_start_s = 30
 entry_cutoff_s = 5
-min_delta_pct = 0.04
-max_entry_price = 0.50
+min_delta_pct = 0.06
+max_entry_price = 0.99
 early_entry_start_s = 0
 undercut_offset = 0.01
 tighten_step = 0.01
 adjust_interval_ms = 1000
 delta_tiers = [
-    [0.04, 0.45],
-    [0.06, 0.48],
-    [0.08, 0.50],
-    [0.10, 0.50],
-    [0.15, 0.50],
+    [0.06, 0.93],
+    [0.08, 0.96],
+    [0.10, 0.97],
+    [0.15, 0.98],
+    [0.20, 0.99],
 ]
 
 [[markets]]
@@ -130,15 +130,15 @@ binance_symbol = "ethusdt"
 chainlink_symbol = "eth/usd"
 bybit_symbol = "ETHUSD"
 entry_start_s = 30
-min_delta_pct = 0.04
-max_entry_price = 0.50
+min_delta_pct = 0.06
+max_entry_price = 0.99
 early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.45],
-    [0.06, 0.48],
-    [0.08, 0.50],
-    [0.10, 0.50],
-    [0.15, 0.50],
+    [0.06, 0.93],
+    [0.08, 0.96],
+    [0.10, 0.97],
+    [0.15, 0.98],
+    [0.20, 0.99],
 ]
 
 [[markets]]
@@ -153,15 +153,15 @@ binance_symbol = "ethusdt"
 chainlink_symbol = "eth/usd"
 bybit_symbol = "ETHUSD"
 entry_start_s = 30
-min_delta_pct = 0.04
-max_entry_price = 0.50
+min_delta_pct = 0.06
+max_entry_price = 0.99
 early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.45],
-    [0.06, 0.48],
-    [0.08, 0.50],
-    [0.10, 0.50],
-    [0.15, 0.50],
+    [0.06, 0.93],
+    [0.08, 0.96],
+    [0.10, 0.97],
+    [0.15, 0.98],
+    [0.20, 0.99],
 ]
 
 [[markets]]
@@ -176,15 +176,15 @@ binance_symbol = "solusdt"
 chainlink_symbol = "sol/usd"
 bybit_symbol = "SOLUSD"
 entry_start_s = 30
-min_delta_pct = 0.04
-max_entry_price = 0.50
+min_delta_pct = 0.06
+max_entry_price = 0.99
 early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.45],
-    [0.06, 0.48],
-    [0.08, 0.50],
-    [0.10, 0.50],
-    [0.15, 0.50],
+    [0.06, 0.93],
+    [0.08, 0.96],
+    [0.10, 0.97],
+    [0.15, 0.98],
+    [0.20, 0.99],
 ]
 
 [[markets]]
@@ -199,15 +199,15 @@ binance_symbol = "solusdt"
 chainlink_symbol = "sol/usd"
 bybit_symbol = "SOLUSD"
 entry_start_s = 30
-min_delta_pct = 0.04
-max_entry_price = 0.50
+min_delta_pct = 0.06
+max_entry_price = 0.99
 early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.45],
-    [0.06, 0.48],
-    [0.08, 0.50],
-    [0.10, 0.50],
-    [0.15, 0.50],
+    [0.06, 0.93],
+    [0.08, 0.96],
+    [0.10, 0.97],
+    [0.15, 0.98],
+    [0.20, 0.99],
 ]
 
 [[markets]]
@@ -222,15 +222,15 @@ binance_symbol = "xrpusdt"
 chainlink_symbol = "xrp/usd"
 bybit_symbol = "XRPUSD"
 entry_start_s = 30
-min_delta_pct = 0.04
-max_entry_price = 0.50
+min_delta_pct = 0.06
+max_entry_price = 0.99
 early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.45],
-    [0.06, 0.48],
-    [0.08, 0.50],
-    [0.10, 0.50],
-    [0.15, 0.50],
+    [0.06, 0.93],
+    [0.08, 0.96],
+    [0.10, 0.97],
+    [0.15, 0.98],
+    [0.20, 0.99],
 ]
 
 [[markets]]
@@ -245,15 +245,15 @@ binance_symbol = "xrpusdt"
 chainlink_symbol = "xrp/usd"
 bybit_symbol = "XRPUSD"
 entry_start_s = 30
-min_delta_pct = 0.04
-max_entry_price = 0.50
+min_delta_pct = 0.06
+max_entry_price = 0.99
 early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.45],
-    [0.06, 0.48],
-    [0.08, 0.50],
-    [0.10, 0.50],
-    [0.15, 0.50],
+    [0.06, 0.93],
+    [0.08, 0.96],
+    [0.10, 0.97],
+    [0.15, 0.98],
+    [0.20, 0.99],
 ]
 
 [[markets]]
@@ -268,15 +268,14 @@ binance_symbol = "dogeusdt"
 chainlink_symbol = "doge/usd"
 bybit_symbol = "DOGEUSD"
 entry_start_s = 30
-min_delta_pct = 0.04
-max_entry_price = 0.50
+min_delta_pct = 0.08
+max_entry_price = 0.99
 early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.45],
-    [0.06, 0.48],
-    [0.08, 0.50],
-    [0.10, 0.50],
-    [0.15, 0.50],
+    [0.08, 0.97],
+    [0.10, 0.97],
+    [0.15, 0.98],
+    [0.20, 0.99],
 ]
 
 [[markets]]
@@ -313,15 +312,15 @@ resolution_source = "chainlink"
 binance_symbol = "bnbusdt"
 chainlink_symbol = "bnb/usd"
 entry_start_s = 30
-min_delta_pct = 0.04
-max_entry_price = 0.50
+min_delta_pct = 0.06
+max_entry_price = 0.99
 early_entry_start_s = 0
 delta_tiers = [
-    [0.04, 0.45],
-    [0.06, 0.48],
-    [0.08, 0.50],
-    [0.10, 0.50],
-    [0.15, 0.50],
+    [0.06, 0.93],
+    [0.08, 0.96],
+    [0.10, 0.97],
+    [0.15, 0.98],
+    [0.20, 0.99],
 ]
 
 [[markets]]
