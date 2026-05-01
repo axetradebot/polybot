@@ -10,7 +10,7 @@ name = "polymarket-btc-bot"
 path = "src/main.rs"
 
 [dependencies]
-polymarket-client-sdk = { version = "0.4", features = [
+polymarket-client-sdk = { path = "vendor/polymarket-client-sdk", features = [
     "clob",
     "ws",
     "gamma",
